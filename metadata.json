@@ -1,0 +1,6 @@
+{
+  "name": "AI Realtime Translation",
+  "description": "Realtime AI speech recognition and translation system powered by Google Chirp and Gemini",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
