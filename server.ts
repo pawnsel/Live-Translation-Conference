@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
@@ -5,6 +6,25 @@ import { Server } from "socket.io";
 import { createServer } from "http";
 import { GoogleGenAI } from "@google/genai";
 import { v4 as uuidv4 } from "uuid";
+
+// Max time to wait for a Gemini response before falling back
+const GEMINI_TIMEOUT_MS = 10000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
 
 // Helper to get GoogleGenAI client with user token or fallback
 function getAiClient(userToken?: string) {
@@ -55,10 +75,14 @@ async function performTranslation(text: string, config: any, customKey?: string)
       const client = getAiClient(activeKey);
       const prompt = buildTranslationPrompt(config, text);
       const modelToUse = config?.aiModel || "gemini-3.7-flash";
-      const response = await client.models.generateContent({
-        model: modelToUse,
-        contents: prompt,
-      });
+      const response = await withTimeout(
+        client.models.generateContent({
+          model: modelToUse,
+          contents: prompt,
+        }),
+        GEMINI_TIMEOUT_MS,
+        "Gemini translation request"
+      );
       const resText = response.text?.trim();
       if (resText) {
         // Strip markdown quotes or conversational prefixes if any
@@ -217,10 +241,14 @@ async function startServer() {
       try {
         const targetKey = tokenToTest?.trim() || serverSecretApiKey;
         const client = getAiClient(targetKey);
-        const res = await client.models.generateContent({
-          model: "gemini-3.7-flash",
-          contents: "Say 'OK' if working.",
-        });
+        const res = await withTimeout(
+          client.models.generateContent({
+            model: "gemini-3.7-flash",
+            contents: "Say 'OK' if working.",
+          }),
+          GEMINI_TIMEOUT_MS,
+          "Gemini API key test"
+        );
         socket.emit("test-token-result", { 
           success: true, 
           message: targetKey ? "API Key ใช้งานได้สมบูรณ์ (Verified & Active)" : "Default API Key ทำงานปกติ" 
