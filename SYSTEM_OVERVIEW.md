@@ -94,3 +94,67 @@
    - เริ่มพูดใส่ไมโครโฟน ระบบจะถอดเสียงและแปลภาษาแบบเรียลไทม์อัตโนมัติ
 4. **แก้ไขคำแปลสด**:
    - หากต้องการแก้ไขคำแปล สามารถคลิกไอคอนดินสอ (Edit) ที่รายการนั้นๆ เพื่อแก้ไขหรือกด **"ให้ AI แปลใหม่"** ได้ทันที
+
+---
+
+## 4. แผนพัฒนาต่อ: Multi-Tenant, Authentication & Billing (Roadmap — ยังไม่ได้เริ่มพัฒนา)
+
+> อัปเดตล่าสุด: 2026-09-02 — เป็นผลสรุปจากการออกแบบ architecture ร่วมกัน ยังเป็นแค่แนวทาง (design) ยังไม่ได้ลงมือแก้โค้ดจริง
+
+### 4.1 เป้าหมาย
+ปัจจุบันระบบเป็น single-tenant: มี state ส่วนกลาง (config, transcripts, API key) ตัวเดียวที่ทุก client เชื่อมต่อเข้ามาใช้ร่วมกัน ไม่มีระบบผู้ใช้ ไม่มีการแยกข้อมูลตามงาน และไม่มีการคำนวณต้นทุน เป้าหมายต่อไปคือทำให้แต่ละ **user** สามารถสร้าง **project** ของตัวเองได้หลายโปรเจกต์ (เช่น 1 project = 1 งานประชุมวิชาการ 30 นาที) โดยข้อมูลและค่าใช้จ่ายแยกกันชัดเจนเป็นรายโปรเจกต์
+
+### 4.2 ขอบเขตที่ตกลงกันไว้ (Confirmed Scope)
+- **เก็บข้อมูลเฉพาะข้อความ (text-only)** — ไม่มีการอัดหรือเก็บไฟล์เสียงดิบ จึงไม่ต้องมี Object Storage (S3/GCS) เพิ่ม ใช้ Postgres ตัวเดียวพอ
+- **API Key เป็นของระบบ ไม่ใช่ของ user** — ตัดหน้า "API Key" ใน Admin console ออกทั้งหมด ระบบใช้ `GEMINI_API_KEY` ระดับ platform ตัวเดียว (จาก env) แล้วคิดต้นทุนฝั่งเราเอง ก่อนสรุปยอดส่งให้ user
+- **ไม่มีระบบ self-registration** — เป็นระบบใช้ภายในองค์กร แอดมินเป็นผู้สร้าง account ให้ user เองในช่วงแรก
+- **1 project = 1 การประชุมครั้งเดียว** — ไม่ต้องมี entity "Session" แยกจาก "Project"
+- **Billing เป็นรายงานสรุปยอดในระบบ พร้อม export เป็นไฟล์ PDF** — ไม่ต้องผูก payment gateway (Stripe/Omise/2C2P) ในเฟสนี้ ระบบคำนวณยอดแล้ว generate ใบสรุปยอด (bill) เป็นไฟล์ PDF ให้ดาวน์โหลดต่อ project เพื่อให้ทีมนำไปเรียกเก็บเงินนอกระบบ
+
+### 4.3 Architecture Overview
+
+```
+[Operator Browser] --HTTPS/WSS + Session-->
+        │
+   [Auth Layer]  →  ยืนยันตัวตนด้วย session, ไม่มีหน้า signup (แอดมินสร้าง user เอง)
+        │
+   [Project Service]  →  CRUD project, ผูก project กับ owner_user_id
+        │
+   [Realtime Session Manager]
+        │   Socket.IO room = projectId  (แทนที่ io.emit() แบบ global เดิม)
+        │   → io.to(projectId).emit(...) แทน io.emit(...) ทั้งหมด
+        │
+        ├──> [Translation Worker]  (performTranslation() เดิม ใช้ platform API key เดียว)
+        │        └─> อ่าน token usage จาก Gemini response.usageMetadata → บันทึกลง Usage Ledger
+        │
+        └──> [Persistence Writer]  →  Postgres: เขียน transcript ทีละ event
+        │
+   [Usage Ledger (Postgres)]  →  รวมยอดตาม project_id
+        │
+   [Billing Report]  →  คำนวณ token cost + service fee → แสดงในระบบ + generate ไฟล์ PDF ให้ดาวน์โหลด (ไม่มี payment gateway)
+```
+
+### 4.4 Data Model (Postgres)
+
+| Entity | คีย์สำคัญ | หมายเหตุ |
+|---|---|---|
+| `users` | id, email, password_hash, role (`admin`\|`member`), created_at | แอดมินสร้างให้เอง ไม่มี self-registration |
+| `projects` | id, owner_user_id, name, status (`draft`\|`active`\|`ended`), config (JSONB: ภาษา, dictionary, chunking ms — ตรงกับ `AppConfig` เดิม), created_at, ended_at | 1 project = 1 การประชุมครั้งเดียว |
+| `transcript_items` | id, project_id, original_text, translated_text, timestamp, latency_ms, is_edited, tokens_in, tokens_out | แทนที่ array `transcripts` ใน memory ของ server.ts เดิม |
+| `usage_events` | id, project_id, event_type (`gemini_call`), tokens_in, tokens_out, unit_cost, total_cost, created_at | insert ทุกครั้งที่เรียก Gemini เพื่อคำนวณต้นทุน |
+
+### 4.5 การเปลี่ยนแปลงหลักที่ต้องทำในโค้ดปัจจุบัน
+1. **Auth**: เพิ่ม session-based login (email + password, bcrypt + server-side session เก็บใน Postgres) และ middleware เช็ค session ทั้งฝั่ง HTTP routes และตอน Socket.IO handshake (`io.use(...)`)
+2. **Realtime scoping**: เปลี่ยนทุก `io.emit(...)` ใน [server.ts](server.ts) เป็น `io.to(projectId).emit(...)` และให้ client `socket.join(projectId)` ตอนเชื่อมต่อ — ปิดช่องโหว่ transcript รั่วไปทุก client ที่เคยพบระหว่างรีวิว
+3. **ตัด API Key UI**: ลบ tab "API Key" และ logic รับ/ทดสอบ custom token ทั้งหมดออกจาก [Admin.tsx](src/pages/Admin.tsx) และ [server.ts](server.ts) เหลือใช้ `GEMINI_API_KEY` จาก env เพียงตัวเดียว
+4. **CORS**: ปิด `origin: "*"` ของ Socket.IO server เหลือแค่ domain จริงของแอป
+5. **Usage metering**: อ่าน `response.usageMetadata` จาก Gemini SDK ในทุกครั้งที่เรียก `performTranslation()` แล้วบันทึกลงตาราง `usage_events`
+6. **Persistence**: ย้าย state จาก in-memory (`currentConfig`, `transcripts`, `serverSecretApiKey`) ไปเขียน/อ่านจาก Postgres แบบ per-event (ปริมาณ event ต่องานประชุมไม่มาก ไม่จำเป็นต้องมี cache layer เพิ่ม)
+7. **PDF export**: เพิ่ม endpoint generate ใบสรุปยอด (bill) เป็น PDF ต่อ project โดยรวม token cost + service fee จาก `usage_events` — ใช้ library ฝั่ง server เช่น `pdfkit` หรือ render HTML แล้วแปลงด้วย `puppeteer`
+
+### 4.6 Stack ที่แนะนำ
+- **Database**: Postgres + Prisma หรือ Drizzle ORM
+- **Auth**: hand-rolled (bcrypt + server-side session) — ไม่จำเป็นต้องใช้ Auth SaaS เพราะไม่มี self-registration และ scope เล็ก
+- **Hosting**: ใช้ Node server เดิมต่อได้ เพิ่มแค่ Postgres (self-host หรือ managed เช่น Neon/Supabase DB)
+
+> หมายเหตุ: ส่วนนี้เป็นผลจากการ brainstorm ยังไม่ได้เขียนเป็น spec/implementation plan อย่างเป็นทางการ เมื่อพร้อมเริ่มพัฒนาให้กลับมาทำ spec doc ก่อนลงมือแก้โค้ด
