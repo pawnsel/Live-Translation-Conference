@@ -1,6 +1,8 @@
 # สรุปการทำงานของระบบ AI Realtime Conference Interpreter & Translator
 (System Overview & Architecture Documentation)
 
+> อัปเดตล่าสุด: 2026-09-02
+
 ระบบ **AI Realtime Conference Interpreter & Translator** คือระบบถอดความเสียงพูดสด (Speech-to-Text) และแปลภาษาแบบเรียลไทม์ (Real-time Live Translation) ที่ออกแบบมาสำหรับการประชุม สัมมนา งานแถลงข่าว และการบรรยายสองภาษา (Thai ↔ English) โดยทำงานผ่านสถาปัตยกรรม Full-Stack (React + Vite + Tailwind CSS + Node.js Express + Socket.IO + Google Gemini API)
 
 ---
@@ -99,7 +101,7 @@
 
 ## 4. แผนพัฒนาต่อ: Multi-Tenant, Authentication & Billing (Roadmap — ยังไม่ได้เริ่มพัฒนา)
 
-> อัปเดตล่าสุด: 2026-09-02 — เป็นผลสรุปจากการออกแบบ architecture ร่วมกัน ยังเป็นแค่แนวทาง (design) ยังไม่ได้ลงมือแก้โค้ดจริง
+> เป็นผลสรุปจากการออกแบบ architecture ร่วมกัน ยังเป็นแค่แนวทาง (design) ยังไม่ได้ลงมือแก้โค้ดจริง
 
 ### 4.1 เป้าหมาย
 ปัจจุบันระบบเป็น single-tenant: มี state ส่วนกลาง (config, transcripts, API key) ตัวเดียวที่ทุก client เชื่อมต่อเข้ามาใช้ร่วมกัน ไม่มีระบบผู้ใช้ ไม่มีการแยกข้อมูลตามงาน และไม่มีการคำนวณต้นทุน เป้าหมายต่อไปคือทำให้แต่ละ **user** สามารถสร้าง **project** ของตัวเองได้หลายโปรเจกต์ (เช่น 1 project = 1 งานประชุมวิชาการ 30 นาที) โดยข้อมูลและค่าใช้จ่ายแยกกันชัดเจนเป็นรายโปรเจกต์
@@ -144,17 +146,25 @@
 | `usage_events` | id, project_id, event_type (`gemini_call`), tokens_in, tokens_out, unit_cost, total_cost, created_at | insert ทุกครั้งที่เรียก Gemini เพื่อคำนวณต้นทุน |
 
 ### 4.5 การเปลี่ยนแปลงหลักที่ต้องทำในโค้ดปัจจุบัน
-1. **Auth**: เพิ่ม session-based login (email + password, bcrypt + server-side session เก็บใน Postgres) และ middleware เช็ค session ทั้งฝั่ง HTTP routes และตอน Socket.IO handshake (`io.use(...)`)
+1. **Auth**: เพิ่ม session-based login และ middleware เช็ค session ทั้งฝั่ง HTTP routes และตอน Socket.IO handshake (`io.use(...)`) — มี 2 ทางเลือกสำหรับตัว auth เอง (ดูรายละเอียดเปรียบเทียบใน 4.6):
+   - **Option A**: hand-rolled (email + password, bcrypt + server-side session เก็บใน Postgres)
+   - **Option B**: ต่อกับระบบ auth ของ IT องค์กรที่มีอยู่แล้ว (SSO ผ่าน SAML/OIDC หรือ Active Directory/LDAP) แล้วเก็บแค่ mapping user ↔ role ↔ project ไว้ในตาราง `users` ของเราเอง
 2. **Realtime scoping**: เปลี่ยนทุก `io.emit(...)` ใน [server.ts](server.ts) เป็น `io.to(projectId).emit(...)` และให้ client `socket.join(projectId)` ตอนเชื่อมต่อ — ปิดช่องโหว่ transcript รั่วไปทุก client ที่เคยพบระหว่างรีวิว
 3. **ตัด API Key UI**: ลบ tab "API Key" และ logic รับ/ทดสอบ custom token ทั้งหมดออกจาก [Admin.tsx](src/pages/Admin.tsx) และ [server.ts](server.ts) เหลือใช้ `GEMINI_API_KEY` จาก env เพียงตัวเดียว
 4. **CORS**: ปิด `origin: "*"` ของ Socket.IO server เหลือแค่ domain จริงของแอป
 5. **Usage metering**: อ่าน `response.usageMetadata` จาก Gemini SDK ในทุกครั้งที่เรียก `performTranslation()` แล้วบันทึกลงตาราง `usage_events`
 6. **Persistence**: ย้าย state จาก in-memory (`currentConfig`, `transcripts`, `serverSecretApiKey`) ไปเขียน/อ่านจาก Postgres แบบ per-event (ปริมาณ event ต่องานประชุมไม่มาก ไม่จำเป็นต้องมี cache layer เพิ่ม)
 7. **PDF export**: เพิ่ม endpoint generate ใบสรุปยอด (bill) เป็น PDF ต่อ project โดยรวม token cost + service fee จาก `usage_events` — ใช้ library ฝั่ง server เช่น `pdfkit` หรือ render HTML แล้วแปลงด้วย `puppeteer`
+8. **Pause/Resume recording ภายใน 1 project**: แก้บั๊กที่พบระหว่างรีวิว — ปัจจุบัน [server.ts:236-241](server.ts#L236-L241) สั่ง `transcripts = []` (ล้างข้อมูลทิ้งหมด) ทุกครั้งที่ event `start-meeting` ถูกยิง แปลว่าถ้า operator กดหยุด-เริ่มมิคใหม่หลายครั้งระหว่างงานเดียวกัน ข้อมูลที่แปลไปแล้วจะหายทุกรอบ ต้องแก้ให้ project เดิมกดอัด/หยุดอัดได้หลายครั้งโดยไม่ล้างข้อมูล กล่าวคือ:
+   - `start-meeting` ควรแค่ตั้ง `isMeetingActive = true` และ**ต่อ**บันทึกลง `transcript_items` ของ `project_id` เดิม ไม่ clear ของเก่า
+   - `stop-meeting` เป็นแค่ pause (หยุดฟังไมค์ชั่วคราว) ไม่ใช่ end-of-project — การ "จบ project" ต้องเป็น action แยกต่างหาก (เช่นปุ่ม "จบการประชุม") ที่เปลี่ยน `projects.status` เป็น `ended` และ lock ไม่ให้แก้ transcript ต่อ
 
 ### 4.6 Stack ที่แนะนำ
 - **Database**: Postgres + Prisma หรือ Drizzle ORM
-- **Auth**: hand-rolled (bcrypt + server-side session) — ไม่จำเป็นต้องใช้ Auth SaaS เพราะไม่มี self-registration และ scope เล็ก
+- **Auth**: มี 2 ทางเลือก ขึ้นอยู่กับว่าองค์กรมีระบบ auth กลางอยู่แล้วหรือไม่
+  - **Option A — hand-rolled** (bcrypt + server-side session): ไม่จำเป็นต้องใช้ Auth SaaS เพราะไม่มี self-registration และ scope เล็ก เหมาะถ้าอยากเริ่มเร็วโดยไม่ต้องพึ่งทีม IT
+  - **Option B — ต่อกับระบบ auth ของ IT องค์กร** (SSO/SAML/OIDC หรือ Active Directory/LDAP ที่มีอยู่แล้ว): ข้อดีคือ user ไม่ต้องจำ password แยกอีกชุด, การปิด/เปิดสิทธิ์ user จัดการที่ระบบกลางที่เดียว (ตอนคนลาออกก็ตัดสิทธิ์อัตโนมัติ), ตรงกับ requirement "ใช้ในองค์กรเท่านั้น ไม่มี self-registration" อยู่แล้ว — ข้อควรระวังคือต้องขอข้อมูล integration (client ID/secret, endpoint) จากทีม IT ก่อน และแอปเรายังต้องมีตาราง `users` ของตัวเองไว้ map ว่า user คนนี้เป็น owner ของ project ไหนบ้าง (SSO ให้แค่ identity ไม่ได้ให้ business data)
+  - แนะนำ: เริ่ม Option A ไปก่อนถ้าต้องรีบใช้งาน แล้วค่อยย้ายไป Option B ทีหลังถ้า IT มีระบบพร้อมและต้องการรวมศูนย์การจัดการสิทธิ์
 - **Hosting**: ใช้ Node server เดิมต่อได้ เพิ่มแค่ Postgres (self-host หรือ managed เช่น Neon/Supabase DB)
 
 > หมายเหตุ: ส่วนนี้เป็นผลจากการ brainstorm ยังไม่ได้เขียนเป็น spec/implementation plan อย่างเป็นทางการ เมื่อพร้อมเริ่มพัฒนาให้กลับมาทำ spec doc ก่อนลงมือแก้โค้ด
