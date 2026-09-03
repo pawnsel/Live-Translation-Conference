@@ -6,6 +6,7 @@ import { Server } from "socket.io";
 import { createServer } from "http";
 import { GoogleGenAI } from "@google/genai";
 import { v4 as uuidv4 } from "uuid";
+import { createTokenBroker } from "./server/asrTokenBroker";
 
 // Max time to wait for a Gemini response before falling back
 const GEMINI_TIMEOUT_MS = 10000;
@@ -170,6 +171,28 @@ async function startServer() {
   });
 
   app.use(express.json());
+
+  const asrBroker = createTokenBroker({
+    backendUrl: process.env.ASR_BACKEND_URL || "http://localhost:8765",
+    password: process.env.ASR_OPERATOR_PASSWORD || "",
+  });
+
+  // The ONE thing this server still protects: the shared operator password.
+  // The browser gets a token and talks to Python directly for everything
+  // else, because control commands travel over the WebSocket and need a real
+  // operator token regardless — proxying the HTTP half would guard nothing.
+  app.post("/api/asr/token", async (_req, res) => {
+    if (!process.env.ASR_OPERATOR_PASSWORD) {
+      res.status(503).json({ error: "ASR_OPERATOR_PASSWORD is not configured on the server" });
+      return;
+    }
+    try {
+      const token = await asrBroker.getToken();
+      res.json(token);
+    } catch (err: any) {
+      res.status(503).json({ error: err?.message || "Could not obtain an ASR token" });
+    }
+  });
 
   // Store state in memory
   let currentConfig: any = {
