@@ -1,0 +1,11 @@
+{
+  "data": {
+    "paused": true
+  },
+  "id": "c-2",
+  "seq": null,
+  "session": "sess_ab12",
+  "ts": 1718000000.125,
+  "type": "control.set_paused",
+  "v": 1
+}

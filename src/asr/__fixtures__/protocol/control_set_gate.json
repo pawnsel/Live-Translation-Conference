@@ -1,0 +1,12 @@
+{
+  "data": {
+    "min_interval_ms": 500.0,
+    "min_words": 4
+  },
+  "id": "c-5",
+  "seq": null,
+  "session": "sess_ab12",
+  "ts": 1718000000.125,
+  "type": "control.set_gate",
+  "v": 1
+}

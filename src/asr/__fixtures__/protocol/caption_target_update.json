@@ -1,0 +1,14 @@
+{
+  "data": {
+    "latency_ms": 981,
+    "rev": 3,
+    "target_lang": "en",
+    "target_text": "two paracetamol tablets"
+  },
+  "id": null,
+  "seq": 41,
+  "session": "sess_ab12",
+  "ts": 1718000000.125,
+  "type": "caption.target_update",
+  "v": 1
+}

@@ -1,0 +1,41 @@
+{
+  "data": {
+    "asr_switchable": true,
+    "clients": 3,
+    "gate": {
+      "min_interval_ms": 400.0,
+      "min_words": 3
+    },
+    "glossary": {
+      "sections": {
+        "person_names": {
+          "นพ. สมชาย": "Dr. Somchai"
+        },
+        "protected_terms": {
+          "ความดันโลหิตสูง": "hypertension"
+        },
+        "thai_corrections": {
+          "ยาพารา": "ยาพาราเซตามอล"
+        }
+      }
+    },
+    "mode": "stream",
+    "paused": false,
+    "report": {
+      "active": true,
+      "count": 12
+    },
+    "role": "operator",
+    "source_lang": "th",
+    "target_lang": "en",
+    "v_supported": [
+      1
+    ]
+  },
+  "id": null,
+  "seq": null,
+  "session": "sess_ab12",
+  "ts": 1718000000.125,
+  "type": "session.welcome",
+  "v": 1
+}

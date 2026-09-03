@@ -1,0 +1,9 @@
+{
+  "data": {},
+  "id": "c-1",
+  "seq": null,
+  "session": "sess_ab12",
+  "ts": 1718000000.125,
+  "type": "control.pong",
+  "v": 1
+}

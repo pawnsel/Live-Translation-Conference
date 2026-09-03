@@ -1,0 +1,17 @@
+{
+  "data": {
+    "corrected": "ยาพาราเซตามอลสองเม็ด",
+    "latency_ms": 743,
+    "raw": "ยาพาราสองเม็ด",
+    "source_lang": "th",
+    "source_text": "ยาพาราเซตามอลสองเม็ด",
+    "target_lang": "en",
+    "target_text": ""
+  },
+  "id": null,
+  "seq": 41,
+  "session": "sess_ab12",
+  "ts": 1718000000.125,
+  "type": "caption.final",
+  "v": 1
+}
