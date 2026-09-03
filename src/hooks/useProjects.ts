@@ -158,12 +158,31 @@ export function useProjects() {
 
   // A project outlives many ASR sessions: the Python registry is in memory,
   // so a backend restart forces a new session id under the same project.
+  // Any session left open by the old id (e.g. the backend restarted rather
+  // than the console cleanly detaching) is closed in this same update, so
+  // this can't collide with startSession's "already have an open session"
+  // guard and silently drop the new recording.
   const attachAsrSession = (asrSessionId: string, sourceLang: string, targetLang: string) => {
     if (!currentProject) return;
+    const now = Date.now();
+    const session: ProjectSession = {
+      id: `sess_${now}`,
+      asrSessionId,
+      startedAt: now,
+      sourceLang,
+      targetLang
+    };
     setProjects((prev) =>
-      prev.map((p: Project) => (p.id === currentProject.id ? { ...p, asrSessionId } : p))
+      prev.map((p: Project) =>
+        p.id === currentProject.id
+          ? {
+              ...p,
+              asrSessionId,
+              sessions: [...p.sessions.map((s) => (s.endedAt ? s : { ...s, endedAt: now })), session]
+            }
+          : p
+      )
     );
-    startSession(asrSessionId, sourceLang, targetLang);
   };
 
   const detachAsrSession = () => {
