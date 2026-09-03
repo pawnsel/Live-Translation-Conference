@@ -9,10 +9,12 @@ export interface AudioCaptureState {
   error: string | null;
 }
 
-function toWsUrl(backendUrl: string, path: string): string {
+function toWsUrl(backendUrl: string, sessionId: string): string {
   const url = new URL(backendUrl);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-  url.pathname = path;
+  // encodeURIComponent, not a raw template slot: a literal "/" inside
+  // sessionId would otherwise be read as an extra path segment.
+  url.pathname = `/ws/${encodeURIComponent(sessionId)}/audio`;
   url.search = '';
   return url.toString().replace(/\/$/, '');
 }
@@ -41,6 +43,7 @@ export function useAudioCapture(opts: {
 
     let disposed = false;
     let stream: MediaStream | null = null;
+    let track: MediaStreamTrack | null = null;
     let ctx: AudioContext | null = null;
     let framerNode: AudioWorkletNode | null = null;
     let micNode: MediaStreamAudioSourceNode | null = null;
@@ -48,9 +51,48 @@ export function useAudioCapture(opts: {
     let socket: WebSocket | null = null;
     let ready = false;
 
+    // The one place every resource this effect can have acquired gets
+    // released. Safe to call more than once — every step below is a no-op on
+    // something already stopped/closed/disconnected — because it runs from
+    // several places that can overlap: the effect cleanup, every failure
+    // path, and a disposed-check straight after an `await` that may have
+    // raced the cleanup and picked up a resource after teardown already ran
+    // once with that variable still unset.
+    const teardown = () => {
+      ready = false;
+      track?.removeEventListener('ended', onDeviceLost);
+      if (socket) {
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onerror = null;
+        socket.onclose = null;
+        socket.close();
+      }
+      framerNode?.port.close();
+      micNode?.disconnect();
+      framerNode?.disconnect();
+      sinkNode?.disconnect();
+      stream?.getTracks().forEach((t) => t.stop());
+      if (ctx && ctx.state !== 'closed') {
+        void ctx.close();
+      }
+    };
+
     const fail = (message: string) => {
+      // Release first, in every case: a message on screen with a hot mic or
+      // an open socket behind it is a lie about the session's state.
+      teardown();
       if (disposed) return;
       setState((s) => ({ ...s, status: 'error', error: message }));
+    };
+
+    // Unplugged, switched off, or grabbed by another application mid-session.
+    // Silent otherwise: frames stop, but nothing about `status` on its own
+    // says why — the meter (a later task) would just flatline.
+    const onDeviceLost = () => {
+      fail(
+        'ไมโครโฟนถูกตัดการเชื่อมต่อหรือถูกใช้งานโดยแอปพลิเคชันอื่น — ไม่มีเสียงถูกส่งเข้าเซสชันนี้แล้ว (the microphone was disconnected or taken by another application)',
+      );
     };
 
     const start = async () => {
@@ -61,15 +103,37 @@ export function useAudioCapture(opts: {
         return;
       }
 
+      // Browser-side cleanup is OFF on purpose: the backend runs its own
+      // preprocessing chain (denoise, pre-emphasis, RMS normalize) tuned for
+      // the room, and two normalizers in series fight each other — the
+      // browser's AGC pumps the noise floor up between sentences and the
+      // server's then squashes the sentences.
+      const constraints: MediaTrackConstraints = {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        channelCount: 1,
+      };
+
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+          audio: deviceId ? { ...constraints, deviceId: { exact: deviceId } } : constraints,
         });
       } catch {
         fail('เปิดไมโครโฟนไม่สำเร็จ — ตรวจสอบสิทธิ์และอุปกรณ์ (could not open the microphone)');
         return;
       }
-      if (disposed) return;
+      // The effect can have been cleaned up while getUserMedia was pending —
+      // the cleanup's own teardown() ran with `stream` still null and so
+      // stopped nothing. This is the only place that stream is reachable
+      // again, so it is the only place that can still stop it.
+      if (disposed) {
+        teardown();
+        return;
+      }
+
+      track = stream.getAudioTracks()[0] ?? null;
+      track?.addEventListener('ended', onDeviceLost);
 
       ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
       if (ctx.sampleRate !== SAMPLE_RATE) {
@@ -80,6 +144,10 @@ export function useAudioCapture(opts: {
         return;
       }
       await ctx.resume();
+      if (disposed) {
+        teardown();
+        return;
+      }
 
       const blobUrl = URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'application/javascript' }));
       try {
@@ -90,7 +158,10 @@ export function useAudioCapture(opts: {
       } finally {
         URL.revokeObjectURL(blobUrl);
       }
-      if (disposed) return;
+      if (disposed) {
+        teardown();
+        return;
+      }
 
       framerNode = new AudioWorkletNode(ctx, 'pcm-framer', {
         numberOfOutputs: 1,
@@ -122,7 +193,7 @@ export function useAudioCapture(opts: {
       sinkNode.gain.value = 0;
       framerNode.connect(sinkNode).connect(ctx.destination);
 
-      socket = new WebSocket(toWsUrl(backendUrl, `/ws/${sessionId}/audio`), ['bearer', sourceToken]);
+      socket = new WebSocket(toWsUrl(backendUrl, sessionId), ['bearer', sourceToken]);
       socket.binaryType = 'arraybuffer';
 
       socket.onopen = () => {
@@ -156,10 +227,11 @@ export function useAudioCapture(opts: {
         } else if (msg.type === 'audio.backpressure') {
           setState((s) => ({ ...s, backpressure: msg.data?.level === 'high' }));
         }
+        // Unknown frame type — ignored, so the server can add frames later
+        // without breaking this hook.
       };
 
       socket.onclose = (event) => {
-        ready = false;
         if (disposed || event.code === 1000) return;
         fail(describeCloseCode(event.code).message);
       };
@@ -169,14 +241,7 @@ export function useAudioCapture(opts: {
 
     return () => {
       disposed = true;
-      ready = false;
-      socket?.close();
-      framerNode?.port.close();
-      micNode?.disconnect();
-      framerNode?.disconnect();
-      sinkNode?.disconnect();
-      stream?.getTracks().forEach((track) => track.stop());
-      void ctx?.close();
+      teardown();
     };
   }, [active, backendUrl, sessionId, sourceToken, deviceId]);
 
