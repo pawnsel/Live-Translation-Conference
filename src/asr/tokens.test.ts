@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createOperatorTokenSource, mintSourceToken } from './tokens';
 
-function jsonFetch(responses: Array<{ ok?: boolean; status?: number; body: unknown }>) {
+function jsonFetch(responses: Array<{ ok?: boolean; status?: number; body?: unknown; jsonThrows?: boolean }>) {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const impl = vi.fn(async (url: string, init?: RequestInit) => {
     calls.push({ url, init });
@@ -10,7 +10,11 @@ function jsonFetch(responses: Array<{ ok?: boolean; status?: number; body: unkno
     return {
       ok: next.ok ?? true,
       status: next.status ?? 200,
-      json: async () => next.body,
+      json: next.jsonThrows
+        ? async () => {
+            throw new SyntaxError("Unexpected token '<', \"<html>...\" is not valid JSON");
+          }
+        : async () => next.body,
     } as Response;
   });
   return { impl: impl as unknown as typeof fetch, calls };
@@ -48,6 +52,13 @@ describe('createOperatorTokenSource', () => {
 
     await expect(source.get()).rejects.toThrow(/not configured/);
   });
+
+  it('handles unparseable responses without a SyntaxError', async () => {
+    const { impl } = jsonFetch([{ ok: false, status: 502, jsonThrows: true }]);
+    const source = createOperatorTokenSource({ fetchImpl: impl });
+
+    await expect(source.get()).rejects.toThrow(/Could not obtain an ASR token.*HTTP 502/);
+  });
 });
 
 describe('mintSourceToken', () => {
@@ -65,5 +76,11 @@ describe('mintSourceToken', () => {
     const { impl } = jsonFetch([{ ok: false, status: 404, body: { detail: 'not found' } }]);
 
     await expect(mintSourceToken('http://localhost:8765', 'gone', 'op-1', impl)).rejects.toThrow(/session/i);
+  });
+
+  it('handles unparseable responses without a SyntaxError', async () => {
+    const { impl } = jsonFetch([{ ok: false, status: 500, jsonThrows: true }]);
+
+    await expect(mintSourceToken('http://localhost:8765', 'sess_x', 'op-1', impl)).rejects.toThrow(/Could not mint a capture token.*HTTP 500/);
   });
 });

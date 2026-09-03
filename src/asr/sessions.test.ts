@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { chooseSession, createSession, getSession, listSessions, type SessionSnapshot } from './sessions';
+import { chooseSession, createSession, deleteSession, getSession, listSessions, type SessionSnapshot } from './sessions';
 
 function snapshot(id: string, extra: Partial<SessionSnapshot> = {}): SessionSnapshot {
   return {
@@ -78,5 +78,29 @@ describe('listSessions', () => {
   it('returns the array the backend sends', async () => {
     const { impl } = jsonFetch([{ body: [snapshot('sess_a')] }]);
     expect(await listSessions('http://localhost:8765', 'op-1', impl)).toHaveLength(1);
+  });
+});
+
+describe('deleteSession', () => {
+  it('sends DELETE with the correct URL and Authorization header', async () => {
+    const { impl, calls } = jsonFetch([{ body: {} }]);
+
+    await deleteSession('http://localhost:8765', 'op-1', 'sess_end', impl);
+
+    expect(calls[0].url).toBe('http://localhost:8765/sessions/sess_end');
+    expect(calls[0].init?.method).toBe('DELETE');
+    expect((calls[0].init?.headers as Record<string, string>).Authorization).toBe('Bearer op-1');
+  });
+
+  it('resolves without throwing when the session is already forgotten', async () => {
+    const { impl } = jsonFetch([{ ok: false, status: 404, body: {} }]);
+
+    await expect(deleteSession('http://localhost:8765', 'op-1', 'gone', impl)).resolves.toBeUndefined();
+  });
+
+  it('throws with the intended message on a 500 error', async () => {
+    const { impl } = jsonFetch([{ ok: false, status: 500, body: {} }]);
+
+    await expect(deleteSession('http://localhost:8765', 'op-1', 'sess_x', impl)).rejects.toThrow(/Could not end session.*HTTP 500/);
   });
 });

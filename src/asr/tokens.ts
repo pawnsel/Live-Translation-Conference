@@ -9,7 +9,7 @@ export function createOperatorTokenSource(opts: { fetchImpl?: typeof fetch; now?
 
   async function load(): Promise<string> {
     const response = await doFetch('/api/asr/token', { method: 'POST' });
-    const body = (await response.json()) as { token?: string; expiresAt?: number; error?: string };
+    const body = (await response.json().catch(() => ({}))) as { token?: string; expiresAt?: number; error?: string };
     if (!response.ok || !body.token || typeof body.expiresAt !== 'number') {
       throw new Error(body.error || `Could not obtain an ASR token (HTTP ${response.status})`);
     }
@@ -47,7 +47,7 @@ export async function mintSourceToken(
   if (response.status === 404) {
     throw new Error(`Session ${sessionId} no longer exists — create a new one`);
   }
-  const body = (await response.json()) as { token?: string };
+  const body = (await response.json().catch(() => ({}))) as { token?: string };
   if (!response.ok || !body.token) {
     throw new Error(`Could not mint a capture token (HTTP ${response.status})`);
   }
