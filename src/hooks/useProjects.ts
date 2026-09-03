@@ -23,8 +23,9 @@ function loadProjects(): Project[] {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
     const parsed: Project[] = stored ? JSON.parse(stored) : [];
-    // Projects saved before per-project transcripts existed have no array yet.
-    return parsed.map((p) => ({ ...p, transcripts: p.transcripts || [] }));
+    // Projects saved before per-project transcripts or ASR sessions existed
+    // have neither field yet.
+    return parsed.map((p) => ({ ...p, transcripts: p.transcripts || [], asrSessionId: p.asrSessionId ?? null }));
   } catch {
     return [];
   }
@@ -40,7 +41,7 @@ function loadSelectedId(): string | null {
 
 function countWords(transcripts: TranscriptItem[]): number {
   return transcripts.reduce((total, t) => {
-    const text = `${t.originalText} ${t.translatedText}`.trim();
+    const text = `${t.sourceText} ${t.targetText}`.trim();
     return total + (text ? text.split(/\s+/).length : 0);
   }, 0);
 }
@@ -127,10 +128,11 @@ export function useProjects() {
   const selectProject = (id: string) => setSelectedProjectId(id);
   const clearSelection = () => setSelectedProjectId(null);
 
-  const startSession = (sourceLang: string, targetLang: string) => {
+  const startSession = (asrSessionId: string, sourceLang: string, targetLang: string) => {
     if (!currentProject || activeSession) return;
     const session: ProjectSession = {
       id: `sess_${Date.now()}`,
+      asrSessionId,
       startedAt: Date.now(),
       sourceLang,
       targetLang
@@ -151,6 +153,24 @@ export function useProjects() {
             }
           : p
       )
+    );
+  };
+
+  // A project outlives many ASR sessions: the Python registry is in memory,
+  // so a backend restart forces a new session id under the same project.
+  const attachAsrSession = (asrSessionId: string, sourceLang: string, targetLang: string) => {
+    if (!currentProject) return;
+    setProjects((prev) =>
+      prev.map((p: Project) => (p.id === currentProject.id ? { ...p, asrSessionId } : p))
+    );
+    startSession(asrSessionId, sourceLang, targetLang);
+  };
+
+  const detachAsrSession = () => {
+    if (!currentProject) return;
+    endSession();
+    setProjects((prev) =>
+      prev.map((p: Project) => (p.id === currentProject.id ? { ...p, asrSessionId: null } : p))
     );
   };
 
@@ -190,6 +210,8 @@ export function useProjects() {
     selectProject,
     clearSelection,
     startSession,
+    attachAsrSession,
+    detachAsrSession,
     endSession,
     saveTranscripts,
     finishProject
