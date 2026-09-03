@@ -88,7 +88,11 @@ export default function Admin() {
       }
     }, HEALTH_POLL_MS);
     return () => clearInterval(timer);
-  }, [token, session]);
+    // `session` is a freshly-parsed object on every poll (never
+    // reference-equal to the last one, even when unchanged), so depending on
+    // it here would tear down and rebuild this very interval every cycle.
+    // `session?.id` is the only field this effect reads.
+  }, [token, session?.id]);
 
   // ── Control socket ───────────────────────────────────────────────────────
   const onFrame = useCallback((frame: AnyFrame) => {
@@ -124,7 +128,11 @@ export default function Admin() {
         .catch((err: Error) => setTokenError(err.message));
     }, SOURCE_TOKEN_REFRESH_MS);
     return () => clearInterval(timer);
-  }, [micActive, token, session]);
+    // Same reasoning as the health-poll effect above: `session` changes
+    // identity on every health poll, which would tear down and rebuild this
+    // 9.6 h interval roughly every 5 s — long enough that it would never
+    // survive to fire once. Depend on the stable `session?.id` instead.
+  }, [micActive, token, session?.id]);
 
   const toggleMic = async () => {
     if (micActive) {
