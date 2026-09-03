@@ -72,15 +72,32 @@ describe('createTokenBroker', () => {
   });
 
   it('throws a message that does not leak the password on 401', async () => {
-    const { impl } = fakeFetch([{ status: 401, body: { detail: 'invalid credentials' } }]);
+    // A failed login is never cached (see "does not cache a failure" below),
+    // so each call below issues its own real fetch — queue one 401 per call
+    // rather than relying on the mock-exhaustion path to reject the second.
+    const DISTINCTIVE_PASSWORD = 'xyzzy-plugh-correct-horse-battery-staple';
+    const { impl } = fakeFetch([
+      { status: 401, body: { detail: 'invalid credentials' } },
+      { status: 401, body: { detail: 'invalid credentials' } },
+    ]);
     const broker = createTokenBroker({
       backendUrl: 'http://localhost:8765',
-      password: 'wrong',
+      password: DISTINCTIVE_PASSWORD,
       fetchImpl: impl,
     });
 
     await expect(broker.getToken()).rejects.toThrow(/rejected the operator password/i);
-    await expect(broker.getToken()).rejects.not.toThrow(/wrong/);
+
+    let secondMessage = '';
+    try {
+      await broker.getToken();
+      throw new Error('expected getToken() to reject');
+    } catch (err) {
+      secondMessage = err instanceof Error ? err.message : String(err);
+    }
+    // Assert on the full captured message, not a partial toThrow match, so a
+    // password appended anywhere in the string would actually fail this.
+    expect(secondMessage).not.toContain(DISTINCTIVE_PASSWORD);
   });
 
   it('surfaces a connection failure as a distinct message', async () => {
@@ -101,5 +118,32 @@ describe('createTokenBroker', () => {
 
     await expect(broker.getToken()).rejects.toThrow();
     await expect(broker.getToken()).resolves.toMatchObject({ token: 'tok-1' });
+  });
+
+  it('collapses concurrent callers onto a single in-flight login', async () => {
+    const { impl } = fakeFetch([{ status: 200, body: { token: 'tok-1', expires_in: 43200 } }]);
+    const broker = createTokenBroker({
+      backendUrl: 'http://localhost:8765',
+      password: 'hunter2',
+      fetchImpl: impl,
+      now: () => 1_000_000,
+    });
+
+    const [a, b] = await Promise.all([broker.getToken(), broker.getToken()]);
+
+    expect(impl).toHaveBeenCalledTimes(1);
+    expect(a.token).toBe('tok-1');
+    expect(b.token).toBe('tok-1');
+  });
+
+  it('rejects every concurrent caller when the shared in-flight login fails', async () => {
+    const { impl } = fakeFetch([{ status: 401, body: {} }]);
+    const broker = createTokenBroker({ backendUrl: 'http://localhost:8765', password: 'p', fetchImpl: impl });
+
+    const results = await Promise.allSettled([broker.getToken(), broker.getToken()]);
+
+    expect(impl).toHaveBeenCalledTimes(1);
+    expect(results[0].status).toBe('rejected');
+    expect(results[1].status).toBe('rejected');
   });
 });
