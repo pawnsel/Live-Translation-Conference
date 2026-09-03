@@ -47,9 +47,9 @@ export async function mintSourceToken(
   if (response.status === 404) {
     throw new Error(`Session ${sessionId} no longer exists — create a new one`);
   }
-  const body = (await response.json().catch(() => ({}))) as { token?: string };
+  const body = (await response.json().catch(() => ({}))) as { token?: string; error?: string };
   if (!response.ok || !body.token) {
-    throw new Error(`Could not mint a capture token (HTTP ${response.status})`);
+    throw new Error(body.error || `Could not mint a capture token (HTTP ${response.status})`);
   }
   return body.token;
 }

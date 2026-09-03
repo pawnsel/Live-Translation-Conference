@@ -23,6 +23,14 @@ const HEALTH_POLL_MS = 5000;
 // event day can run past 12 h; re-mint at 80% rather than discover this at
 // hour twelve of a conference.
 const SOURCE_TOKEN_REFRESH_MS = 12 * 3600 * 1000 * 0.8;
+// Operator tokens live 12 h too, and `tokenSource.get()` only refreshes once
+// 80% of that life has elapsed — calling it more often costs nothing (it
+// just returns the cached token) until it's actually time to re-mint. A
+// short, minutes-scale poll is therefore both sufficient and more robust
+// than one long timer: it re-checks often enough to catch the 80% mark
+// promptly, and a short interval is far less exposed to whatever might tear
+// an effect down and rebuild it (see the stale-dependency notes below).
+const OPERATOR_TOKEN_POLL_MS = 5 * 60 * 1000;
 
 export default function Admin() {
   const projects = useProjects();
@@ -59,6 +67,25 @@ export default function Admin() {
       .catch((err: Error) => setTokenError(err.message));
   }, [tokenSource]);
 
+  // `tokenSource.get()` caches internally and only re-mints once 80% of the
+  // token's life has passed, but nothing calls `.get()` again unless we ask
+  // it to. Without this, the operator token fetched on mount is never
+  // refreshed, and it silently expires partway through a conference.
+  useEffect(() => {
+    const timer = setInterval(() => {
+      tokenSource
+        .get()
+        .then(setToken)
+        .catch((err: Error) => setTokenError(err.message));
+    }, OPERATOR_TOKEN_POLL_MS);
+    return () => clearInterval(timer);
+    // `tokenSource` is created with `useMemo(() => createOperatorTokenSource(), [])`
+    // above, so it is stable for the life of the component — unlike `projects`
+    // (a fresh object every render) and `session` (a fresh parse every poll),
+    // both of which have previously defeated a long timer in this file by
+    // forcing it to tear down and rebuild before it could ever fire.
+  }, [tokenSource]);
+
   // ── Adopt or offer to create a session ───────────────────────────────────
   useEffect(() => {
     if (!token || bootstrapped.current) return;
@@ -76,7 +103,17 @@ export default function Admin() {
   useEffect(() => {
     if (!token || !session) return;
     const timer = setInterval(async () => {
-      const fresh = await getSession(BACKEND_URL, token, session.id).catch(() => undefined);
+      let fresh: SessionSnapshot | null | undefined;
+      try {
+        fresh = await getSession(BACKEND_URL, token, session.id);
+      } catch (err) {
+        // A 401/500/network blip is not the same as a 404 — the session may
+        // still be alive. Surface it instead of silently going dark; do not
+        // touch session/mic state, so a transient failure doesn't tear down
+        // a healthy session.
+        setTokenError((err as Error).message);
+        return;
+      }
       if (fresh === null) {
         // The backend forgot this session — a restart. Do not retry the id.
         setSession(null);

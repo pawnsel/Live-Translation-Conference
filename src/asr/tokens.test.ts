@@ -83,4 +83,10 @@ describe('mintSourceToken', () => {
 
     await expect(mintSourceToken('http://localhost:8765', 'sess_x', 'op-1', impl)).rejects.toThrow(/Could not mint a capture token.*HTTP 500/);
   });
+
+  it('prefers the broker error message over the generic HTTP-status message', async () => {
+    const { impl } = jsonFetch([{ ok: false, status: 503, body: { error: 'ASR recognizer pool exhausted' } }]);
+
+    await expect(mintSourceToken('http://localhost:8765', 'sess_x', 'op-1', impl)).rejects.toThrow(/ASR recognizer pool exhausted/);
+  });
 });
