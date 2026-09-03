@@ -26,9 +26,9 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   });
 }
 
-// Helper to get GoogleGenAI client with user token or fallback
-function getAiClient(userToken?: string) {
-  const key = userToken?.trim() || process.env.GEMINI_API_KEY;
+// Helper to get GoogleGenAI client using the platform API key
+function getAiClient() {
+  const key = process.env.GEMINI_API_KEY;
   if (!key) {
     throw new Error("No Gemini API Key provided.");
   }
@@ -67,12 +67,10 @@ const QUICK_PHRASES: Record<string, { Thai: string; English: string }> = {
 };
 
 // Main Translation Engine with graceful AI & Dictionary Fallback
-async function performTranslation(text: string, config: any, customKey?: string): Promise<{ translatedText: string; isAi: boolean }> {
-  const activeKey = customKey?.trim() || process.env.GEMINI_API_KEY;
-  
-  if (activeKey) {
+async function performTranslation(text: string, config: any): Promise<{ translatedText: string; isAi: boolean }> {
+  if (process.env.GEMINI_API_KEY) {
     try {
-      const client = getAiClient(activeKey);
+      const client = getAiClient();
       const prompt = buildTranslationPrompt(config, text);
       const modelToUse = config?.aiModel || "gemini-3.7-flash";
       const response = await withTimeout(
@@ -173,9 +171,6 @@ async function startServer() {
 
   app.use(express.json());
 
-  // Store server-side secret API Key securely (never transmitted to clients)
-  let serverSecretApiKey = "";
-
   // Store state in memory
   let currentConfig: any = {
     sourceLang: "th-TH",
@@ -197,80 +192,36 @@ async function startServer() {
     chunkSilenceMs: 900
   };
 
-  // Helper to safely serialize config for broadcast (stripping secrets)
-  function getSanitizedConfig() {
-    return {
-      ...currentConfig,
-      apiToken: undefined,
-      hasCustomToken: Boolean(serverSecretApiKey && serverSecretApiKey.trim())
-    };
-  }
-  
   let transcripts: any[] = [];
   let isMeetingActive = false;
 
+  // Bumped on every change. A connection's initial snapshot can be delivered
+  // after a later broadcast (polling→websocket upgrade, or a reconnect), so
+  // clients need the version to drop a stale value instead of applying it.
+  let meetingVersion = 0;
+  const meetingStatus = () => ({ active: isMeetingActive, v: meetingVersion });
+
   io.on("connection", (socket) => {
-    // Send sanitized state to new clients (No secret API key exposed!)
-    socket.emit("config-updated", getSanitizedConfig());
+    socket.emit("config-updated", currentConfig);
     socket.emit("transcripts-updated", transcripts);
-    socket.emit("meeting-status", isMeetingActive);
+    socket.emit("meeting-status", meetingStatus());
 
     // Admin updates config
     socket.on("update-config", (newConfig: any) => {
-      // Check if a new API token was submitted
-      if (typeof newConfig.apiToken === "string") {
-        const trimmed = newConfig.apiToken.trim();
-        if (trimmed) {
-          serverSecretApiKey = trimmed;
-        }
-      }
-      if (newConfig.clearToken) {
-        serverSecretApiKey = "";
-      }
-
-      // Save other configuration parameters
-      const { apiToken, clearToken, ...safeConfig } = newConfig;
-      currentConfig = { ...currentConfig, ...safeConfig };
-
-      // Broadcast sanitized config to all clients
-      io.emit("config-updated", getSanitizedConfig());
-    });
-
-    // Test token connection
-    socket.on("test-token", async (tokenToTest?: string) => {
-      try {
-        const targetKey = tokenToTest?.trim() || serverSecretApiKey;
-        const client = getAiClient(targetKey);
-        const res = await withTimeout(
-          client.models.generateContent({
-            model: "gemini-3.7-flash",
-            contents: "Say 'OK' if working.",
-          }),
-          GEMINI_TIMEOUT_MS,
-          "Gemini API key test"
-        );
-        socket.emit("test-token-result", { 
-          success: true, 
-          message: targetKey ? "API Key ใช้งานได้สมบูรณ์ (Verified & Active)" : "Default API Key ทำงานปกติ" 
-        });
-      } catch (err: any) {
-        socket.emit("test-token-result", { 
-          success: false, 
-          message: err.message || "API Key ไม่ถูกต้อง หรือโควต้าหมดอายุ" 
-        });
-      }
+      currentConfig = { ...currentConfig, ...newConfig };
+      io.emit("config-updated", currentConfig);
     });
 
     socket.on("start-meeting", () => {
       isMeetingActive = true;
-      transcripts = []; // Clear for new meeting
-      io.emit("meeting-status", isMeetingActive);
-      io.emit("transcripts-updated", transcripts);
+      meetingVersion++;
+      io.emit("meeting-status", meetingStatus());
     });
 
     socket.on("stop-meeting", () => {
       isMeetingActive = false;
-      io.emit("meeting-status", isMeetingActive);
+      meetingVersion++;
+      io.emit("meeting-status", meetingStatus());
     });
 
     // Ping for live socket latency
@@ -295,7 +246,7 @@ async function startServer() {
       io.emit("transcripts-updated", transcripts);
 
       try {
-        const { translatedText } = await performTranslation(text.trim(), currentConfig, serverSecretApiKey);
+        const { translatedText } = await performTranslation(text.trim(), currentConfig);
         const latencyMs = Date.now() - startTime;
         
         // Update item
@@ -320,6 +271,13 @@ async function startServer() {
     // Clear transcripts
     socket.on("clear-transcripts", () => {
       transcripts = [];
+      io.emit("transcripts-updated", transcripts);
+    });
+
+    // Replace the buffer wholesale — used when the console switches project,
+    // so the live feed shows that project's own transcripts and nothing else.
+    socket.on("load-transcripts", (items: any[]) => {
+      transcripts = Array.isArray(items) ? items : [];
       io.emit("transcripts-updated", transcripts);
     });
 
@@ -355,7 +313,7 @@ async function startServer() {
       io.emit("transcripts-updated", transcripts);
 
       try {
-        const { translatedText } = await performTranslation(textToTranslate, currentConfig, serverSecretApiKey);
+        const { translatedText } = await performTranslation(textToTranslate, currentConfig);
         const latencyMs = Date.now() - startTime;
         const idx = transcripts.findIndex(t => t.id === data.id);
         if (idx !== -1) {

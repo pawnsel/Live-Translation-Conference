@@ -5,7 +5,6 @@ import {
   MicOff,
   Languages,
   BookOpen,
-  Key,
   Copy,
   Check,
   Download,
@@ -18,11 +17,7 @@ import {
   RotateCcw,
   Sliders,
   Radio,
-  Eye,
-  EyeOff,
   Menu,
-  ShieldCheck,
-  Lock,
   ShieldAlert,
   Cpu,
   Volume2,
@@ -34,6 +29,9 @@ import {
 } from 'lucide-react';
 import { AppConfig, TranscriptItem } from '../types';
 import DictionaryManager from '../components/DictionaryManager';
+import { useProjects } from '../hooks/useProjects';
+import { ProjectPicker, ProjectHeaderBar, BillModal, HistoryPanel } from '../components/ProjectPanel';
+import type { Project } from '../types';
 
 export default function Admin() {
   const [socket, setSocket] = useState<Socket | null>(null);
@@ -58,13 +56,12 @@ export default function Admin() {
     ),
     showOriginal: true,
     showLatency: true,
-    hasCustomToken: false,
     chunkSilenceMs: 900
   });
 
   const [transcripts, setTranscripts] = useState<TranscriptItem[]>([]);
   const [isMeetingActive, setIsMeetingActive] = useState(false);
-  const [activeTab, setActiveTab] = useState<'languages' | 'dictionary' | 'token'>('languages');
+  const [activeTab, setActiveTab] = useState<'languages' | 'dictionary'>('languages');
   const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
 
   // Manual / Quick Test Input
@@ -74,13 +71,38 @@ export default function Admin() {
   const [socketPingMs, setSocketPingMs] = useState<number | null>(null);
   const [lastAiLatencyMs, setLastAiLatencyMs] = useState<number | null>(null);
 
-  // Token management & Secret Key protection
-  const [inputToken, setInputToken] = useState('');
-  const [showToken, setShowToken] = useState(false);
-  const [testingToken, setTestingToken] = useState(false);
-  const [isSavingToken, setIsSavingToken] = useState(false);
-  const [tokenSavedSuccess, setTokenSavedSuccess] = useState(false);
-  const [tokenTestResult, setTokenTestResult] = useState<{ success?: boolean; message?: string } | null>(null);
+  // Project / Session management (see SYSTEM_OVERVIEW.md §4)
+  const {
+    activeProjects,
+    endedProjects,
+    currentProject,
+    activeSession,
+    canCreateProject,
+    createProject,
+    selectProject,
+    clearSelection,
+    startSession,
+    endSession,
+    saveTranscripts,
+    finishProject
+  } = useProjects();
+  const [showHistory, setShowHistory] = useState(false);
+  const [finishedProject, setFinishedProject] = useState<Project | null>(null);
+
+  // The server holds one live transcript buffer; it belongs to whichever project
+  // is open. `hydratedProjectRef` tracks which project's transcripts we pushed
+  // into it, so an incoming update is only saved back to the project it came from.
+  const hydratedProjectRef = useRef<string | null>(null);
+
+  // True only while this tab owns the running session it started itself.
+  const startedMeetingRef = useRef(false);
+
+  // Highest meeting-status version applied, so stale snapshots can be dropped.
+  const meetingVersionRef = useRef(-1);
+
+  // Read inside socket handlers, which are registered once and must not close
+  // over a stale editing state.
+  const editingItemIdRef = useRef<string | null>(null);
 
   // Editing items
   const [editingItemId, setEditingItemId] = useState<string | null>(null);
@@ -124,6 +146,10 @@ export default function Admin() {
     isListeningRef.current = isListening;
   }, [isListening]);
 
+  useEffect(() => {
+    editingItemIdRef.current = editingItemId;
+  }, [editingItemId]);
+
   // Commit recognized speech segment/chunk for live translation
   const commitSpeechChunk = (text: string) => {
     const cleanText = text.trim();
@@ -162,12 +188,26 @@ export default function Admin() {
     const newSocket = io();
     setSocket(newSocket);
 
+    // A socket replaced by this effect's cleanup must not keep writing state:
+    // its late frames (notably the `meeting-status` snapshot every connection
+    // receives) would otherwise clobber the live socket's values.
+    let disposed = false;
+
     newSocket.on('config-updated', (newConfig: AppConfig) => {
+      if (disposed) return;
       setConfig((prev) => ({ ...prev, ...newConfig }));
     });
 
     newSocket.on('transcripts-updated', (items: TranscriptItem[]) => {
+      if (disposed) return;
       setTranscripts(items);
+
+      // Mirror the live buffer into whichever project it currently belongs to
+      const ownerProjectId = hydratedProjectRef.current;
+      if (ownerProjectId) {
+        saveTranscripts(ownerProjectId, items);
+      }
+
       // Track last translation latency
       const latestWithLatency = [...items].reverse().find((t) => t.latencyMs !== undefined);
       if (latestWithLatency && latestWithLatency.latencyMs) {
@@ -176,7 +216,7 @@ export default function Admin() {
 
       // Auto scroll down smoothly
       setTimeout(() => {
-        if (transcriptScrollRef.current && !editingItemId) {
+        if (transcriptScrollRef.current && !editingItemIdRef.current) {
           transcriptScrollRef.current.scrollTo({
             top: transcriptScrollRef.current.scrollHeight,
             behavior: 'smooth'
@@ -185,23 +225,30 @@ export default function Admin() {
       }, 80);
     });
 
-    newSocket.on('meeting-status', (status: boolean) => {
+    newSocket.on('meeting-status', (payload: boolean | { active: boolean; v: number }) => {
+      if (disposed) return;
+
+      // A connection's initial snapshot can arrive after a newer broadcast, which
+      // would flip the console back to idle while the server is still recording.
+      const status = typeof payload === 'boolean' ? payload : payload.active;
+      if (typeof payload !== 'boolean') {
+        if (payload.v < meetingVersionRef.current) return;
+        meetingVersionRef.current = payload.v;
+      }
+
       setIsMeetingActive(status);
       if (status) {
         startListening();
       } else {
+        // Whoever stopped it, this tab no longer owns a running session.
+        startedMeetingRef.current = false;
         stopListening();
       }
     });
 
-    newSocket.on('test-token-result', (result: { success: boolean; message: string }) => {
-      setTestingToken(false);
-      setTokenTestResult(result);
-      setTimeout(() => setTokenTestResult(null), 4000);
-    });
-
     // Pong for live socket ping calculation
     newSocket.on('pong-check', (data: { clientTimestamp: number }) => {
+      if (disposed) return;
       const ping = Date.now() - data.clientTimestamp;
       setSocketPingMs(ping);
     });
@@ -214,11 +261,38 @@ export default function Admin() {
     }, 3000);
 
     return () => {
+      disposed = true;
       clearInterval(pingInterval);
       newSocket.close();
       stopListening();
     };
-  }, [editingItemId]);
+    // One connection for the lifetime of the console — re-running this on every
+    // inline edit opened a second socket whose stale snapshot fought the first.
+  }, []);
+
+  // Hand the server the open project's transcripts, so the live feed shows that
+  // project's own history and new captions append to it.
+  useEffect(() => {
+    if (!socket || !currentProject) {
+      hydratedProjectRef.current = null;
+      return;
+    }
+    if (hydratedProjectRef.current === currentProject.id) return;
+    socket.emit('load-transcripts', currentProject.transcripts || []);
+    hydratedProjectRef.current = currentProject.id;
+  }, [socket, currentProject?.id]);
+
+  // A project can be auto-finished at its 7-day deadline while it is open —
+  // stop the microphone rather than leaving it recording into nothing.
+  // `meeting-status` is broadcast to every client, so this must only ever act on
+  // a session this tab itself started; otherwise a second console sitting on the
+  // picker would stop the session another console just started.
+  useEffect(() => {
+    if (!currentProject && isMeetingActive && startedMeetingRef.current) {
+      startedMeetingRef.current = false;
+      socket?.emit('stop-meeting');
+    }
+  }, [currentProject, isMeetingActive, socket]);
 
   // Handle Speech Recognition setup with smart pause segmentation / chunking
   const startListening = () => {
@@ -357,12 +431,36 @@ export default function Admin() {
   };
 
   const toggleMeeting = () => {
-    if (!socket) return;
+    if (!socket || !currentProject) return;
     if (isMeetingActive) {
+      startedMeetingRef.current = false;
       socket.emit('stop-meeting');
+      endSession();
     } else {
+      startedMeetingRef.current = true;
       socket.emit('start-meeting');
+      startSession(config.sourceLang, config.targetLang);
     }
+  };
+
+  const handleRequestFinishProject = () => {
+    if (!socket || !currentProject) return;
+    if (isMeetingActive) {
+      startedMeetingRef.current = false;
+      socket.emit('stop-meeting');
+    }
+    const finished = finishProject(transcripts);
+    // Detach the buffer from the project first, so clearing it does not wipe
+    // the transcripts we just billed.
+    hydratedProjectRef.current = null;
+    socket.emit('clear-transcripts');
+    if (finished) setFinishedProject(finished);
+  };
+
+  const handleSwitchProject = () => {
+    if (activeSession) return; // one microphone, one live buffer
+    hydratedProjectRef.current = null;
+    clearSelection();
   };
 
   const handleConfigChange = (
@@ -427,33 +525,6 @@ export default function Admin() {
     if (overrideText === undefined) {
       setTestInputText('');
     }
-  };
-
-  const handleSaveToken = (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    if (!inputToken.trim() || !socket) return;
-    setIsSavingToken(true);
-    socket.emit('update-config', { apiToken: inputToken.trim() });
-    setInputToken('');
-    setTokenSavedSuccess(true);
-    setTimeout(() => {
-      setIsSavingToken(false);
-      setTokenSavedSuccess(false);
-    }, 2500);
-  };
-
-  const handleDeleteToken = () => {
-    if (!socket) return;
-    if (window.confirm('ยืนยันลบ Custom API Key ออกจาก Server และกลับไปใช้ Default Gemini Key?')) {
-      socket.emit('update-config', { clearToken: true });
-    }
-  };
-
-  const handleTestToken = (customCandidate?: string) => {
-    if (!socket) return;
-    setTestingToken(true);
-    setTokenTestResult(null);
-    socket.emit('test-token', customCandidate || '');
   };
 
   const handleCopyItem = (item: TranscriptItem) => {
@@ -565,8 +636,26 @@ export default function Admin() {
     }
   };
 
+  if (!currentProject) {
+    return (
+      <>
+        <ProjectPicker
+          activeProjects={activeProjects}
+          canCreateProject={canCreateProject}
+          onSelect={selectProject}
+          onCreate={createProject}
+          onOpenHistory={() => setShowHistory(true)}
+        />
+        {showHistory && <HistoryPanel projects={endedProjects} onClose={() => setShowHistory(false)} />}
+        {finishedProject && <BillModal project={finishedProject} onClose={() => setFinishedProject(null)} />}
+      </>
+    );
+  }
+
   return (
     <div className="flex flex-col h-screen w-full bg-slate-100 text-slate-800 font-sans overflow-hidden">
+      {showHistory && <HistoryPanel projects={endedProjects} onClose={() => setShowHistory(false)} />}
+      {finishedProject && <BillModal project={finishedProject} onClose={() => setFinishedProject(null)} />}
       {/* ─────────────────────────────────────────────────────────────
           TOP CONTROL & METRICS BAR (Professional Minimal Header)
       ────────────────────────────────────────────────────────────── */}
@@ -593,6 +682,16 @@ export default function Admin() {
                 Google Chirp + Gemini 3.7
               </span>
             </div>
+          </div>
+
+          <div className="hidden sm:block">
+            <ProjectHeaderBar
+              project={currentProject}
+              activeSession={activeSession}
+              onRequestFinish={handleRequestFinishProject}
+              onSwitchProject={handleSwitchProject}
+              onOpenHistory={() => setShowHistory(true)}
+            />
           </div>
         </div>
 
@@ -660,10 +759,21 @@ export default function Admin() {
             }`}
           >
             {isMeetingActive ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
-            <span>{isMeetingActive ? 'หยุดแปลสด' : 'เริ่มแปลสด'}</span>
+            <span>{isMeetingActive ? 'จบ Session' : 'เริ่ม Session'}</span>
           </button>
         </div>
       </header>
+
+      {/* Project bar on mobile (hidden in the header row above sm) */}
+      <div className="sm:hidden px-3 py-2 bg-white border-b border-slate-200 shrink-0 overflow-x-auto">
+        <ProjectHeaderBar
+          project={currentProject}
+          activeSession={activeSession}
+          onRequestFinish={handleRequestFinishProject}
+          onSwitchProject={handleSwitchProject}
+          onOpenHistory={() => setShowHistory(true)}
+        />
+      </div>
 
       {/* ─────────────────────────────────────────────────────────────
           MAIN WORKSPACE LAYOUT
@@ -676,7 +786,7 @@ export default function Admin() {
           }`}
         >
           {/* Navigation Tabs */}
-          <div className="grid grid-cols-3 p-1.5 bg-slate-50 border-b border-slate-200 text-xs gap-1 shrink-0">
+          <div className="grid grid-cols-2 p-1.5 bg-slate-50 border-b border-slate-200 text-xs gap-1 shrink-0">
             <button
               onClick={() => setActiveTab('languages')}
               className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all ${
@@ -698,20 +808,6 @@ export default function Admin() {
             >
               <BookOpen className="w-4 h-4" />
               <span className="whitespace-nowrap">พจนานุกรม</span>
-            </button>
-            <button
-              onClick={() => setActiveTab('token')}
-              className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all relative ${
-                activeTab === 'token'
-                  ? 'bg-white text-[#DE5C8E] shadow-xs'
-                  : 'text-slate-500 hover:text-slate-800'
-              }`}
-            >
-              <Key className="w-4 h-4" />
-              <span className="whitespace-nowrap">API Key</span>
-              {config.hasCustomToken && (
-                <span className="w-2 h-2 rounded-full bg-emerald-500 ring-2 ring-white absolute top-1.5 right-2"></span>
-              )}
             </button>
           </div>
 
@@ -890,147 +986,6 @@ export default function Admin() {
               </div>
             )}
 
-            {/* TAB 3: API KEY / TOKEN */}
-            {activeTab === 'token' && (
-              <div className="space-y-4">
-                {/* Security Status Banner */}
-                {config.hasCustomToken ? (
-                  <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl space-y-2.5">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2 text-emerald-800 font-semibold text-xs">
-                        <ShieldCheck className="w-4.5 h-4.5 text-emerald-600 shrink-0" />
-                        <span>บันทึก Key บน Server ปลอดภัย</span>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={handleDeleteToken}
-                        className="p-1.5 text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-lg transition-all"
-                        title="ลบ Key ออกจาก Server และกลับไปใช้ Default Key"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-
-                    <button
-                      type="button"
-                      onClick={() => handleTestToken()}
-                      disabled={testingToken}
-                      className="w-full py-2 bg-white border border-emerald-300 hover:bg-emerald-100 text-emerald-800 rounded-lg text-xs font-semibold transition-all shadow-xs disabled:opacity-50 flex items-center justify-center gap-2"
-                    >
-                      <ShieldCheck className="w-4 h-4 text-emerald-600" />
-                      <span>{testingToken ? 'กำลังตรวจสอบ...' : 'ทดสอบการเชื่อมต่อ API Key'}</span>
-                    </button>
-                  </div>
-                ) : (
-                  <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl space-y-1.5">
-                    <div className="flex items-center gap-2 text-slate-700 font-semibold text-xs">
-                      <Lock className="w-4 h-4 text-slate-500 shrink-0" />
-                      <span>กำลังใช้ Default API Key ของระบบ</span>
-                    </div>
-                    <p className="text-xs text-slate-500 leading-relaxed">
-                      คุณสามารถระบุ Gemini API Key ส่วนตัวเพื่อขยายขีดจำกัดโควต้าและความเร็วในการประมวลผลได้
-                    </p>
-                  </div>
-                )}
-
-                {/* Input New Key Form */}
-                <form onSubmit={handleSaveToken} className="space-y-2.5 pt-1">
-                  <div className="flex items-center justify-between">
-                    <label className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
-                      <Key className="w-3.5 h-3.5 text-[#DE5C8E]" />
-                      <span>{config.hasCustomToken ? 'เปลี่ยน API Key ใหม่' : 'ระบุ Gemini API Key ส่วนตัว'}</span>
-                    </label>
-                    {inputToken && (
-                      <button
-                        type="button"
-                        onClick={() => setShowToken(!showToken)}
-                        className="text-xs text-slate-400 hover:text-slate-600 flex items-center gap-1"
-                      >
-                        {showToken ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                        <span>{showToken ? 'ซ่อน' : 'แสดง'}</span>
-                      </button>
-                    )}
-                  </div>
-
-                  <div className="relative">
-                    <input
-                      type={showToken ? 'text' : 'password'}
-                      value={inputToken}
-                      onChange={(e) => setInputToken(e.target.value)}
-                      placeholder="วาง Gemini API Key (เช่น AIzaSy...)"
-                      className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg font-mono outline-none focus:bg-white focus:border-[#DE5C8E] transition-all pr-8"
-                    />
-                    {inputToken && (
-                      <button
-                        type="button"
-                        onClick={() => setInputToken('')}
-                        className="absolute right-2.5 top-2.5 text-slate-400 hover:text-slate-600"
-                      >
-                        <X className="w-4 h-4" />
-                      </button>
-                    )}
-                  </div>
-
-                  <div className="flex gap-2 pt-1">
-                    <button
-                      type="submit"
-                      disabled={!inputToken.trim() || isSavingToken}
-                      className="flex-1 py-2 bg-[#DE5C8E] hover:bg-[#c94577] text-white rounded-lg text-xs font-bold transition-all shadow-xs disabled:opacity-40 flex items-center justify-center gap-1.5"
-                    >
-                      <Lock className="w-3.5 h-3.5" />
-                      <span>{isSavingToken ? 'กำลังบันทึก...' : 'บันทึก Key ลง Server'}</span>
-                    </button>
-                    {inputToken.trim() && (
-                      <button
-                        type="button"
-                        onClick={() => handleTestToken(inputToken.trim())}
-                        disabled={testingToken}
-                        className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-medium transition-all disabled:opacity-50 whitespace-nowrap"
-                      >
-                        ทดสอบ Key
-                      </button>
-                    )}
-                  </div>
-                </form>
-
-                {/* Save Feedback */}
-                {tokenSavedSuccess && (
-                  <div className="p-3 rounded-xl text-xs bg-emerald-50 border border-emerald-300 text-emerald-800 flex items-center gap-2">
-                    <Check className="w-4 h-4 text-emerald-600 shrink-0" />
-                    <span>บันทึก API Key บน Server สำเร็จและซ่อนจากฝั่ง Client แล้ว</span>
-                  </div>
-                )}
-
-                {/* Test Result Feedback */}
-                {tokenTestResult && (
-                  <div
-                    className={`p-3 rounded-xl text-xs flex items-center gap-2 border ${
-                      tokenTestResult.success
-                        ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
-                        : 'bg-rose-50 text-rose-800 border-rose-200'
-                    }`}
-                  >
-                    {tokenTestResult.success ? (
-                      <ShieldCheck className="w-4.5 h-4.5 text-emerald-600 shrink-0" />
-                    ) : (
-                      <ShieldAlert className="w-4.5 h-4.5 text-rose-600 shrink-0" />
-                    )}
-                    <span>{tokenTestResult.message}</span>
-                  </div>
-                )}
-
-                <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-500 space-y-1.5">
-                  <div className="font-semibold text-slate-700 flex items-center gap-1.5">
-                    <ShieldCheck className="w-3.5 h-3.5 text-slate-500" />
-                    <span>ระบบรักษาความปลอดภัย:</span>
-                  </div>
-                  <ul className="list-disc list-inside space-y-1 text-[11px] text-slate-500">
-                    <li>API Key ได้รับการเข้ารหัสและจัดเก็บบน Server-Side เท่านั้น</li>
-                    <li>ไม่เปิดเผย API Key ผ่านทาง Network Request หรือ DevTools</li>
-                  </ul>
-                </div>
-              </div>
-            )}
           </div>
 
           {/* Close drawer button on mobile */}
