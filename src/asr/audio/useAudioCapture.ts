@@ -42,6 +42,13 @@ export function useAudioCapture(opts: {
     }
 
     let disposed = false;
+    // Set the moment a terminal failure has already run teardown() once.
+    // `disposed` only ever means "the component unmounted" — it says nothing
+    // about a failure (mic lost, socket closed non-1000, ...) that tore
+    // everything down while the startup continuation was still mid-`await`.
+    // Every post-await guard below has to stop for EITHER reason, or it runs
+    // its next step against resources fail() already released.
+    let aborted = false;
     let stream: MediaStream | null = null;
     let track: MediaStreamTrack | null = null;
     let ctx: AudioContext | null = null;
@@ -68,9 +75,12 @@ export function useAudioCapture(opts: {
         socket.onclose = null;
         socket.close();
       }
-      framerNode?.port.close();
+      if (framerNode) {
+        framerNode.port.onmessage = null;
+        framerNode.port.close();
+        framerNode.disconnect();
+      }
       micNode?.disconnect();
-      framerNode?.disconnect();
       sinkNode?.disconnect();
       stream?.getTracks().forEach((t) => t.stop());
       if (ctx && ctx.state !== 'closed') {
@@ -82,7 +92,12 @@ export function useAudioCapture(opts: {
       // Release first, in every case: a message on screen with a hot mic or
       // an open socket behind it is a lie about the session's state.
       teardown();
-      if (disposed) return;
+      // Whichever reason gets here FIRST is the true cause — a device-loss
+      // during, say, addModule() must not be overwritten by the artifact of
+      // that same teardown (a closed AudioContext rejecting the pending
+      // addModule) reaching its own catch a moment later.
+      if (disposed || aborted) return;
+      aborted = true;
       setState((s) => ({ ...s, status: 'error', error: message }));
     };
 
@@ -127,7 +142,7 @@ export function useAudioCapture(opts: {
       // the cleanup's own teardown() ran with `stream` still null and so
       // stopped nothing. This is the only place that stream is reachable
       // again, so it is the only place that can still stop it.
-      if (disposed) {
+      if (disposed || aborted) {
         teardown();
         return;
       }
@@ -144,7 +159,10 @@ export function useAudioCapture(opts: {
         return;
       }
       await ctx.resume();
-      if (disposed) {
+      // Between here and the getUserMedia guard above, `onDeviceLost` is
+      // armed and can fire at any point — including during this very await —
+      // and already ran fail()/teardown() by the time control returns here.
+      if (disposed || aborted) {
         teardown();
         return;
       }
@@ -158,7 +176,15 @@ export function useAudioCapture(opts: {
       } finally {
         URL.revokeObjectURL(blobUrl);
       }
-      if (disposed) {
+      // Same race as above: a device loss during addModule() itself tore
+      // everything down (including closing `ctx`), which is what would make
+      // the addModule() call above reject in the first place — so the catch
+      // just above can also reach here having already reported the WRONG
+      // reason if this guard did not stop it. It is the aborted flag, not
+      // this guard, that keeps the operator-facing message correct; this
+      // guard's job is only to stop the continuation from touching resources
+      // that no longer exist.
+      if (disposed || aborted) {
         teardown();
         return;
       }
@@ -237,7 +263,16 @@ export function useAudioCapture(opts: {
       };
     };
 
-    void start();
+    // A synchronous throw from a step this file does not explicitly guard
+    // (the AudioContext / AudioWorkletNode constructors, for instance) would
+    // otherwise escape as an unhandled rejection with no `.catch` anywhere on
+    // `start()`. Routed through fail() so it is still subject to the
+    // first-reason-wins rule above — this only ever becomes the reported
+    // message when nothing more specific got there first.
+    start().catch((err: unknown) => {
+      const detail = err instanceof Error ? err.message : String(err);
+      fail(`เกิดข้อผิดพลาดที่ไม่คาดคิดขณะเริ่มรับเสียง (unexpected error starting audio capture: ${detail})`);
+    });
 
     return () => {
       disposed = true;
