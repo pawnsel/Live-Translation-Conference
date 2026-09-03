@@ -1,1403 +1,334 @@
-import React, { useEffect, useState, useRef } from 'react';
-import { io, Socket } from 'socket.io-client';
-import {
-  Mic,
-  MicOff,
-  Languages,
-  BookOpen,
-  Copy,
-  Check,
-  Download,
-  Trash2,
-  Sparkles,
-  Zap,
-  Activity,
-  Edit2,
-  X,
-  RotateCcw,
-  Sliders,
-  Radio,
-  Menu,
-  ShieldAlert,
-  Cpu,
-  Volume2,
-  FileText,
-  ArrowLeftRight,
-  Send,
-  Scissors,
-  Timer
-} from 'lucide-react';
-import { AppConfig, TranscriptItem } from '../types';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+// ProjectPanel.tsx has NO default export — it exports four named components.
+import { BillModal, HistoryPanel, ProjectHeaderBar, ProjectPicker } from '../components/ProjectPanel';
 import DictionaryManager from '../components/DictionaryManager';
+import SessionBar from '../components/SessionBar';
+import CaptionFeed from '../components/CaptionFeed';
+import ControlPanel from '../components/ControlPanel';
+import { captionsReducer, initialCaptionState, selectCaptions } from '../asr/captions';
+import { useAsrSocket } from '../asr/useAsrSocket';
+import { useAudioCapture } from '../asr/audio/useAudioCapture';
+import { createOperatorTokenSource, mintSourceToken } from '../asr/tokens';
+import { chooseSession, createSession, deleteSession, getSession, listSessions, type SessionSnapshot } from '../asr/sessions';
+import * as cmd from '../asr/commands';
+import type { GlossarySection } from '../asr/commands';
+import type { AnyFrame, GlossarySections, ReportDonePayload } from '../asr/protocol';
 import { useProjects } from '../hooks/useProjects';
-import { ProjectPicker, ProjectHeaderBar, BillModal, HistoryPanel } from '../components/ProjectPanel';
-import type { Project } from '../types';
+import type { DisplayConfig, Project } from '../types';
+
+const BACKEND_URL = import.meta.env.VITE_ASR_BACKEND_URL || 'http://localhost:8765';
+const HEALTH_POLL_MS = 5000;
+// Source tokens live 12 h and expiry is re-checked on EVERY audio frame, so a
+// capture client that outlives its token is closed mid-stream with 4401. An
+// event day can run past 12 h; re-mint at 80% rather than discover this at
+// hour twelve of a conference.
+const SOURCE_TOKEN_REFRESH_MS = 12 * 3600 * 1000 * 0.8;
 
 export default function Admin() {
-  const [socket, setSocket] = useState<Socket | null>(null);
-  const [config, setConfig] = useState<AppConfig>({
-    sourceLang: 'th-TH',
-    targetLang: 'English',
-    aiModel: 'gemini-3.7-flash',
-    speechEngine: 'google-chirp-asr',
-    fontSize: 'large',
-    fontFamily: 'sans-serif',
-    dictionaryJson: JSON.stringify(
-      {
-        ปัญญาประดิษฐ์: 'Artificial Intelligence (AI)',
-        การเรียนรู้ของเครื่อง: 'Machine Learning',
-        โมเดลภาษาขนาดใหญ่: 'Large Language Models (LLMs)',
-        การประชุมประจำปี: 'Annual General Meeting (AGM)',
-        ผลตอบแทนจากการลงทุน: 'Return on Investment (ROI)',
-        ตัวชี้วัดความสำเร็จ: 'KPI / Key Performance Indicators'
-      },
-      null,
-      2
-    ),
-    showOriginal: true,
-    showLatency: true,
-    chunkSilenceMs: 900
-  });
+  const projects = useProjects();
+  const tokenSource = useMemo(() => createOperatorTokenSource(), []);
 
-  const [transcripts, setTranscripts] = useState<TranscriptItem[]>([]);
-  const [isMeetingActive, setIsMeetingActive] = useState(false);
-  const [activeTab, setActiveTab] = useState<'languages' | 'dictionary'>('languages');
-  const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
-
-  // Manual / Quick Test Input
-  const [testInputText, setTestInputText] = useState('');
-
-  // Latency & Connection Metrics
-  const [socketPingMs, setSocketPingMs] = useState<number | null>(null);
-  const [lastAiLatencyMs, setLastAiLatencyMs] = useState<number | null>(null);
-
-  // Project / Session management (see SYSTEM_OVERVIEW.md §4)
-  const {
-    activeProjects,
-    endedProjects,
-    currentProject,
-    activeSession,
-    canCreateProject,
-    createProject,
-    selectProject,
-    clearSelection,
-    startSession,
-    endSession,
-    saveTranscripts,
-    finishProject
-  } = useProjects();
+  const [token, setToken] = useState<string | null>(null);
+  const [tokenError, setTokenError] = useState<string | null>(null);
+  const [session, setSession] = useState<SessionSnapshot | null>(null);
+  const [candidates, setCandidates] = useState<SessionSnapshot[]>([]);
+  const [sourceToken, setSourceToken] = useState<string | null>(null);
+  const [micActive, setMicActive] = useState(false);
+  const [glossary, setGlossary] = useState<GlossarySections | null>(null);
+  const [report, setReport] = useState<ReportDonePayload | null>(null);
+  const [config, setConfig] = useState<DisplayConfig>({ fontSize: 'large', showOriginal: true, showLatency: true });
   const [showHistory, setShowHistory] = useState(false);
   const [finishedProject, setFinishedProject] = useState<Project | null>(null);
+  const [captionState, dispatchCaption] = useReducer(captionsReducer, initialCaptionState);
 
-  // The server holds one live transcript buffer; it belongs to whichever project
-  // is open. `hydratedProjectRef` tracks which project's transcripts we pushed
-  // into it, so an incoming update is only saved back to the project it came from.
-  const hydratedProjectRef = useRef<string | null>(null);
+  const captions = useMemo(() => selectCaptions(captionState), [captionState]);
+  const bootstrapped = useRef(false);
 
-  // True only while this tab owns the running session it started itself.
-  const startedMeetingRef = useRef(false);
+  // `useProjects()` returns a fresh object literal every render, so
+  // `detachAsrSession` changes identity on every render too. Effects below
+  // need to call it without re-running on every render because of that —
+  // hold it in a ref refreshed each render instead of depending on `projects`.
+  const detachAsrSessionRef = useRef(projects.detachAsrSession);
+  detachAsrSessionRef.current = projects.detachAsrSession;
 
-  // Highest meeting-status version applied, so stale snapshots can be dropped.
-  const meetingVersionRef = useRef(-1);
-
-  // Read inside socket handlers, which are registered once and must not close
-  // over a stale editing state.
-  const editingItemIdRef = useRef<string | null>(null);
-
-  // Editing items
-  const [editingItemId, setEditingItemId] = useState<string | null>(null);
-  const [editTranslatedText, setEditTranslatedText] = useState<string>('');
-  const [editOriginalText, setEditOriginalText] = useState<string>('');
-  const [savedFeedbackId, setSavedFeedbackId] = useState<string | null>(null);
-
-  // Copy feedback
-  const [copiedItemId, setCopiedItemId] = useState<string | null>(null);
-
-  // Speech Recognition & Realtime Chunking Refs
-  const recognitionRef = useRef<any>(null);
-  const socketRef = useRef<Socket | null>(null);
-  const configRef = useRef<AppConfig>(config);
-  const isMeetingActiveRef = useRef<boolean>(false);
-  const isListeningRef = useRef<boolean>(false);
-  const silenceTimerRef = useRef<any>(null);
-  const currentInterimRef = useRef<string>('');
-  const isRestartingRef = useRef<boolean>(false);
-
-  const [isListening, setIsListening] = useState(false);
-  const [interimSpeechText, setInterimSpeechText] = useState('');
-  const [micPermissionError, setMicPermissionError] = useState(false);
-  const [micAudioLevel, setMicAudioLevel] = useState<number>(0);
-  const transcriptScrollRef = useRef<HTMLDivElement>(null);
-
-  // Keep fresh state in refs for async callbacks & speech recognition
+  // ── Token ────────────────────────────────────────────────────────────────
   useEffect(() => {
-    socketRef.current = socket;
-  }, [socket]);
+    tokenSource
+      .get()
+      .then(setToken)
+      .catch((err: Error) => setTokenError(err.message));
+  }, [tokenSource]);
 
+  // ── Adopt or offer to create a session ───────────────────────────────────
   useEffect(() => {
-    configRef.current = config;
-  }, [config]);
+    if (!token || bootstrapped.current) return;
+    bootstrapped.current = true;
+    listSessions(BACKEND_URL, token)
+      .then((live) => {
+        const choice = chooseSession(live);
+        if (choice.action === 'adopt') setSession(live.find((s) => s.id === choice.id) ?? null);
+        else if (choice.action === 'ask') setCandidates(choice.sessions);
+      })
+      .catch((err: Error) => setTokenError(err.message));
+  }, [token]);
 
+  // ── Health polling over HTTP, never over the rate-limited WebSocket ──────
   useEffect(() => {
-    isMeetingActiveRef.current = isMeetingActive;
-  }, [isMeetingActive]);
-
-  useEffect(() => {
-    isListeningRef.current = isListening;
-  }, [isListening]);
-
-  useEffect(() => {
-    editingItemIdRef.current = editingItemId;
-  }, [editingItemId]);
-
-  // Commit recognized speech segment/chunk for live translation
-  const commitSpeechChunk = (text: string) => {
-    const cleanText = text.trim();
-    if (!cleanText || cleanText.length < 2) return;
-
-    if (socketRef.current) {
-      socketRef.current.emit('new-transcription', cleanText);
-    }
-
-    currentInterimRef.current = '';
-    setInterimSpeechText('');
-
-    // Cleanly flush the browser's speech recognition buffer to prevent repeat words
-    if (isListeningRef.current && recognitionRef.current) {
-      try {
-        isRestartingRef.current = true;
-        recognitionRef.current.abort();
-      } catch {
-        // ignore
+    if (!token || !session) return;
+    const timer = setInterval(async () => {
+      const fresh = await getSession(BACKEND_URL, token, session.id).catch(() => undefined);
+      if (fresh === null) {
+        // The backend forgot this session — a restart. Do not retry the id.
+        setSession(null);
+        setMicActive(false);
+        setSourceToken(null);
+        detachAsrSessionRef.current();
+      } else if (fresh) {
+        setSession(fresh);
       }
-    }
-  };
+    }, HEALTH_POLL_MS);
+    return () => clearInterval(timer);
+  }, [token, session]);
 
-  const handleForceCommitInterim = () => {
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
-    const textToCommit = (currentInterimRef.current || interimSpeechText).trim();
-    if (textToCommit) {
-      commitSpeechChunk(textToCommit);
-    }
-  };
-
-  useEffect(() => {
-    const newSocket = io();
-    setSocket(newSocket);
-
-    // A socket replaced by this effect's cleanup must not keep writing state:
-    // its late frames (notably the `meeting-status` snapshot every connection
-    // receives) would otherwise clobber the live socket's values.
-    let disposed = false;
-
-    newSocket.on('config-updated', (newConfig: AppConfig) => {
-      if (disposed) return;
-      setConfig((prev) => ({ ...prev, ...newConfig }));
-    });
-
-    newSocket.on('transcripts-updated', (items: TranscriptItem[]) => {
-      if (disposed) return;
-      setTranscripts(items);
-
-      // Mirror the live buffer into whichever project it currently belongs to
-      const ownerProjectId = hydratedProjectRef.current;
-      if (ownerProjectId) {
-        saveTranscripts(ownerProjectId, items);
-      }
-
-      // Track last translation latency
-      const latestWithLatency = [...items].reverse().find((t) => t.latencyMs !== undefined);
-      if (latestWithLatency && latestWithLatency.latencyMs) {
-        setLastAiLatencyMs(latestWithLatency.latencyMs);
-      }
-
-      // Auto scroll down smoothly
-      setTimeout(() => {
-        if (transcriptScrollRef.current && !editingItemIdRef.current) {
-          transcriptScrollRef.current.scrollTo({
-            top: transcriptScrollRef.current.scrollHeight,
-            behavior: 'smooth'
-          });
-        }
-      }, 80);
-    });
-
-    newSocket.on('meeting-status', (payload: boolean | { active: boolean; v: number }) => {
-      if (disposed) return;
-
-      // A connection's initial snapshot can arrive after a newer broadcast, which
-      // would flip the console back to idle while the server is still recording.
-      const status = typeof payload === 'boolean' ? payload : payload.active;
-      if (typeof payload !== 'boolean') {
-        if (payload.v < meetingVersionRef.current) return;
-        meetingVersionRef.current = payload.v;
-      }
-
-      setIsMeetingActive(status);
-      if (status) {
-        startListening();
-      } else {
-        // Whoever stopped it, this tab no longer owns a running session.
-        startedMeetingRef.current = false;
-        stopListening();
-      }
-    });
-
-    // Pong for live socket ping calculation
-    newSocket.on('pong-check', (data: { clientTimestamp: number }) => {
-      if (disposed) return;
-      const ping = Date.now() - data.clientTimestamp;
-      setSocketPingMs(ping);
-    });
-
-    // Start periodic heartbeat ping
-    const pingInterval = setInterval(() => {
-      if (newSocket.connected) {
-        newSocket.emit('ping-check', Date.now());
-      }
-    }, 3000);
-
-    return () => {
-      disposed = true;
-      clearInterval(pingInterval);
-      newSocket.close();
-      stopListening();
-    };
-    // One connection for the lifetime of the console — re-running this on every
-    // inline edit opened a second socket whose stale snapshot fought the first.
+  // ── Control socket ───────────────────────────────────────────────────────
+  const onFrame = useCallback((frame: AnyFrame) => {
+    dispatchCaption({ kind: 'frame', frame });
+    if (frame.type === 'glossary.state') setGlossary((frame.data as { sections: GlossarySections }).sections);
+    else if (frame.type === 'session.welcome') setGlossary((frame.data as { glossary: { sections: GlossarySections } }).glossary.sections);
+    else if (frame.type === 'report.done') setReport(frame.data as ReportDonePayload);
   }, []);
 
-  // Hand the server the open project's transcripts, so the live feed shows that
-  // project's own history and new captions append to it.
+  const socket = useAsrSocket({ backendUrl: BACKEND_URL, sessionId: session?.id ?? null, token, onFrame });
+
   useEffect(() => {
-    if (!socket || !currentProject) {
-      hydratedProjectRef.current = null;
+    if (!socket.sessionGone) return;
+    setSession(null);
+    setMicActive(false);
+    setSourceToken(null);
+    detachAsrSessionRef.current();
+  }, [socket.sessionGone]);
+
+  // ── Audio ────────────────────────────────────────────────────────────────
+  const capture = useAudioCapture({
+    backendUrl: BACKEND_URL,
+    sessionId: session?.id ?? null,
+    sourceToken,
+    active: micActive,
+  });
+
+  useEffect(() => {
+    if (!micActive || !token || !session) return;
+    const timer = setInterval(() => {
+      mintSourceToken(BACKEND_URL, session.id, token)
+        .then(setSourceToken)
+        .catch((err: Error) => setTokenError(err.message));
+    }, SOURCE_TOKEN_REFRESH_MS);
+    return () => clearInterval(timer);
+  }, [micActive, token, session]);
+
+  const toggleMic = async () => {
+    if (micActive) {
+      setMicActive(false);
       return;
     }
-    if (hydratedProjectRef.current === currentProject.id) return;
-    socket.emit('load-transcripts', currentProject.transcripts || []);
-    hydratedProjectRef.current = currentProject.id;
-  }, [socket, currentProject?.id]);
-
-  // A project can be auto-finished at its 7-day deadline while it is open —
-  // stop the microphone rather than leaving it recording into nothing.
-  // `meeting-status` is broadcast to every client, so this must only ever act on
-  // a session this tab itself started; otherwise a second console sitting on the
-  // picker would stop the session another console just started.
-  useEffect(() => {
-    if (!currentProject && isMeetingActive && startedMeetingRef.current) {
-      startedMeetingRef.current = false;
-      socket?.emit('stop-meeting');
-    }
-  }, [currentProject, isMeetingActive, socket]);
-
-  // Handle Speech Recognition setup with smart pause segmentation / chunking
-  const startListening = () => {
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-
-    if (!SpeechRecognition) {
-      alert('เบราว์เซอร์นี้ไม่รองรับ Web Speech API กรุณาเปิดด้วย Google Chrome หรือ Microsoft Edge');
-      return;
-    }
-
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {
-        // ignore
-      }
-    }
-
-    const recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = configRef.current.sourceLang || 'th-TH';
-
-    recognition.onstart = () => {
-      setIsListening(true);
-      isListeningRef.current = true;
-      setMicPermissionError(false);
-      setMicAudioLevel(35);
-    };
-
-    recognition.onerror = (event: any) => {
-      if (event.error === 'not-allowed') {
-        setMicPermissionError(true);
-      }
-      if (event.error !== 'no-speech') {
-        setIsListening(false);
-        isListeningRef.current = false;
-      }
-    };
-
-    recognition.onend = () => {
-      setMicAudioLevel(0);
-      // Auto reconnect if meeting is active or restarting after a segment chunk commit
-      if (isMeetingActiveRef.current || isRestartingRef.current) {
-        isRestartingRef.current = false;
-        try {
-          recognition.start();
-          setIsListening(true);
-          isListeningRef.current = true;
-        } catch {
-          // ignore
-        }
-      } else {
-        setIsListening(false);
-        isListeningRef.current = false;
-        setInterimSpeechText('');
-      }
-    };
-
-    recognition.onresult = (event: any) => {
-      let interim = '';
-      let finalChunk = '';
-
-      for (let i = event.resultIndex; i < event.results.length; ++i) {
-        const transcript = event.results[i][0].transcript;
-        if (event.results[i].isFinal) {
-          finalChunk += transcript + ' ';
-        } else {
-          interim += transcript;
-        }
-      }
-
-      // 1. If ASR emitted a final segment, commit it immediately
-      if (finalChunk.trim()) {
-        if (silenceTimerRef.current) {
-          clearTimeout(silenceTimerRef.current);
-          silenceTimerRef.current = null;
-        }
-        commitSpeechChunk(finalChunk);
-        return;
-      }
-
-      // 2. If interim results are arriving:
-      const trimmedInterim = interim.trim();
-      if (trimmedInterim) {
-        currentInterimRef.current = trimmedInterim;
-        setInterimSpeechText(trimmedInterim);
-        setMicAudioLevel(Math.min(95, 30 + Math.random() * 50));
-
-        // Reset silence timer on every new speech acoustic packet
-        if (silenceTimerRef.current) {
-          clearTimeout(silenceTimerRef.current);
-        }
-
-        // Get configured silence threshold (default 900ms)
-        const silenceThreshold = configRef.current.chunkSilenceMs || 900;
-
-        // Auto-commit chunk when speaker pauses for silenceThreshold ms
-        silenceTimerRef.current = setTimeout(() => {
-          if (currentInterimRef.current.trim()) {
-            commitSpeechChunk(currentInterimRef.current);
-          }
-        }, silenceThreshold);
-      }
-    };
-
+    if (!token || !session) return;
     try {
-      recognition.start();
-      recognitionRef.current = recognition;
-      setIsListening(true);
-      isListeningRef.current = true;
-    } catch (e) {
-      console.error(e);
+      setSourceToken(await mintSourceToken(BACKEND_URL, session.id, token));
+      setMicActive(true);
+    } catch (err) {
+      setTokenError((err as Error).message);
     }
   };
 
-  const stopListening = () => {
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
-    currentInterimRef.current = '';
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {
-        // ignore
-      }
-      recognitionRef.current = null;
-    }
-    setIsListening(false);
-    isListeningRef.current = false;
-    setMicAudioLevel(0);
-    setInterimSpeechText('');
+  // ── Session actions ──────────────────────────────────────────────────────
+  const adopt = async (id: string) => {
+    if (!token) return;
+    const found = await getSession(BACKEND_URL, token, id);
+    setSession(found);
+    setCandidates([]);
+    if (found) projects.attachAsrSession(found.id, found.source_lang, found.target_lang);
   };
 
-  const toggleMeeting = () => {
-    if (!socket || !currentProject) return;
-    if (isMeetingActive) {
-      startedMeetingRef.current = false;
-      socket.emit('stop-meeting');
-      endSession();
-    } else {
-      startedMeetingRef.current = true;
-      socket.emit('start-meeting');
-      startSession(config.sourceLang, config.targetLang);
+  const create = async () => {
+    if (!token) return;
+    try {
+      const created = await createSession(BACKEND_URL, token);
+      setSession(created);
+      setCandidates([]);
+      dispatchCaption({ kind: 'reset' });
+      projects.attachAsrSession(created.id, created.source_lang, created.target_lang);
+    } catch (err) {
+      setTokenError((err as Error).message);
     }
   };
 
-  const handleRequestFinishProject = () => {
-    if (!socket || !currentProject) return;
-    if (isMeetingActive) {
-      startedMeetingRef.current = false;
-      socket.emit('stop-meeting');
-    }
-    const finished = finishProject(transcripts);
-    // Detach the buffer from the project first, so clearing it does not wipe
-    // the transcripts we just billed.
-    hydratedProjectRef.current = null;
-    socket.emit('clear-transcripts');
+  const end = async () => {
+    if (!token || !session) return;
+    await deleteSession(BACKEND_URL, token, session.id);
+    setSession(null);
+    setMicActive(false);
+    setSourceToken(null);
+    projects.detachAsrSession();
+  };
+
+  // Ending the project also ends the ASR session: a project is durable, the
+  // Python session is not, and leaving one running would keep billing a
+  // recognizer for an event that is over.
+  const finishProject = async () => {
+    if (session && token) await deleteSession(BACKEND_URL, token, session.id);
+    setSession(null);
+    setMicActive(false);
+    setSourceToken(null);
+    const finished = projects.finishProject(captions);
+    dispatchCaption({ kind: 'reset' });
     if (finished) setFinishedProject(finished);
   };
 
-  const handleSwitchProject = () => {
-    if (activeSession) return; // one microphone, one live buffer
-    hydratedProjectRef.current = null;
-    clearSelection();
-  };
-
-  const handleConfigChange = (
-    e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>
-  ) => {
-    const { name, value, type } = e.target;
-    const checked = (e.target as HTMLInputElement).checked;
-    let newConfig = {
-      ...config,
-      [name]: type === 'checkbox' ? checked : value
-    };
-
-    // Auto-switch complementary language (Thai <-> English)
-    if (name === 'sourceLang') {
-      if (value === 'th-TH') {
-        newConfig.targetLang = 'English';
-      } else if (value === 'en-US') {
-        newConfig.targetLang = 'Thai';
-      }
-    } else if (name === 'targetLang') {
-      if (value === 'English') {
-        newConfig.sourceLang = 'th-TH';
-      } else if (value === 'Thai') {
-        newConfig.sourceLang = 'en-US';
-      }
-    }
-
-    setConfig(newConfig);
-    if (socket) {
-      socket.emit('update-config', newConfig);
-    }
-
-    // If source language changed while listening, restart recognition
-    if (name === 'sourceLang' && isMeetingActive) {
-      stopListening();
-      setTimeout(() => startListening(), 250);
-    }
-  };
-
-  const handleSwapLanguages = () => {
-    const newSource = config.sourceLang === 'th-TH' ? 'en-US' : 'th-TH';
-    const newTarget = newSource === 'th-TH' ? 'English' : 'Thai';
-    const newConfig = {
-      ...config,
-      sourceLang: newSource,
-      targetLang: newTarget
-    };
-    setConfig(newConfig);
-    if (socket) {
-      socket.emit('update-config', newConfig);
-    }
-    if (isMeetingActive) {
-      stopListening();
-      setTimeout(() => startListening(), 250);
-    }
-  };
-
-  const handleSendTestText = (overrideText?: string) => {
-    const text = (overrideText !== undefined ? overrideText : testInputText).trim();
-    if (!text || !socket) return;
-    socket.emit('new-transcription', text);
-    if (overrideText === undefined) {
-      setTestInputText('');
-    }
-  };
-
-  const handleCopyItem = (item: TranscriptItem) => {
-    const fullText = `${item.originalText}\n${item.translatedText}`;
-    navigator.clipboard.writeText(fullText);
-    setCopiedItemId(item.id);
-    setTimeout(() => setCopiedItemId(null), 1500);
-  };
-
-  const startEditing = (item: TranscriptItem) => {
-    setEditingItemId(item.id);
-    setEditTranslatedText(item.translatedText);
-    setEditOriginalText(item.originalText);
-  };
-
-  const cancelEditing = () => {
-    setEditingItemId(null);
-    setEditTranslatedText('');
-    setEditOriginalText('');
-  };
-
-  const saveCorrection = (id: string) => {
-    if (!socket) return;
-    socket.emit('update-transcript-item', {
-      id,
-      translatedText: editTranslatedText.trim(),
-      originalText: editOriginalText.trim()
-    });
-    setSavedFeedbackId(id);
-    setTimeout(() => setSavedFeedbackId(null), 2000);
-    setEditingItemId(null);
-  };
-
-  const deleteItem = (id: string) => {
-    if (socket) {
-      socket.emit('delete-transcript-item', id);
-    }
-  };
-
-  const retranslateItem = (item: TranscriptItem) => {
-    if (!socket) return;
-    socket.emit('retranslate-item', {
-      id: item.id,
-      text: editOriginalText || item.originalText
-    });
-    setEditingItemId(null);
-  };
-
-  const clearTranscripts = () => {
-    if (socket && window.confirm('ล้างประวัติการแปลทั้งหมด?')) {
-      socket.emit('clear-transcripts');
-    }
-  };
-
-  const exportTranscript = (type: 'txt' | 'srt') => {
-    if (transcripts.length === 0) return;
-    let content = '';
-    const dateStr = new Date().toISOString().slice(0, 10);
-
-    if (type === 'txt') {
-      content = `=== Live Translation Transcript (${dateStr}) ===\n${config.sourceLang} -> ${config.targetLang}\n\n`;
-      content += transcripts
-        .map(
-          (t, i) =>
-            `[${i + 1}] ${new Date(t.timestamp).toLocaleTimeString()}${t.isEdited ? ' (edited)' : ''} [${t.latencyMs || '-'}ms]\nOriginal: ${t.originalText}\nTranslated: ${t.translatedText}\n`
-        )
-        .join('\n');
-    } else {
-      const formatSrtTime = (ms: number) => {
-        const d = new Date(ms);
-        const hh = String(d.getUTCHours()).padStart(2, '0');
-        const mm = String(d.getUTCMinutes()).padStart(2, '0');
-        const ss = String(d.getUTCSeconds()).padStart(2, '0');
-        const msStr = String(d.getUTCMilliseconds()).padStart(3, '0');
-        return `${hh}:${mm}:${ss},${msStr}`;
-      };
-
-      const startBase = transcripts[0].timestamp;
-      content = transcripts
-        .map((t, idx) => {
-          const startTime = Math.max(0, t.timestamp - startBase);
-          const endTime = startTime + 3500;
-          return `${idx + 1}\n${formatSrtTime(startTime)} --> ${formatSrtTime(endTime)}\n${t.translatedText}\n`;
-        })
-        .join('\n');
-    }
-
-    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `transcript_${dateStr}.${type}`;
-    a.click();
+  // ── Export ───────────────────────────────────────────────────────────────
+  const download = (name: string, body: string) => {
+    const url = URL.createObjectURL(new Blob([body], { type: 'text/plain;charset=utf-8' }));
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = name;
+    anchor.click();
     URL.revokeObjectURL(url);
   };
 
-  // Font size styling helper
-  const getTextSizeClass = () => {
-    switch (config.fontSize) {
-      case 'small':
-        return 'text-sm sm:text-base';
-      case 'medium':
-        return 'text-base sm:text-lg';
-      case 'xlarge':
-        return 'text-xl sm:text-2xl';
-      case 'large':
-      default:
-        return 'text-lg sm:text-xl';
-    }
+  const srtTime = (ms: number) => {
+    const h = String(Math.floor(ms / 3600000)).padStart(2, '0');
+    const m = String(Math.floor(ms / 60000) % 60).padStart(2, '0');
+    const s = String(Math.floor(ms / 1000) % 60).padStart(2, '0');
+    return `${h}:${m}:${s},${String(Math.floor(ms % 1000)).padStart(3, '0')}`;
   };
 
-  if (!currentProject) {
+  const exportTranscript = (type: 'txt' | 'srt') => {
+    if (captions.length === 0) return;
+    if (type === 'txt') {
+      const body = captions
+        .map((c) => `[${new Date(c.ts * 1000).toLocaleTimeString('th-TH')}]\n${c.sourceText}\n${c.targetText}\n`)
+        .join('\n');
+      download(`transcript-${Date.now()}.txt`, body);
+      return;
+    }
+    const start = captions[0].ts;
+    const body = captions
+      .map((c, i) => {
+        const from = (c.ts - start) * 1000;
+        const to = from + 3000;
+        return `${i + 1}\n${srtTime(from)} --> ${srtTime(to)}\n${c.targetText}\n`;
+      })
+      .join('\n');
+    download(`subtitles-${Date.now()}.srt`, body);
+  };
+
+  const disabled = socket.status !== 'open';
+  const send = socket.send;
+  const sid = session?.id ?? '';
+
+  // No project selected: the picker is the whole screen, as it is today.
+  if (!projects.currentProject) {
     return (
       <>
         <ProjectPicker
-          activeProjects={activeProjects}
-          canCreateProject={canCreateProject}
-          onSelect={selectProject}
-          onCreate={createProject}
+          activeProjects={projects.activeProjects}
+          canCreateProject={projects.canCreateProject}
+          onSelect={projects.selectProject}
+          onCreate={projects.createProject}
           onOpenHistory={() => setShowHistory(true)}
         />
-        {showHistory && <HistoryPanel projects={endedProjects} onClose={() => setShowHistory(false)} />}
-        {finishedProject && <BillModal project={finishedProject} onClose={() => setFinishedProject(null)} />}
+        {showHistory && <HistoryPanel projects={projects.endedProjects} onClose={() => setShowHistory(false)} />}
       </>
     );
   }
 
   return (
-    <div className="flex flex-col h-screen w-full bg-slate-100 text-slate-800 font-sans overflow-hidden">
-      {showHistory && <HistoryPanel projects={endedProjects} onClose={() => setShowHistory(false)} />}
-      {finishedProject && <BillModal project={finishedProject} onClose={() => setFinishedProject(null)} />}
-      {/* ─────────────────────────────────────────────────────────────
-          TOP CONTROL & METRICS BAR (Professional Minimal Header)
-      ────────────────────────────────────────────────────────────── */}
-      <header className="h-15 bg-white border-b border-slate-200 px-3 sm:px-6 flex items-center justify-between shrink-0 z-30 shadow-xs">
-        {/* Brand & Mobile Sidebar Toggle */}
-        <div className="flex items-center gap-2.5">
-          <button
-            onClick={() => setMobileSettingsOpen(!mobileSettingsOpen)}
-            className="lg:hidden p-2 text-slate-600 hover:bg-slate-100 rounded-lg"
-            title="เปิดเมนูตั้งค่า"
-          >
-            <Menu className="w-5 h-5" />
-          </button>
+    <div className="min-h-screen bg-slate-900 text-slate-100 p-4 flex flex-col gap-4">
+      <ProjectHeaderBar
+        project={projects.currentProject}
+        activeSession={projects.activeSession}
+        onRequestFinish={finishProject}
+        onSwitchProject={projects.clearSelection}
+        onOpenHistory={() => setShowHistory(true)}
+      />
 
-          <div className="flex items-center gap-2.5">
-            <div className="w-8.5 h-8.5 rounded-lg bg-[#DE5C8E] flex items-center justify-center text-white shadow-xs">
-              <Sparkles className="w-4.5 h-4.5" />
-            </div>
-            <div className="flex flex-col">
-              <span className="font-bold text-sm text-slate-900 tracking-tight leading-none">
-                AI Live Translator
-              </span>
-              <span className="text-[11px] text-slate-400 font-medium leading-tight mt-0.5">
-                Google Chirp + Gemini 3.7
-              </span>
-            </div>
-          </div>
+      {tokenError && <p className="text-sm text-red-400 bg-red-950/40 border border-red-900 rounded p-2">{tokenError}</p>}
+      {socket.error && <p className="text-sm text-amber-300 bg-amber-950/40 border border-amber-900 rounded p-2">{socket.error}</p>}
 
-          <div className="hidden sm:block">
-            <ProjectHeaderBar
-              project={currentProject}
-              activeSession={activeSession}
-              onRequestFinish={handleRequestFinishProject}
-              onSwitchProject={handleSwitchProject}
-              onOpenHistory={() => setShowHistory(true)}
-            />
-          </div>
-        </div>
+      <SessionBar
+        session={session}
+        candidates={candidates}
+        connecting={socket.status === 'connecting'}
+        micActive={micActive}
+        micStatus={capture.error ?? (capture.status === 'sending' ? 'กำลังส่งเสียงเข้าเซิร์ฟเวอร์' : '')}
+        backpressure={capture.backpressure}
+        droppedFrames={capture.droppedFrames}
+        onAdopt={adopt}
+        onCreate={create}
+        onEnd={end}
+        onToggleMic={toggleMic}
+      />
 
-        {/* Status Indicators & Main Action Button */}
-        <div className="flex items-center gap-2 sm:gap-3">
-          {/* Live Status Badge */}
-          <div
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold transition-all ${
-              isMeetingActive
-                ? 'bg-emerald-50 text-emerald-700 border border-emerald-300 ring-2 ring-emerald-100'
-                : 'bg-slate-100 text-slate-500 border border-slate-200'
-            }`}
-          >
-            {isMeetingActive ? (
-              <>
-                <span className="relative flex h-2 w-2">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-                </span>
-                <span className="tracking-wider text-[11px] font-bold uppercase whitespace-nowrap">
-                  กำลังแปลสด
-                </span>
-                {/* Visualizer bars */}
-                <div className="hidden sm:flex items-center gap-0.5 ml-1 h-3.5 bg-emerald-200/70 px-1 rounded">
-                  <div
-                    className="w-1 bg-emerald-600 rounded-full transition-all duration-75"
-                    style={{ height: `${Math.max(25, micAudioLevel)}%` }}
-                  />
-                  <div
-                    className="w-1 bg-emerald-600 rounded-full transition-all duration-75"
-                    style={{ height: `${Math.max(15, micAudioLevel * 0.7)}%` }}
-                  />
-                </div>
-              </>
-            ) : (
-              <>
-                <span className="w-2 h-2 rounded-full bg-slate-400"></span>
-                <span className="text-[11px] whitespace-nowrap">พร้อมใช้งาน</span>
-              </>
-            )}
-          </div>
-
-          {/* Real-time Telemetry (AI Latency & Ping) */}
-          <div className="hidden md:flex items-center gap-2 bg-slate-100 px-3 py-1.5 rounded-full text-[11px] font-mono border border-slate-200">
-            <Zap className={`w-3.5 h-3.5 ${isMeetingActive ? 'text-amber-500' : 'text-slate-400'}`} />
-            <span className="text-slate-500">AI:</span>
-            <span className="font-semibold text-slate-800">
-              {lastAiLatencyMs ? `${lastAiLatencyMs}ms` : '--'}
-            </span>
-            <span className="text-slate-300">|</span>
-            <Activity className="w-3.5 h-3.5 text-emerald-600" />
-            <span className="text-slate-500">Ping:</span>
-            <span className="font-semibold text-slate-800">
-              {socketPingMs !== null ? `${socketPingMs}ms` : '--'}
-            </span>
-          </div>
-
-          {/* Start / Stop Primary Button */}
-          <button
-            onClick={toggleMeeting}
-            className={`px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2 transition-all shadow-xs whitespace-nowrap ${
-              isMeetingActive
-                ? 'bg-rose-600 hover:bg-rose-700 text-white animate-pulse'
-                : 'bg-[#DE5C8E] hover:bg-[#c94577] text-white'
-            }`}
-          >
-            {isMeetingActive ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
-            <span>{isMeetingActive ? 'จบ Session' : 'เริ่ม Session'}</span>
-          </button>
-        </div>
-      </header>
-
-      {/* Project bar on mobile (hidden in the header row above sm) */}
-      <div className="sm:hidden px-3 py-2 bg-white border-b border-slate-200 shrink-0 overflow-x-auto">
-        <ProjectHeaderBar
-          project={currentProject}
-          activeSession={activeSession}
-          onRequestFinish={handleRequestFinishProject}
-          onSwitchProject={handleSwitchProject}
-          onOpenHistory={() => setShowHistory(true)}
-        />
-      </div>
-
-      {/* ─────────────────────────────────────────────────────────────
-          MAIN WORKSPACE LAYOUT
-      ────────────────────────────────────────────────────────────── */}
-      <div className="flex-1 flex overflow-hidden relative">
-        {/* LEFT SETTINGS SIDEBAR */}
-        <aside
-          className={`fixed inset-y-15 left-0 z-20 w-84 lg:w-96 bg-white border-r border-slate-200 flex flex-col transition-transform duration-200 lg:static lg:translate-x-0 ${
-            mobileSettingsOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-full'
-          }`}
-        >
-          {/* Navigation Tabs */}
-          <div className="grid grid-cols-2 p-1.5 bg-slate-50 border-b border-slate-200 text-xs gap-1 shrink-0">
-            <button
-              onClick={() => setActiveTab('languages')}
-              className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all ${
-                activeTab === 'languages'
-                  ? 'bg-white text-[#DE5C8E] shadow-xs'
-                  : 'text-slate-500 hover:text-slate-800'
-              }`}
-            >
-              <Languages className="w-4 h-4" />
-              <span className="whitespace-nowrap">ภาษาและ AI</span>
+      <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4">
+        <div className="flex flex-col gap-3">
+          <div className="flex gap-2">
+            <button onClick={() => exportTranscript('txt')} className="px-3 py-1.5 rounded bg-slate-700 text-sm">
+              ส่งออก .TXT
             </button>
-            <button
-              onClick={() => setActiveTab('dictionary')}
-              className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all ${
-                activeTab === 'dictionary'
-                  ? 'bg-white text-[#DE5C8E] shadow-xs'
-                  : 'text-slate-500 hover:text-slate-800'
-              }`}
-            >
-              <BookOpen className="w-4 h-4" />
-              <span className="whitespace-nowrap">พจนานุกรม</span>
+            <button onClick={() => exportTranscript('srt')} className="px-3 py-1.5 rounded bg-slate-700 text-sm">
+              ส่งออก .SRT
             </button>
           </div>
-
-          {/* Sidebar Tab Content */}
-          <div className="flex-1 p-4 overflow-y-auto space-y-4">
-            {/* TAB 1: LANGUAGES & AI ENGINE */}
-            {activeTab === 'languages' && (
-              <div className="space-y-4">
-                {/* Speech Recognition Engine (Chirp 3 / Cloud ASR) */}
-                <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
-                      <Cpu className="w-4 h-4 text-[#DE5C8E]" />
-                      <span>ระบบแปลงเสียงพูด (Speech ASR)</span>
-                    </span>
-                    <span className="text-[10px] bg-emerald-50 text-emerald-800 font-semibold px-2 py-0.5 rounded-md border border-emerald-200">
-                      Chirp 3 Engine
-                    </span>
-                  </div>
-                  <p className="text-xs text-slate-500 leading-relaxed">
-                    เอนจิน Google Cloud Speech &amp; Chirp แปลงเสียงสดเป็นข้อความอัตโนมัติความเร็วสูง (&lt;100ms)
-                  </p>
-                </div>
-
-                {/* AI Model Selection */}
-                <div>
-                  <div className="flex items-center justify-between mb-1.5">
-                    <label className="block text-xs font-bold text-slate-700">
-                      โมเดล AI แปลภาษา (Translation Model)
-                    </label>
-                    <span className="text-[10px] text-purple-700 font-mono font-semibold">Gemini API</span>
-                  </div>
-                  <select
-                    name="aiModel"
-                    value={config.aiModel || 'gemini-3.7-flash'}
-                    onChange={handleConfigChange}
-                    className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium"
-                  >
-                    <option value="gemini-3.7-flash">Gemini 3.7 Flash (แนะนำ: ความเร็วสูง ตอบสนองทันที)</option>
-                    <option value="gemini-2.5-flash">Gemini 2.5 Flash (มาตรฐานความเร็วสูง)</option>
-                    <option value="gemini-2.5-pro">Gemini 2.5 Pro (แม่นยำสูง สำหรับเนื้อหาเชิงวิชาการ)</option>
-                  </select>
-                </div>
-
-                {/* Source & Target Language (Thai <-> English) */}
-                <div className="space-y-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-800">คู่ภาษาแปลสด (Thai ↔ English)</span>
-                    <button
-                      type="button"
-                      onClick={handleSwapLanguages}
-                      className="text-[11px] px-2.5 py-1 bg-white hover:bg-pink-50 text-[#DE5C8E] border border-pink-200 rounded-lg font-bold flex items-center gap-1 shadow-2xs transition-all cursor-pointer"
-                      title="สลับภาษาผู้พูดและภาษาแปล"
-                    >
-                      <ArrowLeftRight className="w-3.5 h-3.5" />
-                      <span>สลับภาษา</span>
-                    </button>
-                  </div>
-
-                  {/* Source Language */}
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">
-                      ภาษาของผู้พูด (Source Language)
-                    </label>
-                    <select
-                      name="sourceLang"
-                      value={config.sourceLang}
-                      onChange={handleConfigChange}
-                      disabled={isMeetingActive}
-                      className="w-full p-2.5 text-xs bg-white border border-slate-200 rounded-lg outline-none focus:border-[#DE5C8E] disabled:opacity-60 font-semibold text-slate-800"
-                    >
-                      <option value="th-TH">ไทย (Thai - th-TH)</option>
-                      <option value="en-US">อังกฤษ (English - en-US)</option>
-                    </select>
-                  </div>
-
-                  {/* Target Language */}
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">
-                      ภาษาที่ต้องการแปล (Target Language - อัตโนมัติ)
-                    </label>
-                    <select
-                      name="targetLang"
-                      value={config.targetLang}
-                      onChange={handleConfigChange}
-                      className="w-full p-2.5 text-xs bg-white border border-slate-200 rounded-lg outline-none focus:border-[#DE5C8E] font-semibold text-[#DE5C8E]"
-                    >
-                      <option value="English">แปลเป็นอังกฤษ (English)</option>
-                      <option value="Thai">แปลเป็นไทย (Thai)</option>
-                    </select>
-                  </div>
-                </div>
-
-                {/* Chunking / Silence Pause Segmentation */}
-                <div>
-                  <div className="flex items-center justify-between mb-1.5">
-                    <label className="block text-xs font-bold text-slate-700">
-                      ความไวการตัดช่วงแปลสด (Live Chunking)
-                    </label>
-                    <span className="text-[10px] text-[#DE5C8E] font-semibold flex items-center gap-1">
-                      <Timer className="w-3 h-3" />
-                      <span>{config.chunkSilenceMs || 900}ms</span>
-                    </span>
-                  </div>
-                  <select
-                    name="chunkSilenceMs"
-                    value={config.chunkSilenceMs || 900}
-                    onChange={handleConfigChange}
-                    className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium"
-                  >
-                    <option value={600}>⚡ เร็วมาก (Fast: ~0.6 วินาที - แปลสดคำต่อคำ)</option>
-                    <option value={900}>⚖️ มาตรฐาน (Balanced: ~0.9 วินาที - แนะนำ จังหวะหายใจ)</option>
-                    <option value={1400}>🧘 ผ่อนคลาย (Relaxed: ~1.4 วินาที - รอจบประโยคยาว)</option>
-                  </select>
-                  <p className="mt-1 text-[11px] text-slate-500 leading-normal">
-                    ระบบจะตัดวรรคส่งให้ AI แปลทันทีแบบเรียลไทม์เมื่อตรวจพบการหยุดพูดตามเวลาที่กำหนด
-                  </p>
-                </div>
-
-                {/* Font Size Option */}
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1.5">
-                    ขนาดตัวอักษรข้อความแปล (Font Size)
-                  </label>
-                  <select
-                    name="fontSize"
-                    value={config.fontSize || 'large'}
-                    onChange={handleConfigChange}
-                    className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium"
-                  >
-                    <option value="small">ขนาดเล็ก (Small)</option>
-                    <option value="medium">ขนาดปานกลาง (Medium)</option>
-                    <option value="large">ขนาดใหญ่ (Large - แนะนำ)</option>
-                    <option value="xlarge">ขนาดใหญ่พิเศษ (Extra Large)</option>
-                  </select>
-                </div>
-
-                {/* Options checklist */}
-                <div className="pt-3 border-t border-slate-200 space-y-2.5">
-                  <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
-                    <input
-                      type="checkbox"
-                      name="showOriginal"
-                      checked={config.showOriginal !== false}
-                      onChange={handleConfigChange}
-                      className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
-                    />
-                    <span>แสดงประโยคต้นฉบับคู่กับคำแปล</span>
-                  </label>
-
-                  <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
-                    <input
-                      type="checkbox"
-                      name="showLatency"
-                      checked={config.showLatency !== false}
-                      onChange={handleConfigChange}
-                      className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
-                    />
-                    <span>แสดงความเร็วการตอบสนอง (Latency ms)</span>
-                  </label>
-                </div>
-              </div>
-            )}
-
-            {/* TAB 2: DICTIONARY */}
-            {activeTab === 'dictionary' && (
-              <div>
-                <DictionaryManager
-                  dictionaryJson={config.dictionaryJson}
-                  onChange={(newJson) => {
-                    const updated = { ...config, dictionaryJson: newJson };
-                    setConfig(updated);
-                    if (socket) socket.emit('update-config', updated);
-                  }}
-                />
-              </div>
-            )}
-
-          </div>
-
-          {/* Close drawer button on mobile */}
-          <div className="p-3 border-t border-slate-200 lg:hidden">
-            <button
-              onClick={() => setMobileSettingsOpen(false)}
-              className="w-full py-2 bg-slate-100 text-slate-700 text-xs font-semibold rounded-lg"
-            >
-              ปิดหน้าต่างตั้งค่า
-            </button>
-          </div>
-        </aside>
-
-        {/* Backdrop for mobile drawer */}
-        {mobileSettingsOpen && (
-          <div
-            onClick={() => setMobileSettingsOpen(false)}
-            className="fixed inset-0 bg-black/30 z-10 lg:hidden"
+          <CaptionFeed
+            captions={captions}
+            interim={captionState.interim?.sourceText ?? null}
+            config={config}
+            onEdit={(seq, targetText) => dispatchCaption({ kind: 'edit', seq, targetText })}
           />
-        )}
+        </div>
 
-        {/* ─────────────────────────────────────────────────────────────
-            MAIN TRANSLATION FEED & ACTIVE TRANSCRIPT MONITOR
-        ────────────────────────────────────────────────────────────── */}
-        <main className="flex-1 flex flex-col bg-slate-50 min-w-0">
-          {/* Feed Header */}
-          <div className="px-4 py-2.5 bg-white border-b border-slate-200 flex items-center justify-between gap-3 shrink-0">
-            <div className="flex items-center gap-2 text-xs text-slate-600">
-              <Radio className={`w-4 h-4 ${isListening ? 'text-emerald-500 animate-pulse' : 'text-slate-400'}`} />
-              <div className="flex items-center gap-1.5 bg-slate-100 px-2.5 py-1 rounded-lg border border-slate-200">
-                <span className="font-bold text-slate-800">
-                  {config.sourceLang === 'th-TH' ? 'ไทย (TH)' : 'อังกฤษ (EN)'} ➔ {config.targetLang}
-                </span>
-                <button
-                  onClick={handleSwapLanguages}
-                  className="p-1 hover:bg-white rounded-md text-slate-500 hover:text-[#DE5C8E] transition-all cursor-pointer"
-                  title="สลับภาษาผู้พูดและภาษาแปล"
-                >
-                  <ArrowLeftRight className="w-3.5 h-3.5" />
-                </button>
-              </div>
-              <span className="text-slate-400 font-medium hidden sm:inline">({transcripts.length} รายการ)</span>
-            </div>
+        <div className="flex flex-col gap-6">
+          <ControlPanel
+            state={socket.welcome}
+            disabled={disabled}
+            onSetLanguages={(source, target) => send(cmd.setLanguages(sid, source, target))}
+            onSetPaused={(paused) => send(cmd.setPaused(sid, paused))}
+            onSetGate={(w, ms) => send(cmd.setGate(sid, w, ms))}
+            onReport={(start) => send(start ? cmd.reportStart(sid) : cmd.reportStop(sid))}
+          />
 
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => exportTranscript('txt')}
-                disabled={transcripts.length === 0}
-                className="px-2.5 py-1.5 text-xs text-slate-700 hover:text-slate-900 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg font-semibold transition-all disabled:opacity-40 flex items-center gap-1.5 shadow-2xs"
-                title="ส่งออกข้อความ TXT"
-              >
-                <Download className="w-3.5 h-3.5 text-slate-500" />
-                <span>TXT</span>
-              </button>
+          <DictionaryManager
+            sections={glossary}
+            disabled={disabled}
+            onAdd={(section: GlossarySection, abbr, full) => send(cmd.glossaryAdd(sid, section, abbr, full))}
+            onRemove={(section: GlossarySection, abbr) => send(cmd.glossaryRemove(sid, section, abbr))}
+            onReload={() => send(cmd.glossaryReload(sid))}
+          />
 
-              <button
-                onClick={() => exportTranscript('srt')}
-                disabled={transcripts.length === 0}
-                className="px-2.5 py-1.5 text-xs text-slate-700 hover:text-slate-900 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg font-semibold transition-all disabled:opacity-40 flex items-center gap-1.5 shadow-2xs"
-                title="ส่งออกคำบรรยาย SRT"
-              >
-                <FileText className="w-3.5 h-3.5 text-slate-500" />
-                <span>SRT</span>
-              </button>
-
-              <button
-                onClick={clearTranscripts}
-                disabled={transcripts.length === 0}
-                className="p-1.5 text-slate-400 hover:text-rose-600 rounded-lg hover:bg-rose-50 transition-all disabled:opacity-30 ml-1"
-                title="ล้างประวัติข้อความทั้งหมด"
-              >
-                <Trash2 className="w-4 h-4" />
-              </button>
-            </div>
-          </div>
-
-          {/* Mic Permission Error Alert */}
-          {micPermissionError && (
-            <div className="p-3 bg-rose-50 border-b border-rose-200 text-rose-800 text-xs flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <ShieldAlert className="w-4 h-4 text-rose-600 shrink-0" />
-                <span>ไมโครโฟนถูกบล็อก กรุณาอนุญาตการเข้าถึงไมโครโฟนในเบราว์เซอร์</span>
-              </div>
-              <button
-                onClick={startListening}
-                className="px-3 py-1 bg-rose-600 text-white rounded-lg text-xs font-semibold"
-              >
-                ลองใหม่อีกครั้ง
-              </button>
-            </div>
-          )}
-
-          {/* Live Interim Speech Stream Indicator & Live Chunk Controller */}
-          {isListening && (
-            <div className="px-4 py-2 bg-emerald-50 border-b border-emerald-200 flex items-center justify-between gap-3 text-xs text-emerald-900 transition-all shrink-0">
-              <div className="flex items-center gap-2 min-w-0 flex-1">
-                <div className="flex items-center gap-1.5 shrink-0">
-                  <span className="relative flex h-2 w-2">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-                  </span>
-                  <span className="font-bold text-emerald-800 shrink-0">กำลังฟัง:</span>
-                </div>
-                <div className="flex-1 truncate font-mono text-xs text-emerald-800 font-medium">
-                  {interimSpeechText ? (
-                    <span className="bg-emerald-100/80 px-2 py-0.5 rounded text-emerald-900 font-semibold animate-pulse">
-                      &ldquo;{interimSpeechText}&rdquo;
-                    </span>
-                  ) : (
-                    <span className="text-emerald-600/80 italic">กำลังรอเสียงพูด... (พูดใส่ไมโครโฟนได้ทันที)</span>
-                  )}
-                </div>
-              </div>
-
-              <div className="flex items-center gap-2 shrink-0">
-                {/* Visual Audio Wave */}
-                <div className="flex items-center gap-0.5 h-3.5 bg-emerald-200/80 px-1.5 rounded">
-                  <div
-                    className="w-1 bg-emerald-700 rounded-full transition-all duration-75"
-                    style={{ height: `${Math.max(25, micAudioLevel)}%` }}
-                  />
-                  <div
-                    className="w-1 bg-emerald-700 rounded-full transition-all duration-75"
-                    style={{ height: `${Math.max(20, micAudioLevel * 0.8)}%` }}
-                  />
-                  <div
-                    className="w-1 bg-emerald-700 rounded-full transition-all duration-75"
-                    style={{ height: `${Math.max(15, micAudioLevel * 0.6)}%` }}
-                  />
-                </div>
-
-                {/* Live Chunk Status Badge */}
-                <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 bg-white text-[11px] font-semibold text-emerald-800 border border-emerald-300 rounded-md shadow-2xs">
-                  <Timer className="w-3 h-3 text-emerald-600" />
-                  <span>ตัดวรรค ~{(config.chunkSilenceMs || 900) / 1000}s</span>
-                </span>
-
-                {/* Manual Cut Now Button */}
-                {interimSpeechText && (
-                  <button
-                    type="button"
-                    onClick={handleForceCommitInterim}
-                    className="px-2.5 py-1 bg-[#DE5C8E] hover:bg-[#c94577] text-white rounded-md text-[11px] font-bold flex items-center gap-1 transition-all shadow-2xs cursor-pointer animate-bounce"
-                    title="ตัดวรรคและส่งท่อนนี้ให้ AI แปลทันที"
-                  >
-                    <Scissors className="w-3 h-3" />
-                    <span>ตัดแปลทันที</span>
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Transcripts List Container */}
-          <div
-            ref={transcriptScrollRef}
-            className="flex-1 p-3.5 sm:p-6 overflow-y-auto space-y-3.5"
-          >
-            {transcripts.length === 0 ? (
-              <div className="h-full flex flex-col items-center justify-center text-center p-6 text-slate-400 space-y-3">
-                <div className="w-14 h-14 rounded-2xl bg-white border border-slate-200 shadow-xs flex items-center justify-center text-[#DE5C8E]">
-                  <Mic className="w-7 h-7" />
-                </div>
-                <div className="space-y-1 max-w-sm">
-                  <div className="font-bold text-slate-700 text-sm">พร้อมรับเสียงจากไมโครโฟน</div>
-                  <p className="text-xs text-slate-400 leading-relaxed">
-                    กดปุ่ม <strong>&quot;เริ่มแปลสด&quot;</strong> ด้านบน จากนั้นพูดใส่ไมโครโฟนเพื่อทำการแปลภาษาแบบเรียลไทม์
-                  </p>
-                </div>
-              </div>
-            ) : (
-              transcripts.map((item, index) => {
-                const isEditing = editingItemId === item.id;
-                const isLatest = index === transcripts.length - 1;
-
-                return (
-                  <div
-                    key={item.id}
-                    className={`p-4 rounded-xl border transition-all shadow-xs ${
-                      isEditing
-                        ? 'bg-amber-50/90 border-amber-300 ring-2 ring-amber-200'
-                        : isLatest
-                        ? 'bg-white border-[#DE5C8E]/40 ring-1 ring-[#DE5C8E]/20'
-                        : 'bg-white border-slate-200 hover:border-slate-300'
-                    }`}
-                  >
-                    {isEditing ? (
-                      /* Inline Editor */
-                      <div className="space-y-2.5">
-                        <div>
-                          <label className="text-xs font-bold text-slate-600 block mb-1">
-                            ประโยคต้นฉบับ:
-                          </label>
-                          <input
-                            type="text"
-                            value={editOriginalText}
-                            onChange={(e) => setEditOriginalText(e.target.value)}
-                            className="w-full p-2.5 text-xs bg-white border border-slate-300 rounded-lg outline-none focus:border-[#DE5C8E]"
-                          />
-                        </div>
-                        <div>
-                          <label className="text-xs font-bold text-slate-600 block mb-1">
-                            คำแปล:
-                          </label>
-                          <input
-                            type="text"
-                            value={editTranslatedText}
-                            onChange={(e) => setEditTranslatedText(e.target.value)}
-                            className="w-full p-2.5 text-xs bg-white border border-slate-300 rounded-lg font-bold text-slate-900 outline-none focus:border-[#DE5C8E]"
-                          />
-                        </div>
-                        <div className="flex items-center justify-between pt-1">
-                          <button
-                            type="button"
-                            onClick={() => retranslateItem(item)}
-                            className="px-3 py-1.5 text-xs text-[#DE5C8E] bg-[#DE5C8E]/10 hover:bg-[#DE5C8E]/20 rounded-lg font-semibold flex items-center gap-1.5 transition-all"
-                          >
-                            <RotateCcw className="w-3.5 h-3.5" />
-                            <span>ให้ AI แปลใหม่</span>
-                          </button>
-                          <div className="flex gap-2">
-                            <button
-                              type="button"
-                              onClick={cancelEditing}
-                              className="px-3.5 py-1.5 text-xs text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium transition-all"
-                            >
-                              ยกเลิก
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => saveCorrection(item.id)}
-                              className="px-3.5 py-1.5 text-xs text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg font-semibold flex items-center gap-1.5 shadow-xs transition-all"
-                            >
-                              <Check className="w-3.5 h-3.5" />
-                              <span>บันทึก</span>
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-                    ) : (
-                      /* Clean Item Display */
-                      <div className="space-y-1.5">
-                        {/* Meta header row */}
-                        <div className="flex items-center justify-between text-xs text-slate-400">
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono text-[11px] text-slate-400">
-                              {new Date(item.timestamp).toLocaleTimeString()}
-                            </span>
-                            {config.showLatency && item.latencyMs ? (
-                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 font-mono text-[10px] text-slate-600 border border-slate-200">
-                                <Zap className="w-3 h-3 text-amber-500" />
-                                <span>{item.latencyMs}ms</span>
-                              </span>
-                            ) : null}
-                            {item.isEdited && (
-                              <span className="text-[10px] text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded-md font-medium border border-amber-200">
-                                แก้ไขแล้ว
-                              </span>
-                            )}
-                          </div>
-
-                          <div className="flex items-center gap-1">
-                            <button
-                              onClick={() => handleCopyItem(item)}
-                              className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
-                              title="คัดลอกข้อความ"
-                            >
-                              {copiedItemId === item.id ? (
-                                <Check className="w-3.5 h-3.5 text-emerald-600" />
-                              ) : (
-                                <Copy className="w-3.5 h-3.5" />
-                              )}
-                            </button>
-                            <button
-                              onClick={() => startEditing(item)}
-                              className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
-                              title="แก้ไขคำแปล"
-                            >
-                              <Edit2 className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              onClick={() => deleteItem(item.id)}
-                              className="p-1.5 text-slate-400 hover:text-rose-600 rounded-md hover:bg-rose-50 transition-all"
-                              title="ลบรายการนี้"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        </div>
-
-                        {/* Source text (if enabled) */}
-                        {config.showOriginal && item.originalText && (
-                          <div className="text-xs text-slate-500 font-medium leading-relaxed">
-                            {item.originalText}
-                          </div>
-                        )}
-
-                        {/* Primary Translated text */}
-                        <div className={`${getTextSizeClass()} font-bold text-slate-900 leading-snug tracking-tight`}>
-                          {item.translatedText}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                );
-              })
-            )}
-          </div>
-
-          {/* ─────────────────────────────────────────────────────────────
-              BOTTOM TEST & SIMULATION INPUT BAR (Instant Translation Check)
-          ────────────────────────────────────────────────────────────── */}
-          <div className="p-3 bg-white border-t border-slate-200 shrink-0 space-y-2">
-            {/* Quick Test Chips */}
-            <div className="flex items-center gap-1.5 overflow-x-auto text-[11px] no-scrollbar pb-0.5">
-              <span className="text-slate-400 font-semibold shrink-0 flex items-center gap-1">
-                <Sparkles className="w-3 h-3 text-[#DE5C8E]" />
-                <span>ตัวอย่างทดสอบ:</span>
-              </span>
-              {config.sourceLang === 'th-TH' ? (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => handleSendTestText('สวัสดีครับ ยินดีต้อนรับสู่การประชุมประจำปี')}
-                    className="px-2.5 py-1 bg-slate-100 hover:bg-pink-50 hover:text-[#DE5C8E] hover:border-pink-200 border border-slate-200 text-slate-700 rounded-md font-medium shrink-0 transition-all cursor-pointer"
-                  >
-                    &ldquo;สวัสดีครับ ยินดีต้อนรับสู่การประชุม&rdquo;
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleSendTestText('ปัญญาประดิษฐ์และ Machine Learning มีความสำคัญต่อองค์กร')}
-                    className="px-2.5 py-1 bg-slate-100 hover:bg-pink-50 hover:text-[#DE5C8E] hover:border-pink-200 border border-slate-200 text-slate-700 rounded-md font-medium shrink-0 transition-all cursor-pointer"
-                  >
-                    &ldquo;ปัญญาประดิษฐ์และ Machine Learning&rdquo;
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleSendTestText('ตัวชี้วัดความสำเร็จและ ROI ปีนี้เติบโต 25%')}
-                    className="px-2.5 py-1 bg-slate-100 hover:bg-pink-50 hover:text-[#DE5C8E] hover:border-pink-200 border border-slate-200 text-slate-700 rounded-md font-medium shrink-0 transition-all cursor-pointer"
-                  >
-                    &ldquo;ตัวชี้วัดความสำเร็จและ ROI&rdquo;
-                  </button>
-                </>
-              ) : (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => handleSendTestText('Good morning everyone and welcome to the conference.')}
-                    className="px-2.5 py-1 bg-slate-100 hover:bg-pink-50 hover:text-[#DE5C8E] hover:border-pink-200 border border-slate-200 text-slate-700 rounded-md font-medium shrink-0 transition-all cursor-pointer"
-                  >
-                    &ldquo;Good morning everyone and welcome&rdquo;
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleSendTestText('Today we will discuss Artificial Intelligence and Machine Learning.')}
-                    className="px-2.5 py-1 bg-slate-100 hover:bg-pink-50 hover:text-[#DE5C8E] hover:border-pink-200 border border-slate-200 text-slate-700 rounded-md font-medium shrink-0 transition-all cursor-pointer"
-                  >
-                    &ldquo;Artificial Intelligence & Machine Learning&rdquo;
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleSendTestText('Let us review our key performance indicators and return on investment.')}
-                    className="px-2.5 py-1 bg-slate-100 hover:bg-pink-50 hover:text-[#DE5C8E] hover:border-pink-200 border border-slate-200 text-slate-700 rounded-md font-medium shrink-0 transition-all cursor-pointer"
-                  >
-                    &ldquo;KPI & Return on investment&rdquo;
-                  </button>
-                </>
-              )}
-            </div>
-
-            {/* Test Input Form */}
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                handleSendTestText();
-              }}
-              className="flex items-center gap-2"
+          <div className="flex flex-col gap-2">
+            <label className="text-xs text-slate-400">ขนาดตัวอักษร</label>
+            <select
+              value={config.fontSize}
+              onChange={(e) => setConfig((c) => ({ ...c, fontSize: e.target.value as DisplayConfig['fontSize'] }))}
+              className="bg-slate-800 rounded px-2 py-1.5 text-sm"
             >
-              <div className="relative flex-1">
-                <input
-                  type="text"
-                  value={testInputText}
-                  onChange={(e) => setTestInputText(e.target.value)}
-                  placeholder={
-                    config.sourceLang === 'th-TH'
-                      ? 'พิมพ์ข้อความภาษาไทยเพื่อทดสอบแปลเป็นอังกฤษ (กด Enter หรือคลิกส่ง)...'
-                      : 'Type English text to test translation to Thai (press Enter or click Send)...'
-                  }
-                  className="w-full pl-3 pr-8 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] transition-all text-slate-800 placeholder:text-slate-400"
-                />
-                {testInputText && (
-                  <button
-                    type="button"
-                    onClick={() => setTestInputText('')}
-                    className="absolute right-2.5 top-2.5 text-slate-400 hover:text-slate-600 cursor-pointer"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
-                )}
-              </div>
-              <button
-                type="submit"
-                disabled={!testInputText.trim()}
-                className="px-4 py-2 bg-[#DE5C8E] hover:bg-[#c94577] text-white rounded-lg text-xs font-bold transition-all shadow-2xs disabled:opacity-40 flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
-              >
-                <Send className="w-3.5 h-3.5" />
-                <span>แปลทันที</span>
-              </button>
-            </form>
+              <option value="small">เล็ก</option>
+              <option value="medium">กลาง</option>
+              <option value="large">ใหญ่</option>
+              <option value="xlarge">ใหญ่พิเศษ</option>
+            </select>
           </div>
-        </main>
+        </div>
       </div>
+
+      {report && (
+        <div className="p-3 bg-slate-800 rounded">
+          <h2 className="text-sm font-semibold mb-2">สรุปช่วงการประชุม</h2>
+          <p className="text-sm whitespace-pre-wrap">{report.summary}</p>
+        </div>
+      )}
+
+      {showHistory && <HistoryPanel projects={projects.endedProjects} onClose={() => setShowHistory(false)} />}
+      {finishedProject && <BillModal project={finishedProject} onClose={() => setFinishedProject(null)} />}
     </div>
   );
 }
