@@ -26,8 +26,8 @@ import {
   ChevronDown,
   ChevronUp
 } from 'lucide-react';
-// ProjectPanel.tsx has NO default export — it exports four named components.
-import { BillModal, HistoryPanel, ProjectHeaderBar, ProjectPicker } from '../components/ProjectPanel';
+// ProjectPanel.tsx has NO default export — it exports five named components.
+import { BillModal, HistoryPanel, ProjectHeaderBar, ProjectPicker, SessionHistoryModal } from '../components/ProjectPanel';
 import DictionaryManager from '../components/DictionaryManager';
 import { captionsReducer, initialCaptionState, selectCaptions, type Caption } from '../asr/captions';
 import { useAsrSocket } from '../asr/useAsrSocket';
@@ -125,6 +125,7 @@ export default function Admin() {
   const [activeTab, setActiveTab] = useState<'languages' | 'dictionary'>('languages');
   const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showSessionHistory, setShowSessionHistory] = useState(false);
   const [showAllHistory, setShowAllHistory] = useState(false);
   const [finishedProject, setFinishedProject] = useState<Project | null>(null);
 
@@ -231,7 +232,12 @@ export default function Admin() {
     } else if (frame.type === 'session.welcome') {
       setGlossary((frame.data as { glossary: { sections: GlossarySections } }).glossary.sections);
     } else if (frame.type === 'report.done') {
-      setReport(frame.data as ReportDonePayload);
+      const payload = frame.data as ReportDonePayload;
+      setReport(payload);
+      // `saveSessionSummary` is `useCallback(..., [])` inside useProjects, so
+      // it is reference-stable across renders — unlike `detachAsrSession`, it
+      // does not need a ref to stay fresh in this `useCallback([])` closure.
+      projects.saveSessionSummary(frame.session, payload.summary, payload.items.length);
       resolvePendingReportRef.current?.();
     } else if (frame.type === 'report.state') {
       // The backend acks report_stop with report.state BEFORE it attempts
@@ -515,6 +521,9 @@ export default function Admin() {
     <div className="flex flex-col h-screen w-full bg-slate-100 text-slate-800 font-sans overflow-hidden">
       {showHistory && <HistoryPanel projects={projects.endedProjects} onClose={() => setShowHistory(false)} />}
       {finishedProject && <BillModal project={finishedProject} onClose={() => setFinishedProject(null)} />}
+      {showSessionHistory && (
+        <SessionHistoryModal project={projects.currentProject} onClose={() => setShowSessionHistory(false)} />
+      )}
 
       {/* ─────────────────────────────────────────────────────────────
           TOP CONTROL & METRICS BAR
@@ -539,7 +548,7 @@ export default function Admin() {
             </div>
           </div>
 
-          <div className="hidden sm:block">
+          <div className="hidden sm:flex items-center gap-1.5">
             <ProjectHeaderBar
               project={projects.currentProject}
               activeSession={projects.activeSession}
@@ -547,6 +556,14 @@ export default function Admin() {
               onSwitchProject={handleSwitchProject}
               onOpenHistory={() => setShowHistory(true)}
             />
+            <button
+              type="button"
+              onClick={() => setShowSessionHistory(true)}
+              className="p-1.5 text-slate-400 hover:text-[#DE5C8E] rounded-full hover:bg-slate-100 transition-all shrink-0"
+              title="ดู session และสรุปการประชุมย้อนหลังในโปรเจกต์นี้"
+            >
+              <ClipboardList className="w-4 h-4" />
+            </button>
           </div>
         </div>
 
@@ -618,7 +635,7 @@ export default function Admin() {
         </div>
       </header>
 
-      <div className="sm:hidden px-3 py-2 bg-white border-b border-slate-200 shrink-0 overflow-x-auto">
+      <div className="sm:hidden px-3 py-2 bg-white border-b border-slate-200 shrink-0 overflow-x-auto flex items-center gap-1.5">
         <ProjectHeaderBar
           project={projects.currentProject}
           activeSession={projects.activeSession}
@@ -626,6 +643,14 @@ export default function Admin() {
           onSwitchProject={handleSwitchProject}
           onOpenHistory={() => setShowHistory(true)}
         />
+        <button
+          type="button"
+          onClick={() => setShowSessionHistory(true)}
+          className="p-1.5 text-slate-400 hover:text-[#DE5C8E] rounded-full hover:bg-slate-100 transition-all shrink-0"
+          title="ดู session และสรุปการประชุมย้อนหลังในโปรเจกต์นี้"
+        >
+          <ClipboardList className="w-4 h-4" />
+        </button>
       </div>
 
       {tokenError && (

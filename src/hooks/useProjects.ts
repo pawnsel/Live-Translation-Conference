@@ -199,6 +199,24 @@ export function useProjects() {
     setProjects((prev) => prev.map((p: Project) => (p.id === projectId ? { ...p, transcripts } : p)));
   }, []);
 
+  // Attaches a report.done summary to whichever ProjectSession recorded that
+  // ASR session, wherever it lives — searched by `asrSessionId` inside the
+  // updater rather than gated on `currentProject`, so it stays correct even
+  // if a late-arriving report resolves after the project selection moved on.
+  // No P2 database exists yet, so this is the "mock" persistence: the same
+  // localStorage record every other project field already rides on.
+  const saveSessionSummary = useCallback((asrSessionId: string, summary: string, reportItemCount: number) => {
+    setProjects((prev) =>
+      prev.map((p) => {
+        const idx = p.sessions.findIndex((s) => s.asrSessionId === asrSessionId);
+        if (idx === -1) return p;
+        const sessions = p.sessions.slice();
+        sessions[idx] = { ...sessions[idx], summary, reportItemCount };
+        return { ...p, sessions };
+      })
+    );
+  }, []);
+
   const finishProject = (transcripts: TranscriptItem[]): Project | undefined => {
     if (!currentProject) return undefined;
 
@@ -233,6 +251,7 @@ export function useProjects() {
     detachAsrSession,
     endSession,
     saveTranscripts,
+    saveSessionSummary,
     finishProject
   };
 }

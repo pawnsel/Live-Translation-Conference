@@ -28,6 +28,16 @@ export interface ProjectSession {
   endedAt?: number;
   sourceLang: string;
   targetLang: string;
+  /** The backend's report.done summary for this session, once it arrives.
+   *  No P2 database exists yet, so this rides on the same localStorage
+   *  record everything else in `Project` already uses — undefined means
+   *  "no report has come in for this session" (nothing was gathered, the
+   *  session predates this field, or the operator never finished it),
+   *  never "the report failed": a failed AI summary is stored as "". */
+  summary?: string;
+  /** Finals gathered for that report, so an empty `summary` (AI failed
+   *  server-side) can still say "N ข้อความถูกบันทึกไว้" instead of nothing. */
+  reportItemCount?: number;
 }
 
 export interface ProjectBill {
