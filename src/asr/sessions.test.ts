@@ -75,9 +75,25 @@ describe('getSession', () => {
 });
 
 describe('listSessions', () => {
-  it('returns the array the backend sends', async () => {
-    const { impl } = jsonFetch([{ body: [snapshot('sess_a')] }]);
-    expect(await listSessions('http://localhost:8765', 'op-1', impl)).toHaveLength(1);
+  it('unwraps the {sessions: [...]} envelope the real backend sends', async () => {
+    // main.py's list_sessions: `return {"sessions": [...]}` — NOT a bare
+    // array. A mock returning a bare array here would let listSessions
+    // parse the response wrong (`response.json() as SessionSnapshot[]`
+    // with no unwrapping) and still pass, which is exactly how this bug
+    // shipped undetected: `listed.length` on the wrapper object is
+    // `undefined`, so chooseSession never hit its `sessions.length === 0`
+    // branch and always fell through to `ask` — even with zero sessions.
+    const { impl } = jsonFetch([{ body: { sessions: [snapshot('sess_a')] } }]);
+    const result = await listSessions('http://localhost:8765', 'op-1', impl);
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe('sess_a');
+  });
+
+  it('returns an array (not the wrapper object) for an empty session list, so chooseSession decides create', async () => {
+    const { impl } = jsonFetch([{ body: { sessions: [] } }]);
+    const result = await listSessions('http://localhost:8765', 'op-1', impl);
+    expect(Array.isArray(result)).toBe(true);
+    expect(result).toHaveLength(0);
   });
 });
 

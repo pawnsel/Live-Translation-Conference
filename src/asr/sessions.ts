@@ -64,7 +64,18 @@ export async function listSessions(
     headers: authHeaders(token),
   });
   if (!response.ok) throw new Error(`Could not list sessions (HTTP ${response.status})`);
-  return (await response.json()) as SessionSnapshot[];
+  // The backend wraps the list: `{"sessions": [...]}`, not a bare array
+  // (main.py's list_sessions: `return {"sessions": [...]}`). This was cast
+  // straight to SessionSnapshot[] with no unwrapping — an unchecked `as`
+  // that TypeScript never validates at runtime — so `listed.length` was
+  // always `undefined` and `chooseSession` always fell through to its final
+  // `ask` branch, even with zero live sessions. Confirmed live: every
+  // fresh "เริ่ม Session" press listed correctly, decided wrong, and bailed
+  // out without ever creating anything — a silent full-stop with no error,
+  // because `undefined === 0` and `undefined === 1` are both false, so
+  // neither of chooseSession's earlier branches ever fire.
+  const body = (await response.json()) as { sessions: SessionSnapshot[] };
+  return body.sessions;
 }
 
 export async function createSession(
