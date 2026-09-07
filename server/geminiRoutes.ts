@@ -18,6 +18,22 @@ interface TranscribeMeta {
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
 
+// Deadlines so a hung Gemini SDK call can't hold a request open indefinitely
+// — a hang (not an error) would otherwise stall the caller forever with no
+// visible failure.
+const TRANSCRIBE_TIMEOUT_MS = 15000;
+const SUMMARIZE_TIMEOUT_MS = 20000;
+
+// Caps the summarize payload so one request can't build an unbounded prompt.
+const MAX_SUMMARIZE_ITEMS = 2000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms))
+  ]);
+}
+
 export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps): void {
   app.post('/api/gemini/transcribe', upload.single('audio'), async (req: Request, res: Response) => {
     if (!req.file) {
@@ -38,17 +54,24 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps): void 
 
     const startedAt = Date.now();
     try {
-      const result = await transcribeChunk(
-        deps.client,
-        {
-          audio: req.file.buffer,
-          mimeType: req.file.mimetype || 'audio/wav',
-          sourceLang: meta.sourceLang,
-          targetLang: meta.targetLang,
-          glossary: meta.glossary ?? { protected_terms: {}, person_names: {}, thai_corrections: {} },
-          context: meta.context ?? ''
-        },
-        deps.model
+      const result = await withTimeout(
+        transcribeChunk(
+          deps.client,
+          {
+            audio: req.file.buffer,
+            // The client always sends WAV; the upload's declared mimetype is
+            // attacker-controlled multipart header data, not something to
+            // trust and forward to Gemini verbatim.
+            mimeType: 'audio/wav',
+            sourceLang: meta.sourceLang,
+            targetLang: meta.targetLang,
+            glossary: meta.glossary ?? { protected_terms: {}, person_names: {}, thai_corrections: {} },
+            context: meta.context ?? ''
+          },
+          deps.model
+        ),
+        TRANSCRIBE_TIMEOUT_MS,
+        'transcribe'
       );
       res.json({ source_text: result.sourceText, target_text: result.targetText, latencyMs: Date.now() - startedAt });
     } catch (err) {
@@ -64,12 +87,20 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps): void 
       res.status(400).json({ error: 'Missing items array' });
       return;
     }
+    if (items.length > MAX_SUMMARIZE_ITEMS) {
+      res.status(400).json({ error: `Too many items (max ${MAX_SUMMARIZE_ITEMS})` });
+      return;
+    }
     const transcript: TranscriptLine[] = items.map((item) => ({
       sourceText: item.source_text ?? '',
       targetText: item.target_text ?? ''
     }));
     try {
-      const summary = await summarizeTranscript(deps.client, transcript, deps.summaryModel);
+      const summary = await withTimeout(
+        summarizeTranscript(deps.client, transcript, deps.summaryModel),
+        SUMMARIZE_TIMEOUT_MS,
+        'summarize'
+      );
       res.json({ summary, items: items.length });
     } catch {
       // Fallback contract: an AI failure never loses the transcript —
