@@ -37,6 +37,38 @@ describe('transcribeChunk', () => {
     });
   });
 
+  it('requests structured JSON output via config.responseMimeType and responseSchema', async () => {
+    // Pins the structured-output mechanism the spec specifically chose for
+    // reliability (over asking for JSON in the prompt text alone) — nothing
+    // else protected this before.
+    const { client, calls } = fakeClient(JSON.stringify({ source_text: 'a', target_text: 'b' }));
+    await transcribeChunk(
+      client,
+      { audio: Buffer.from([1]), mimeType: 'audio/wav', sourceLang: 'th', targetLang: 'en', glossary: emptyGlossary(), context: '' },
+      'gemini-test-model'
+    );
+    const args = calls[0] as { config?: { responseMimeType?: string; responseSchema?: unknown } };
+    expect(args.config?.responseMimeType).toBe('application/json');
+    expect(args.config?.responseSchema).toBeDefined();
+    expect(args.config?.responseSchema).toEqual(
+      expect.objectContaining({
+        type: 'object',
+        required: expect.arrayContaining(['source_text', 'target_text'])
+      })
+    );
+  });
+
+  it('throws a clear error when Gemini returns an empty/safety-blocked response', async () => {
+    const { client } = fakeClient(undefined as unknown as string);
+    await expect(
+      transcribeChunk(
+        client,
+        { audio: Buffer.from([1]), mimeType: 'audio/wav', sourceLang: 'th', targetLang: 'en', glossary: emptyGlossary(), context: '' },
+        'model'
+      )
+    ).rejects.toThrow(/empty/i);
+  });
+
   it('includes glossary terms and prior context in the prompt text', async () => {
     const { client, calls } = fakeClient(JSON.stringify({ source_text: 'a', target_text: 'b' }));
     await transcribeChunk(
@@ -97,5 +129,10 @@ describe('summarizeTranscript', () => {
     const args = calls[0] as { contents: Array<{ parts: Array<{ text: string }> }> };
     expect(args.contents[0].parts[0].text).toContain('สวัสดี => Hello');
     expect(args.contents[0].parts[0].text).toContain('ลาก่อน => Goodbye');
+  });
+
+  it('throws a clear error when Gemini returns an empty/safety-blocked response', async () => {
+    const { client } = fakeClient(undefined as unknown as string);
+    await expect(summarizeTranscript(client, [{ sourceText: 'a', targetText: 'b' }], 'model')).rejects.toThrow(/empty/i);
   });
 });
