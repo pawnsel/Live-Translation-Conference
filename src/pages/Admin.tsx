@@ -196,11 +196,25 @@ export default function Admin() {
   // ── Health polling over HTTP, never over the rate-limited WebSocket ──────
   useEffect(() => {
     if (!token || !session) return;
+    // `clearInterval` in this effect's cleanup only stops FUTURE polls from
+    // being scheduled — it cannot cancel a request already in flight. Since
+    // each poll can now take up to REQUEST_TIMEOUT_MS (10s) to fail against
+    // a slow/dying backend, and polls fire every HEALTH_POLL_MS (5s), 2-3
+    // requests can be genuinely in flight at once. Without this guard, a
+    // stale poll issued before the operator ended the session (or before
+    // useAsrSocket's giveUp fired) can resolve with a stale 200 AFTER
+    // setSession(null) already ran, silently resurrecting a session that
+    // was just torn down. `cancelled` is flipped in this effect's own
+    // cleanup, so any response arriving after the effect has been torn
+    // down (session changed, unmount, token change) is discarded instead
+    // of applied.
+    let cancelled = false;
     const timer = setInterval(async () => {
       let fresh: SessionSnapshot | null | undefined;
       try {
         fresh = await getSession(BACKEND_URL, token, session.id);
       } catch (err) {
+        if (cancelled) return;
         // A 401/500/network blip is not the same as a 404 — the session may
         // still be alive. Surface it instead of silently going dark; do not
         // touch session/mic state here, so a transient failure doesn't tear
@@ -222,6 +236,7 @@ export default function Admin() {
         );
         return;
       }
+      if (cancelled) return;
       if (fresh === null) {
         // The backend forgot this session — a restart. Do not retry the id.
         setSession(null);
@@ -232,7 +247,10 @@ export default function Admin() {
         setSession(fresh);
       }
     }, HEALTH_POLL_MS);
-    return () => clearInterval(timer);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
     // `session` is a freshly-parsed object on every poll (never
     // reference-equal to the last one, even when unchanged), so depending on
     // it here would tear down and rebuild this very interval every cycle.
