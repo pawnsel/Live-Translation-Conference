@@ -59,8 +59,13 @@ async function startServer() {
     });
   }
 
-  httpServer.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  // This is a single-operator, single-tab local tool (no multi-session
+  // registry, no shared backend) — it has no business being reachable from
+  // the network. Bind to loopback only unless a developer explicitly opts
+  // into LAN/remote access via HOST.
+  const HOST = process.env.HOST || "127.0.0.1";
+  httpServer.listen(PORT, HOST, () => {
+    console.log(`Server running on http://${HOST}:${PORT}`);
   });
 }
 
