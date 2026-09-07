@@ -110,7 +110,9 @@ export default function Admin() {
 
   // Captions have no "delete" concept anymore (there is no server to delete
   // them from) — "delete" stays a local-only hide so an operator can tidy
-  // the visible history without losing anything from the export.
+  // the visible history. Hiding removes a caption from the on-screen view
+  // and from TXT/SRT export, but it is still included in the AI summary and
+  // the permanent project record.
   const [hiddenSeqs, setHiddenSeqs] = useState<Set<number>>(new Set());
   const [editingSeq, setEditingSeq] = useState<number | null>(null);
   const [editDraft, setEditDraft] = useState('');
@@ -164,7 +166,7 @@ export default function Admin() {
       return;
     }
     let cancelled = false;
-    const timer = setInterval(async () => {
+    const probe = async () => {
       const startedAt = Date.now();
       try {
         const res = await fetch('/api/health', { signal: AbortSignal.timeout(4000) });
@@ -173,7 +175,12 @@ export default function Admin() {
       } catch {
         if (!cancelled) setPingMs(null);
       }
-    }, PING_INTERVAL_MS);
+    };
+    // Fire one probe immediately — otherwise Ping reads "--" for the first
+    // PING_INTERVAL_MS of every session, since setInterval's first callback
+    // doesn't fire until the interval has already elapsed once.
+    void probe();
+    const timer = setInterval(probe, PING_INTERVAL_MS);
     return () => {
       cancelled = true;
       clearInterval(timer);
@@ -199,10 +206,14 @@ export default function Admin() {
   // last few words of a sentence aren't lost), then asks Gemini for a
   // summary of the whole transcript before letting go of the session id.
   const stopSessionAndMic = async (): Promise<CaptionResult | null> => {
+    // Disable the "End Session" button immediately, before the await below
+    // — otherwise it stays clickable for the ~1-2s the final chunk's Gemini
+    // call takes, and a second click fires a duplicate summarize POST and a
+    // duplicate saveSessionSummary.
+    setEndingSession(true);
     const flushed = await capture.flush();
     setMicActive(false);
     if (sessionId) {
-      setEndingSession(true);
       const items = allCaptions.map((c) => ({ source_text: c.sourceText, target_text: c.targetText }));
       if (flushed) items.push({ source_text: flushed.sourceText, target_text: flushed.targetText });
       try {
@@ -223,8 +234,8 @@ export default function Admin() {
         setReport({ summary: '', items: items.length });
         projects.saveSessionSummary(sessionId, '', items.length);
       }
-      setEndingSession(false);
     }
+    setEndingSession(false);
     setSessionId(null);
     setPaused(false);
     projects.detachAsrSession();
