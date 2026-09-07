@@ -12,7 +12,6 @@ import {
   Zap,
   Activity,
   Edit2,
-  X,
   Radio,
   Menu,
   ShieldAlert,
@@ -30,44 +29,26 @@ import {
 import { BillModal, HistoryPanel, ProjectHeaderBar, ProjectPicker, SessionHistoryModal } from '../components/ProjectPanel';
 import DictionaryManager from '../components/DictionaryManager';
 import { captionsReducer, initialCaptionState, selectCaptions, type Caption } from '../asr/captions';
-import { useAsrSocket } from '../asr/useAsrSocket';
-import { useAudioCapture } from '../asr/audio/useAudioCapture';
-import { createOperatorTokenSource, mintSourceToken } from '../asr/tokens';
-import { chooseSession, createSession, deleteSession, getSession, listSessions, type SessionSnapshot } from '../asr/sessions';
-import * as cmd from '../asr/commands';
-import type { GlossarySection } from '../asr/commands';
-import type { AnyFrame, GlossarySections, ReportDonePayload } from '../asr/protocol';
+import { useGeminiCapture, type CaptionResult } from '../asr/audio/useGeminiCapture';
 import { useProjects } from '../hooks/useProjects';
+import { loadGlossary, saveGlossary, type GlossarySection, type GlossarySections } from '../glossary';
 import type { DisplayConfig, Project } from '../types';
 
-const BACKEND_URL = import.meta.env.VITE_ASR_BACKEND_URL || 'http://localhost:8765';
-const HEALTH_POLL_MS = 5000;
 const PING_INTERVAL_MS = 3000;
-// A ping that never gets a pong (backend gone, socket dead) must not grow
-// this map forever — clear it and treat latency as unknown rather than leak.
-const MAX_PENDING_PINGS = 20;
-
-// Source tokens live 12 h and expiry is re-checked on EVERY audio frame, so a
-// capture client that outlives its token is closed mid-stream with 4401. An
-// event day can run past 12 h; re-mint at 80% rather than discover this at
-// hour twelve of a conference.
-const SOURCE_TOKEN_REFRESH_MS = 12 * 3600 * 1000 * 0.8;
-// Operator tokens live 12 h too, and `tokenSource.get()` only refreshes once
-// 80% of that life has elapsed — calling it more often costs nothing (it
-// just returns the cached token) until it's actually time to re-mint. A
-// short, minutes-scale poll is therefore both sufficient and more robust
-// than one long timer.
-const OPERATOR_TOKEN_POLL_MS = 5 * 60 * 1000;
-// Bounded wait for the section-report summary before a session is deleted.
-// The backend's own Vertex/Gemini call times out at 30s (SUMMARIZE_TIMEOUT_SEC);
-// this stays under that so ending a session is never stuck longer than the
-// backend itself would give up.
+// Bounded wait for the end-of-session summary before giving up and showing
+// the "AI summary failed" fallback — keeps ending a session from hanging on
+// a stuck Gemini call.
 const REPORT_WAIT_TIMEOUT_MS = 20000;
 
-// Only the pair the backend actually supports (protocol-v1.md: "Supported
-// pairs: th⇄en"). Anything else is not a language the server will accept.
+// Only the pair this console supports. Anything else is not a language
+// Gemini is instructed to expect.
 const LANGS: Record<'th' | 'en', string> = { th: 'ไทย (Thai)', en: 'อังกฤษ (English)' };
 const other = (lang: string) => (lang === 'th' ? 'en' : 'th');
+
+interface ReportResult {
+  summary: string;
+  items: number;
+}
 
 function formatSrtTime(ms: number): string {
   const h = String(Math.floor(ms / 3600000)).padStart(2, '0');
@@ -109,16 +90,14 @@ function boxTextSizeClass(size: DisplayConfig['fontSize']): string {
 
 export default function Admin() {
   const projects = useProjects();
-  const tokenSource = useMemo(() => createOperatorTokenSource(), []);
 
-  const [token, setToken] = useState<string | null>(null);
-  const [tokenError, setTokenError] = useState<string | null>(null);
-  const [session, setSession] = useState<SessionSnapshot | null>(null);
-  const [candidates, setCandidates] = useState<SessionSnapshot[]>([]);
-  const [sourceToken, setSourceToken] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
   const [micActive, setMicActive] = useState(false);
-  const [glossary, setGlossary] = useState<GlossarySections | null>(null);
-  const [report, setReport] = useState<ReportDonePayload | null>(null);
+  const [sourceLang, setSourceLangState] = useState<'th' | 'en'>('th');
+  const [targetLang, setTargetLangState] = useState<'th' | 'en'>('en');
+  const [paused, setPaused] = useState(false);
+  const [glossary, setGlossary] = useState<GlossarySections>(() => loadGlossary());
+  const [report, setReport] = useState<ReportResult | null>(null);
   const [pingMs, setPingMs] = useState<number | null>(null);
 
   const [config, setConfig] = useState<DisplayConfig>({ fontSize: 'large', showOriginal: false, showLatency: false });
@@ -129,10 +108,9 @@ export default function Admin() {
   const [showAllHistory, setShowAllHistory] = useState(false);
   const [finishedProject, setFinishedProject] = useState<Project | null>(null);
 
-  // Captions have no delete command in protocol v1 (they are server-authored
-  // history), so "delete" is a local-only hide — it never reaches the
-  // backend and never affects the export unless the operator also removes it
-  // there. Hidden seqs still exist in the reducer; only the render is filtered.
+  // Captions have no "delete" concept anymore (there is no server to delete
+  // them from) — "delete" stays a local-only hide so an operator can tidy
+  // the visible history without losing anything from the export.
   const [hiddenSeqs, setHiddenSeqs] = useState<Set<number>>(new Set());
   const [editingSeq, setEditingSeq] = useState<number | null>(null);
   const [editDraft, setEditDraft] = useState('');
@@ -142,339 +120,116 @@ export default function Admin() {
   const allCaptions = useMemo(() => selectCaptions(captionState), [captionState]);
   const captions = useMemo(() => allCaptions.filter((c) => !hiddenSeqs.has(c.seq)), [allCaptions, hiddenSeqs]);
 
-  const bootstrapped = useRef(false);
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
-  const pendingPings = useRef<Map<string, number>>(new Map());
-  // Which session's section report we have already sent control.report_start
-  // for — a session is recorded automatically for its whole life, so there
-  // is no manual "start recording" button; this ref just stops the effect
-  // below from re-sending the command on every render.
-  const reportStartedForSessionRef = useRef<string | null>(null);
-  // Resolves the promise stopSessionAndMic awaits after sending report_stop.
-  // DELETE /sessions/{id} force-closes and clears the session's client list
-  // server-side — if it ran before summarize() (a real network call, even on
-  // failure) finished, report.done would broadcast to nobody. This is what
-  // makes ending a session wait for the report instead of racing it away.
-  const resolvePendingReportRef = useRef<(() => void) | null>(null);
 
-  // `useProjects()` returns a fresh object literal every render, so
-  // `detachAsrSession` changes identity on every render too. Effects below
-  // need to call it without re-running on every render because of that —
-  // hold it in a ref refreshed each render instead of depending on `projects`.
-  const detachAsrSessionRef = useRef(projects.detachAsrSession);
-  detachAsrSessionRef.current = projects.detachAsrSession;
+  // ── Gemini capture result → captions ─────────────────────────────────────
+  const handleCaptureResult = useCallback((result: CaptionResult) => {
+    dispatchCaption({
+      kind: 'add',
+      seq: result.seq,
+      sourceText: result.sourceText,
+      targetText: result.targetText,
+      sourceLang: result.sourceLang,
+      targetLang: result.targetLang,
+      latencyMs: result.latencyMs
+    });
+  }, []);
 
-  // ── Operator token: initial fetch + periodic refresh ────────────────────
+  // Last 1-2 captions, handed to each new chunk as coherence context so a
+  // chunk boundary landing mid-sentence doesn't translate in a vacuum.
+  const contextText = useMemo(
+    () =>
+      allCaptions
+        .slice(-2)
+        .map((c) => `${c.sourceText} => ${c.targetText}`)
+        .join(' / '),
+    [allCaptions]
+  );
+
+  const capture = useGeminiCapture({
+    active: micActive,
+    paused,
+    sourceLang,
+    targetLang,
+    glossary,
+    context: contextText,
+    onResult: handleCaptureResult
+  });
+
+  // ── "Ping" — round-trip time of our own server's /api/health, not a
+  //    control-socket heartbeat (there is no persistent socket anymore) ─────
   useEffect(() => {
-    tokenSource.get().then(setToken).catch((err: Error) => setTokenError(err.message));
-  }, [tokenSource]);
-
-  useEffect(() => {
-    const timer = setInterval(() => {
-      tokenSource.get().then(setToken).catch((err: Error) => setTokenError(err.message));
-    }, OPERATOR_TOKEN_POLL_MS);
-    return () => clearInterval(timer);
-    // `tokenSource` is `useMemo(() => createOperatorTokenSource(), [])`, so it
-    // is stable for the component's life — unlike `projects` or a re-parsed
-    // `session` object, both of which have previously defeated a long timer
-    // in this file by forcing it to tear down and rebuild before it fired.
-  }, [tokenSource]);
-
-  // ── Adopt or offer to create a session ───────────────────────────────────
-  useEffect(() => {
-    if (!token || bootstrapped.current) return;
-    bootstrapped.current = true;
-    listSessions(BACKEND_URL, token)
-      .then((live) => {
-        const choice = chooseSession(live);
-        if (choice.action === 'adopt') setSession(live.find((s) => s.id === choice.id) ?? null);
-        else if (choice.action === 'ask') setCandidates(choice.sessions);
-      })
-      .catch((err: Error) => setTokenError(err.message));
-  }, [token]);
-
-  // ── Health polling over HTTP, never over the rate-limited WebSocket ──────
-  useEffect(() => {
-    if (!token || !session) return;
-    // `clearInterval` in this effect's cleanup only stops FUTURE polls from
-    // being scheduled — it cannot cancel a request already in flight. Since
-    // each poll can now take up to REQUEST_TIMEOUT_MS (10s) to fail against
-    // a slow/dying backend, and polls fire every HEALTH_POLL_MS (5s), 2-3
-    // requests can be genuinely in flight at once. Without this guard, a
-    // stale poll issued before the operator ended the session (or before
-    // useAsrSocket's giveUp fired) can resolve with a stale 200 AFTER
-    // setSession(null) already ran, silently resurrecting a session that
-    // was just torn down. `cancelled` is flipped in this effect's own
-    // cleanup, so any response arriving after the effect has been torn
-    // down (session changed, unmount, token change) is discarded instead
-    // of applied.
+    if (!sessionId || !micActive) {
+      setPingMs(null);
+      return;
+    }
     let cancelled = false;
     const timer = setInterval(async () => {
-      let fresh: SessionSnapshot | null | undefined;
+      const startedAt = Date.now();
       try {
-        fresh = await getSession(BACKEND_URL, token, session.id);
-      } catch (err) {
-        if (cancelled) return;
-        // A 401/500/network blip is not the same as a 404 — the session may
-        // still be alive. Surface it instead of silently going dark; do not
-        // touch session/mic state here, so a transient failure doesn't tear
-        // down a healthy session — the control socket's own retry-budget
-        // (useAsrSocket's `giveUp`) is what eventually does that if the
-        // backend is really gone, not this poll.
-        //
-        // `fetch()` itself rejects with a TypeError when the request never
-        // reached a server at all (connection refused, DNS failure, offline)
-        // — as opposed to `getSession`'s own thrown Errors, which already
-        // carry a specific "Could not read session (HTTP …)" message. The
-        // raw TypeError's message is the browser's own wording ("Failed to
-        // fetch" in Chrome, "NetworkError…" in Firefox) — not something an
-        // operator at a live event can act on.
-        setTokenError(
-          err instanceof TypeError
-            ? 'ติดต่อเซิร์ฟเวอร์ ASR ไม่ได้ (network error) — กำลังลองใหม่'
-            : (err as Error).message
-        );
-        return;
+        const res = await fetch('/api/health', { signal: AbortSignal.timeout(4000) });
+        if (!res.ok) throw new Error('unhealthy');
+        if (!cancelled) setPingMs(Date.now() - startedAt);
+      } catch {
+        if (!cancelled) setPingMs(null);
       }
-      if (cancelled) return;
-      if (fresh === null) {
-        // The backend forgot this session — a restart. Do not retry the id.
-        setSession(null);
-        setMicActive(false);
-        setSourceToken(null);
-        detachAsrSessionRef.current();
-      } else if (fresh) {
-        setSession(fresh);
-      }
-    }, HEALTH_POLL_MS);
+    }, PING_INTERVAL_MS);
     return () => {
       cancelled = true;
       clearInterval(timer);
     };
-    // `session` is a freshly-parsed object on every poll (never
-    // reference-equal to the last one, even when unchanged), so depending on
-    // it here would tear down and rebuild this very interval every cycle.
-  }, [token, session?.id]);
-
-  // ── Control socket ───────────────────────────────────────────────────────
-  const onFrame = useCallback((frame: AnyFrame) => {
-    dispatchCaption({ kind: 'frame', frame });
-    if (frame.type === 'glossary.state') {
-      setGlossary((frame.data as { sections: GlossarySections }).sections);
-    } else if (frame.type === 'session.welcome') {
-      setGlossary((frame.data as { glossary: { sections: GlossarySections } }).glossary.sections);
-    } else if (frame.type === 'report.done') {
-      const payload = frame.data as ReportDonePayload;
-      setReport(payload);
-      // `saveSessionSummary` is `useCallback(..., [])` inside useProjects, so
-      // it is reference-stable across renders — unlike `detachAsrSession`, it
-      // does not need a ref to stay fresh in this `useCallback([])` closure.
-      projects.saveSessionSummary(frame.session, payload.summary, payload.items.length);
-      resolvePendingReportRef.current?.();
-    } else if (frame.type === 'report.state') {
-      // The backend acks report_stop with report.state BEFORE it attempts
-      // the (network-bound) summary. When there was nothing gathered, no
-      // report.done will ever follow — stop waiting immediately instead of
-      // sitting out the full timeout for no reason.
-      const d = frame.data as { active: boolean; count: number };
-      if (!d.active && d.count === 0) resolvePendingReportRef.current?.();
-    } else if (frame.type === 'control.pong' && frame.id) {
-      const sentAt = pendingPings.current.get(frame.id);
-      if (sentAt !== undefined) {
-        setPingMs(Date.now() - sentAt);
-        pendingPings.current.delete(frame.id);
-      }
-    }
-  }, []);
-
-  const socket = useAsrSocket({ backendUrl: BACKEND_URL, sessionId: session?.id ?? null, token, onFrame });
-
-  useEffect(() => {
-    // `sessionGone` (4404, the backend explicitly forgetting a session) and
-    // `giveUp` (retryable closes like 1006 exhausted their retry budget —
-    // what a killed or crashed backend actually produces) get the same
-    // response: the console cannot tell, from a client, whether the exact
-    // problem is "no such session" or "no such server," and there is no
-    // meaningfully different thing to do about either. Continuing to show
-    // "live" while both are dead is strictly worse than resetting to the
-    // start-a-session screen.
-    if (!socket.sessionGone && !socket.giveUp) return;
-    setSession(null);
-    setMicActive(false);
-    setSourceToken(null);
-    detachAsrSessionRef.current();
-  }, [socket.sessionGone, socket.giveUp]);
-
-  // ── Recording is automatic: start the section report the moment the
-  //    control socket for this session is open, stop it when the session
-  //    ends (in stopSessionAndMic below) — there is no manual record button.
-  useEffect(() => {
-    if (!session || socket.status !== 'open' || !socket.welcome) return;
-    if (reportStartedForSessionRef.current === session.id) return;
-    reportStartedForSessionRef.current = session.id;
-    // Only start if nobody already has. The backend resets the collected
-    // items to empty on EVERY control.report_start, even one already
-    // active — so a second tab adopting an already-live session (the
-    // normal, intended way for a colleague to also open the console) must
-    // never resend it: that would silently discard everything the first
-    // tab has gathered so far. `welcome.report` is the live projection of
-    // report.state broadcasts, so this reflects current server truth, not
-    // just what this tab remembers from its own mount. Confirmed live: a
-    // third tab joining reset an already-recording session to 0 items,
-    // and the operator ending it saw "จบ Session" resolve almost
-    // instantly — nothing to wait for, because there was nothing left.
-    if (!socket.welcome.report.active) {
-      socket.send(cmd.reportStart(session.id));
-    }
-  }, [session?.id, socket.status, socket.welcome]);
-
-  // ── Live socket latency, mirroring the old ping-check/pong-check heartbeat ──
-  useEffect(() => {
-    if (socket.status !== 'open' || !session) {
-      pendingPings.current.clear();
-      return;
-    }
-    const timer = setInterval(() => {
-      if (pendingPings.current.size >= MAX_PENDING_PINGS) {
-        // Nothing has answered in a while — the connection is not healthy.
-        // Stop guessing rather than grow this map forever.
-        pendingPings.current.clear();
-        setPingMs(null);
-      }
-      const built = cmd.ping(session.id);
-      pendingPings.current.set(built.id, Date.now());
-      socket.send(built);
-    }, PING_INTERVAL_MS);
-    return () => clearInterval(timer);
-  }, [socket.status, session?.id]);
-
-  // ── Audio capture ────────────────────────────────────────────────────────
-  const capture = useAudioCapture({
-    backendUrl: BACKEND_URL,
-    sessionId: session?.id ?? null,
-    sourceToken,
-    active: micActive
-  });
-
-  useEffect(() => {
-    if (!micActive || !token || !session) return;
-    const timer = setInterval(() => {
-      mintSourceToken(BACKEND_URL, session.id, token).then(setSourceToken).catch((err: Error) => setTokenError(err.message));
-    }, SOURCE_TOKEN_REFRESH_MS);
-    return () => clearInterval(timer);
-  }, [micActive, token, session?.id]);
+  }, [sessionId, micActive]);
 
   // ── Session + mic as one combined "Session" toggle, matching the original
-  //    single Start/Stop button (the backend's create/adopt/end machinery
-  //    sits behind it rather than being exposed as separate controls) ──────
-  const [starting, setStarting] = useState(false);
+  //    single Start/Stop button ─────────────────────────────────────────────
   const [endingSession, setEndingSession] = useState(false);
 
-  const adoptCandidate = async (id: string) => {
-    if (!token) return;
-    try {
-      const found = await getSession(BACKEND_URL, token, id);
-      setSession(found);
-      setCandidates([]);
-      if (found) projects.attachAsrSession(found.id, found.source_lang, found.target_lang);
-    } catch (err) {
-      setTokenError((err as Error).message);
-    }
+  const startSessionAndMic = () => {
+    if (micActive) return;
+    const id = `local_${Date.now()}`;
+    setSessionId(id);
+    dispatchCaption({ kind: 'reset' });
+    setHiddenSeqs(new Set());
+    setReport(null);
+    projects.attachAsrSession(id, sourceLang, targetLang);
+    setMicActive(true);
   };
 
-  const startSessionAndMic = async () => {
-    if (!token || starting) return;
-    setStarting(true);
-    try {
-      let live = session;
-      if (!live) {
-        // Unconditionally creating here — without first checking whether a
-        // session already exists — is what let two browser tabs opened a
-        // few seconds apart each create and record into their OWN separate
-        // session: neither tab's local `session` state had any way to know
-        // about the other's, since the mount-time bootstrap effect only
-        // runs once and does nothing when it finds zero sessions (correct
-        // — a page load must not auto-create). Confirmed live: two tabs,
-        // two different session ids in the backend log, both accepting
-        // audio, and the second audio writer was never rejected with 4408
-        // because the two writers were never attached to the same session
-        // to begin with. Re-listing right before deciding is what makes
-        // this button behave the same as the bootstrap: adopt a lone
-        // session, ask when there's more than one, and only create when
-        // there's genuinely none. It narrows the race to "two tabs pressed
-        // the button in the same instant," which chooseSession's own
-        // multi-session picker already exists to handle after the fact.
-        const listed = await listSessions(BACKEND_URL, token);
-        const choice = chooseSession(listed);
-        if (choice.action === 'ask') {
-          setCandidates(choice.sessions);
-          return;
-        }
-        if (choice.action === 'adopt') {
-          live = listed.find((s) => s.id === choice.id) ?? null;
-        } else {
-          live = await createSession(BACKEND_URL, token);
-        }
-        if (!live) return;
-        setSession(live);
-        setCandidates([]);
-        dispatchCaption({ kind: 'reset' });
-        setHiddenSeqs(new Set());
-        setReport(null);
-        projects.attachAsrSession(live.id, live.source_lang, live.target_lang);
-      }
-      const src = await mintSourceToken(BACKEND_URL, live.id, token);
-      setSourceToken(src);
-      setMicActive(true);
-    } catch (err) {
-      setTokenError((err as Error).message);
-    } finally {
-      setStarting(false);
-    }
-  };
-
-  // Ending the session also ends the ASR session on the backend: a project is
-  // durable, the Python session is not, and leaving one running would keep
-  // billing a recognizer for an event that is over.
+  // Ending the session flushes whatever audio is still buffered (so the
+  // last few words of a sentence aren't lost), then asks Gemini for a
+  // summary of the whole transcript before letting go of the session id.
   const stopSessionAndMic = async () => {
+    await capture.flush();
     setMicActive(false);
-    if (token && session) {
-      // Stop the automatic section report and WAIT for its outcome before
-      // deleting the session. Deleting force-closes the socket and clears
-      // the session's client list server-side, so a report.done that
-      // arrives even a moment later broadcasts to nobody — this is what
-      // actually produced "no report" rather than any backend defect.
-      //
-      // Gated on `welcome.report.active` (current server truth), not on
-      // whether THIS tab is the one that happened to send report_start:
-      // any tab adopting a shared session can be the one that presses
-      // "จบ Session," and it must still stop and wait for the report
-      // regardless of which tab originally started it.
-      if (socket.welcome?.report.active && socket.status === 'open') {
-        socket.send(cmd.reportStop(session.id));
-        reportStartedForSessionRef.current = null;
-        setEndingSession(true);
-        await new Promise<void>((resolve) => {
-          let settled = false;
-          const done = () => {
-            if (settled) return;
-            settled = true;
-            resolvePendingReportRef.current = null;
-            resolve();
-          };
-          resolvePendingReportRef.current = done;
-          setTimeout(done, REPORT_WAIT_TIMEOUT_MS);
+    if (sessionId) {
+      setEndingSession(true);
+      const items = allCaptions.map((c) => ({ source_text: c.sourceText, target_text: c.targetText }));
+      try {
+        const res = await fetch('/api/gemini/summarize', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items }),
+          signal: AbortSignal.timeout(REPORT_WAIT_TIMEOUT_MS)
         });
-        setEndingSession(false);
+        const data = (await res.json()) as { summary?: string; items?: number };
+        const summary = data.summary ?? '';
+        const itemCount = data.items ?? items.length;
+        setReport({ summary, items: itemCount });
+        projects.saveSessionSummary(sessionId, summary, itemCount);
+      } catch {
+        // Same fallback contract as the old backend: an AI failure never
+        // loses the transcript, it just ships without a summary.
+        setReport({ summary: '', items: items.length });
+        projects.saveSessionSummary(sessionId, '', items.length);
       }
-      await deleteSession(BACKEND_URL, token, session.id).catch(() => undefined);
+      setEndingSession(false);
     }
-    setSession(null);
-    setSourceToken(null);
+    setSessionId(null);
+    setPaused(false);
     projects.detachAsrSession();
   };
 
-  const isSessionActive = !!session && micActive;
+  const isSessionActive = !!sessionId && micActive;
 
   const handleRequestFinishProject = async () => {
     await stopSessionAndMic();
@@ -491,13 +246,26 @@ export default function Admin() {
 
   // ── Language swap ────────────────────────────────────────────────────────
   const setLanguage = (source: 'th' | 'en') => {
-    if (!session) return;
-    socket.send(cmd.setLanguages(session.id, source, other(source)));
+    setSourceLangState(source);
+    setTargetLangState(other(source) as 'th' | 'en');
   };
 
-  const handleSwapLanguages = () => {
-    if (!socket.welcome || !session) return;
-    socket.send(cmd.setLanguages(session.id, socket.welcome.target_lang, socket.welcome.source_lang));
+  const handleSwapLanguages = () => setLanguage(targetLang);
+
+  // ── Glossary ──────────────────────────────────────────────────────────────
+  const persistGlossary = (next: GlossarySections) => {
+    setGlossary(next);
+    saveGlossary(next);
+  };
+
+  const handleGlossaryAdd = (section: GlossarySection, term: string, equivalent: string) => {
+    persistGlossary({ ...glossary, [section]: { ...glossary[section], [term]: equivalent } });
+  };
+
+  const handleGlossaryRemove = (section: GlossarySection, term: string) => {
+    const next = { ...glossary[section] };
+    delete next[term];
+    persistGlossary({ ...glossary, [section]: next });
   };
 
   // ── Caption item actions ─────────────────────────────────────────────────
@@ -546,7 +314,7 @@ export default function Admin() {
     let content = '';
 
     if (type === 'txt') {
-      content = `=== Live Translation Transcript (${dateStr}) ===\n${socket.welcome?.source_lang ?? '-'} -> ${socket.welcome?.target_lang ?? '-'}\n\n`;
+      content = `=== Live Translation Transcript (${dateStr}) ===\n${sourceLang} -> ${targetLang}\n\n`;
       content += captions
         .map(
           (c, i) =>
@@ -573,20 +341,14 @@ export default function Admin() {
     URL.revokeObjectURL(url);
   };
 
-  const disabled = socket.status !== 'open';
-  const welcome = socket.welcome;
-  const sourceLang = welcome?.source_lang ?? 'th';
-  const targetLang = welcome?.target_lang ?? 'en';
-  const isListening = capture.status === 'sending';
+  const isListening = capture.status === 'listening';
   const micPermissionError = capture.status === 'error';
 
   // The live subtitle box always shows ONE caption at a time — the latest —
   // like a YouTube subtitle, so an operator can crop just this box in OBS
-  // for streaming. Source text tracks the in-progress interim while the
-  // target lags behind it until its own translation arrives, matching the
-  // two-stage delivery the wire protocol uses.
+  // for streaming.
   const latestCaption = captions.length > 0 ? captions[captions.length - 1] : null;
-  const boxSourceText = captionState.interim?.sourceText || latestCaption?.sourceText || '';
+  const boxSourceText = latestCaption?.sourceText || '';
   const boxTargetText = latestCaption?.targetText ?? '';
   const isEditingBox = editingSeq !== null && editingSeq === latestCaption?.seq;
 
@@ -634,7 +396,7 @@ export default function Admin() {
             </div>
             <div className="flex flex-col">
               <span className="font-bold text-sm text-slate-900 tracking-tight leading-none">AI Live Translator</span>
-              <span className="text-[11px] text-slate-400 font-medium leading-tight mt-0.5">Google Chirp 3 + Google Translate</span>
+              <span className="text-[11px] text-slate-400 font-medium leading-tight mt-0.5">Powered by Google Gemini</span>
             </div>
           </div>
 
@@ -672,7 +434,7 @@ export default function Admin() {
                   <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
                 </span>
                 <span className="tracking-wider text-[11px] font-bold uppercase whitespace-nowrap">
-                  {welcome?.paused ? 'พักการถอดความ' : 'กำลังแปลสด'}
+                  {paused ? 'พักการถอดความ' : 'กำลังแปลสด'}
                 </span>
               </>
             ) : (
@@ -693,34 +455,26 @@ export default function Admin() {
             <span className="font-semibold text-slate-800">{pingMs !== null ? `${pingMs}ms` : '--'}</span>
           </div>
 
-          {session && (
+          {sessionId && (
             <button
-              onClick={() => socket.send(cmd.setPaused(session.id, !welcome?.paused))}
-              disabled={disabled}
-              title={welcome?.paused ? 'เล่นต่อ' : 'พักการถอดความ'}
-              className="p-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600 disabled:opacity-40"
+              onClick={() => setPaused((p) => !p)}
+              title={paused ? 'เล่นต่อ' : 'พักการถอดความ'}
+              className="p-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600"
             >
-              {welcome?.paused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
+              {paused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
             </button>
           )}
 
           <button
             onClick={isSessionActive ? stopSessionAndMic : startSessionAndMic}
-            // Deliberately NOT disabled just because `candidates` is
-            // populated: startSessionAndMic re-lists and re-decides fresh on
-            // every press, so a stale picker (sessions that ended elsewhere
-            // since it was shown) cannot wedge this button — pressing it
-            // again re-evaluates current backend truth. A permanent disable
-            // here once left an operator with no way to recover except
-            // reloading the page.
-            disabled={starting || endingSession}
+            disabled={capture.status === 'starting' || endingSession}
             className={`px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2 transition-all shadow-xs whitespace-nowrap disabled:opacity-50 ${
               isSessionActive ? 'bg-rose-600 hover:bg-rose-700 text-white animate-pulse' : 'bg-[#DE5C8E] hover:bg-[#c94577] text-white'
             }`}
           >
             {isSessionActive ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
             <span>
-              {starting
+              {capture.status === 'starting'
                 ? 'กำลังเริ่ม…'
                 : endingSession
                 ? 'กำลังสรุปผลการประชุม…'
@@ -750,48 +504,10 @@ export default function Admin() {
         </button>
       </div>
 
-      {tokenError && (
-        <div className="px-4 py-2 bg-rose-50 border-b border-rose-200 text-rose-800 text-xs flex items-center gap-2 shrink-0">
-          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-          <span>{tokenError}</span>
-        </div>
-      )}
-      {socket.error && (
+      {capture.lastChunkError && (
         <div className="px-4 py-2 bg-amber-50 border-b border-amber-200 text-amber-800 text-xs flex items-center gap-2 shrink-0">
           <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-          <span>{socket.error}</span>
-        </div>
-      )}
-
-      {/* Several ASR sessions are already running on the backend — this is
-          new capability that plain socket.io never had, since the old server
-          held exactly one global session. Adopting "the first" would attach
-          this console to another venue's live event. */}
-      {!session && candidates.length > 1 && (
-        <div className="px-4 py-3 bg-white border-b border-slate-200 shrink-0 space-y-2">
-          <p className="text-xs font-semibold text-slate-700">มีหลายเซสชันกำลังทำงานอยู่บนเซิร์ฟเวอร์ เลือกเซสชันที่ต้องการควบคุม:</p>
-          <div className="flex flex-wrap gap-2">
-            {candidates.map((c) => (
-              <button
-                key={c.id}
-                onClick={() => adoptCandidate(c.id)}
-                className="px-3 py-1.5 bg-slate-100 hover:bg-pink-50 hover:text-[#DE5C8E] border border-slate-200 rounded-lg text-xs font-mono"
-              >
-                {c.id} — {c.source_lang}→{c.target_lang} · {c.clients} จอ
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {session && (session.recognizer_alive === false || (capture.backpressure && isSessionActive)) && (
-        <div className="px-4 py-2 bg-amber-50 border-b border-amber-200 text-amber-800 text-xs flex items-center gap-2 shrink-0">
-          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-          <span>
-            {session.recognizer_alive === false
-              ? 'ตัวถอดเสียงของเซสชันนี้ขัดข้อง — ลองจบและเริ่ม Session ใหม่'
-              : `เซิร์ฟเวอร์รับเสียงไม่ทัน กำลังตัดเฟรมทิ้ง (${capture.droppedFrames} เฟรม)`}
-          </span>
+          <span>{capture.lastChunkError}</span>
         </div>
       )}
 
@@ -834,8 +550,7 @@ export default function Admin() {
                     <button
                       type="button"
                       onClick={handleSwapLanguages}
-                      disabled={disabled || !welcome?.asr_switchable}
-                      className="text-[11px] px-2.5 py-1 bg-white hover:bg-pink-50 text-[#DE5C8E] border border-pink-200 rounded-lg font-bold flex items-center gap-1 shadow-2xs transition-all disabled:opacity-40"
+                      className="text-[11px] px-2.5 py-1 bg-white hover:bg-pink-50 text-[#DE5C8E] border border-pink-200 rounded-lg font-bold flex items-center gap-1 shadow-2xs transition-all"
                       title="สลับภาษาผู้พูดและภาษาแปล"
                     >
                       <ArrowLeftRight className="w-3.5 h-3.5" />
@@ -848,8 +563,7 @@ export default function Admin() {
                     <select
                       value={sourceLang}
                       onChange={(e) => setLanguage(e.target.value as 'th' | 'en')}
-                      disabled={disabled || isListening}
-                      className="w-full p-2.5 text-xs bg-white border border-slate-200 rounded-lg outline-none focus:border-[#DE5C8E] disabled:opacity-60 font-semibold text-slate-800"
+                      className="w-full p-2.5 text-xs bg-white border border-slate-200 rounded-lg outline-none focus:border-[#DE5C8E] font-semibold text-slate-800"
                     >
                       <option value="th">{LANGS.th}</option>
                       <option value="en">{LANGS.en}</option>
@@ -861,16 +575,12 @@ export default function Admin() {
                     <select
                       value={targetLang}
                       onChange={(e) => setLanguage(other(e.target.value) as 'th' | 'en')}
-                      disabled={disabled}
-                      className="w-full p-2.5 text-xs bg-white border border-slate-200 rounded-lg outline-none focus:border-[#DE5C8E] disabled:opacity-60 font-semibold text-[#DE5C8E]"
+                      className="w-full p-2.5 text-xs bg-white border border-slate-200 rounded-lg outline-none focus:border-[#DE5C8E] font-semibold text-[#DE5C8E]"
                     >
                       <option value="en">แปลเป็นอังกฤษ (English)</option>
                       <option value="th">แปลเป็นไทย (Thai)</option>
                     </select>
                   </div>
-                  {welcome?.asr_switchable && (
-                    <p className="text-[11px] text-slate-500">การสลับภาษาต้นทางจะรีสตาร์ทการฟังเสียงราว 1 วินาที</p>
-                  )}
                 </div>
 
                 <div>
@@ -907,18 +617,11 @@ export default function Admin() {
                     <span>แสดงความเร็วการตอบสนอง (Latency ms)</span>
                   </label>
                 </div>
-
               </div>
             )}
 
             {activeTab === 'dictionary' && (
-              <DictionaryManager
-                sections={glossary}
-                disabled={disabled}
-                onAdd={(section: GlossarySection, abbr, full) => session && socket.send(cmd.glossaryAdd(session.id, section, abbr, full))}
-                onRemove={(section: GlossarySection, abbr) => session && socket.send(cmd.glossaryRemove(session.id, section, abbr))}
-                onReload={() => session && socket.send(cmd.glossaryReload(session.id))}
-              />
+              <DictionaryManager sections={glossary} disabled={false} onAdd={handleGlossaryAdd} onRemove={handleGlossaryRemove} />
             )}
           </div>
 
@@ -945,12 +648,11 @@ export default function Admin() {
               <Radio className={`w-4 h-4 ${isListening ? 'text-emerald-500 animate-pulse' : 'text-slate-400'}`} />
               <div className="flex items-center gap-1.5 bg-slate-100 px-2.5 py-1 rounded-lg border border-slate-200">
                 <span className="font-bold text-slate-800">
-                  {LANGS[sourceLang as 'th' | 'en'] ?? sourceLang} ➔ {LANGS[targetLang as 'th' | 'en'] ?? targetLang}
+                  {LANGS[sourceLang]} ➔ {LANGS[targetLang]}
                 </span>
                 <button
                   onClick={handleSwapLanguages}
-                  disabled={disabled || !welcome?.asr_switchable}
-                  className="p-1 hover:bg-white rounded-md text-slate-500 hover:text-[#DE5C8E] transition-all disabled:opacity-40"
+                  className="p-1 hover:bg-white rounded-md text-slate-500 hover:text-[#DE5C8E] transition-all"
                   title="สลับภาษาผู้พูดและภาษาแปล"
                 >
                   <ArrowLeftRight className="w-3.5 h-3.5" />
@@ -1019,23 +721,14 @@ export default function Admin() {
                   <span className="font-bold text-emerald-800 shrink-0">กำลังฟัง:</span>
                 </div>
                 <div className="flex-1 truncate font-mono text-xs text-emerald-800 font-medium">
-                  {captionState.interim?.sourceText ? (
-                    <span className="bg-emerald-100/80 px-2 py-0.5 rounded text-emerald-900 font-semibold animate-pulse">
-                      &ldquo;{captionState.interim.sourceText}&rdquo;
-                    </span>
-                  ) : (
-                    <span className="text-emerald-600/80 italic">กำลังรอเสียงพูด... (พูดใส่ไมโครโฟนได้ทันที)</span>
-                  )}
+                  <span className="text-emerald-600/80 italic">กำลังรอเสียงพูด... (พูดใส่ไมโครโฟนได้ทันที)</span>
                 </div>
               </div>
             </div>
           )}
 
           {/* ─────────────────────────────────────────────────────────────
-              LIVE SUBTITLE — one box, one caption at a time. This is the
-              region an operator will window-crop in OBS to stream the
-              live translation, so it stays uncluttered by history/edit
-              chrome (that lives in the collapsible panel below instead).
+              LIVE SUBTITLE — one box, one caption at a time.
           ────────────────────────────────────────────────────────────── */}
           <div className="flex-1 flex flex-col items-center justify-center p-4 sm:p-8 min-h-0">
             <div className="relative w-full max-w-4xl bg-white rounded-2xl border border-slate-200 shadow-sm px-6 py-10 sm:px-12 sm:py-14 text-center">
@@ -1058,7 +751,7 @@ export default function Admin() {
                 </div>
               )}
 
-              {!latestCaption && !boxSourceText ? (
+              {!latestCaption ? (
                 <div className="flex flex-col items-center gap-3 text-slate-400">
                   <div className="w-14 h-14 rounded-2xl bg-slate-50 border border-slate-200 flex items-center justify-center text-[#DE5C8E]">
                     <Mic className="w-7 h-7" />
@@ -1132,113 +825,113 @@ export default function Admin() {
               {showAllHistory && (
                 <div ref={transcriptScrollRef} className="max-h-64 overflow-y-auto p-3.5 space-y-3 border-t border-slate-100">
                   {captions.map((item, index) => {
-                // Editing the latest caption happens in the box above, not
-                // duplicated here.
-                const isEditing = editingSeq === item.seq && item.seq !== latestCaption?.seq;
-                const isLatest = index === captions.length - 1;
-                return (
-                  <div
-                    key={item.seq}
-                    className={`p-4 rounded-xl border transition-all shadow-xs ${
-                      isEditing
-                        ? 'bg-amber-50/90 border-amber-300 ring-2 ring-amber-200'
-                        : isLatest
-                        ? 'bg-white border-[#DE5C8E]/40 ring-1 ring-[#DE5C8E]/20'
-                        : 'bg-white border-slate-200 hover:border-slate-300'
-                    }`}
-                  >
-                    {isEditing ? (
-                      <div className="space-y-2.5">
-                        {/* Original text is server-authored and not editable —
-                            protocol v1 has no command to amend it. */}
-                        <div>
-                          <label className="text-xs font-bold text-slate-600 block mb-1">ประโยคต้นฉบับ (แก้ไขไม่ได้):</label>
-                          <p className="w-full p-2.5 text-xs bg-slate-100 border border-slate-200 rounded-lg text-slate-500">
-                            {item.sourceText}
-                          </p>
-                        </div>
-                        <div>
-                          <label className="text-xs font-bold text-slate-600 block mb-1">คำแปล:</label>
-                          <input
-                            type="text"
-                            autoFocus
-                            value={editDraft}
-                            onChange={(e) => setEditDraft(e.target.value)}
-                            onKeyDown={(e) => e.key === 'Enter' && saveEdit()}
-                            className="w-full p-2.5 text-xs bg-white border border-slate-300 rounded-lg font-bold text-slate-900 outline-none focus:border-[#DE5C8E]"
-                          />
-                        </div>
-                        <div className="flex items-center justify-end gap-2 pt-1">
-                          <button
-                            type="button"
-                            onClick={() => setEditingSeq(null)}
-                            className="px-3.5 py-1.5 text-xs text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium transition-all"
-                          >
-                            ยกเลิก
-                          </button>
-                          <button
-                            type="button"
-                            onClick={saveEdit}
-                            className="px-3.5 py-1.5 text-xs text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg font-semibold flex items-center gap-1.5 shadow-xs transition-all"
-                          >
-                            <Check className="w-3.5 h-3.5" />
-                            <span>บันทึก</span>
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="space-y-1.5">
-                        <div className="flex items-center justify-between text-xs text-slate-400">
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono text-[11px] text-slate-400">{new Date(item.ts * 1000).toLocaleTimeString()}</span>
-                            {config.showLatency && item.latencyMs ? (
-                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 font-mono text-[10px] text-slate-600 border border-slate-200">
-                                <Zap className="w-3 h-3 text-amber-500" />
-                                <span>{item.latencyMs}ms</span>
-                              </span>
-                            ) : null}
-                            {item.isEdited && (
-                              <span className="text-[10px] text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded-md font-medium border border-amber-200">
-                                แก้ไขแล้ว
-                              </span>
+                    // Editing the latest caption happens in the box above, not
+                    // duplicated here.
+                    const isEditing = editingSeq === item.seq && item.seq !== latestCaption?.seq;
+                    const isLatest = index === captions.length - 1;
+                    return (
+                      <div
+                        key={item.seq}
+                        className={`p-4 rounded-xl border transition-all shadow-xs ${
+                          isEditing
+                            ? 'bg-amber-50/90 border-amber-300 ring-2 ring-amber-200'
+                            : isLatest
+                            ? 'bg-white border-[#DE5C8E]/40 ring-1 ring-[#DE5C8E]/20'
+                            : 'bg-white border-slate-200 hover:border-slate-300'
+                        }`}
+                      >
+                        {isEditing ? (
+                          <div className="space-y-2.5">
+                            {/* Original text has no re-transcription command in
+                                this pipeline — it's corrected by re-speaking, not typed. */}
+                            <div>
+                              <label className="text-xs font-bold text-slate-600 block mb-1">ประโยคต้นฉบับ (แก้ไขไม่ได้):</label>
+                              <p className="w-full p-2.5 text-xs bg-slate-100 border border-slate-200 rounded-lg text-slate-500">
+                                {item.sourceText}
+                              </p>
+                            </div>
+                            <div>
+                              <label className="text-xs font-bold text-slate-600 block mb-1">คำแปล:</label>
+                              <input
+                                type="text"
+                                autoFocus
+                                value={editDraft}
+                                onChange={(e) => setEditDraft(e.target.value)}
+                                onKeyDown={(e) => e.key === 'Enter' && saveEdit()}
+                                className="w-full p-2.5 text-xs bg-white border border-slate-300 rounded-lg font-bold text-slate-900 outline-none focus:border-[#DE5C8E]"
+                              />
+                            </div>
+                            <div className="flex items-center justify-end gap-2 pt-1">
+                              <button
+                                type="button"
+                                onClick={() => setEditingSeq(null)}
+                                className="px-3.5 py-1.5 text-xs text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium transition-all"
+                              >
+                                ยกเลิก
+                              </button>
+                              <button
+                                type="button"
+                                onClick={saveEdit}
+                                className="px-3.5 py-1.5 text-xs text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg font-semibold flex items-center gap-1.5 shadow-xs transition-all"
+                              >
+                                <Check className="w-3.5 h-3.5" />
+                                <span>บันทึก</span>
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="space-y-1.5">
+                            <div className="flex items-center justify-between text-xs text-slate-400">
+                              <div className="flex items-center gap-2">
+                                <span className="font-mono text-[11px] text-slate-400">{new Date(item.ts * 1000).toLocaleTimeString()}</span>
+                                {config.showLatency && item.latencyMs ? (
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 font-mono text-[10px] text-slate-600 border border-slate-200">
+                                    <Zap className="w-3 h-3 text-amber-500" />
+                                    <span>{item.latencyMs}ms</span>
+                                  </span>
+                                ) : null}
+                                {item.isEdited && (
+                                  <span className="text-[10px] text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded-md font-medium border border-amber-200">
+                                    แก้ไขแล้ว
+                                  </span>
+                                )}
+                              </div>
+                              <div className="flex items-center gap-1">
+                                <button
+                                  onClick={() => handleCopyItem(item)}
+                                  className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
+                                  title="คัดลอกข้อความ"
+                                >
+                                  {copiedSeq === item.seq ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                                </button>
+                                <button
+                                  onClick={() => startEditing(item)}
+                                  className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
+                                  title="แก้ไขคำแปล"
+                                >
+                                  <Edit2 className="w-3.5 h-3.5" />
+                                </button>
+                                <button
+                                  onClick={() => hideItem(item.seq)}
+                                  className="p-1.5 text-slate-400 hover:text-rose-600 rounded-md hover:bg-rose-50 transition-all"
+                                  title="ซ่อนรายการนี้ (ไม่ลบจากเซิร์ฟเวอร์)"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </div>
+
+                            {config.showOriginal && item.sourceText && (
+                              <div className="text-xs text-slate-500 font-medium leading-relaxed">{item.sourceText}</div>
                             )}
-                          </div>
-                          <div className="flex items-center gap-1">
-                            <button
-                              onClick={() => handleCopyItem(item)}
-                              className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
-                              title="คัดลอกข้อความ"
-                            >
-                              {copiedSeq === item.seq ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                            </button>
-                            <button
-                              onClick={() => startEditing(item)}
-                              className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
-                              title="แก้ไขคำแปล"
-                            >
-                              <Edit2 className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              onClick={() => hideItem(item.seq)}
-                              className="p-1.5 text-slate-400 hover:text-rose-600 rounded-md hover:bg-rose-50 transition-all"
-                              title="ซ่อนรายการนี้ (ไม่ลบจากเซิร์ฟเวอร์)"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        </div>
 
-                        {config.showOriginal && item.sourceText && (
-                          <div className="text-xs text-slate-500 font-medium leading-relaxed">{item.sourceText}</div>
+                            <div className={`${textSizeClass(config.fontSize)} font-bold text-slate-900 leading-snug tracking-tight`}>
+                              {item.targetText || <span className="text-slate-400 font-normal">กำลังแปล…</span>}
+                            </div>
+                          </div>
                         )}
-
-                        <div className={`${textSizeClass(config.fontSize)} font-bold text-slate-900 leading-snug tracking-tight`}>
-                          {item.targetText || <span className="text-slate-400 font-normal">กำลังแปล…</span>}
-                        </div>
                       </div>
-                    )}
-                  </div>
-                );
+                    );
                   })}
                 </div>
               )}
@@ -1254,14 +947,12 @@ export default function Admin() {
               {report.summary ? (
                 <p className="text-xs text-slate-600 whitespace-pre-wrap leading-relaxed">{report.summary}</p>
               ) : (
-                // The backend still sends report.done with an empty summary
-                // when the Gemini/Vertex call fails (quota, disabled API,
-                // network) — it ships the raw transcript regardless rather
-                // than losing the session's record entirely. Say so plainly
-                // instead of leaving a blank panel that looks broken.
+                // The transcript is preserved even when the summarize call
+                // itself fails (quota, network) — say so plainly instead of
+                // leaving a blank panel that looks broken.
                 <p className="text-xs text-amber-700 flex items-center gap-1.5">
                   <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                  <span>สรุปด้วย AI ไม่สำเร็จ (ตรวจสอบสิทธิ์ Vertex AI ฝั่งเซิร์ฟเวอร์) — บันทึกไว้ {report.items.length} ข้อความ ดูได้ที่ &quot;ประวัติทั้งหมด&quot; ด้านบน</span>
+                  <span>สรุปด้วย AI ไม่สำเร็จ — บันทึกไว้ {report.items} ข้อความ ดูได้ที่ &quot;ประวัติทั้งหมด&quot; ด้านบน</span>
                 </p>
               )}
             </div>
