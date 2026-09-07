@@ -353,7 +353,34 @@ export default function Admin() {
     try {
       let live = session;
       if (!live) {
-        live = await createSession(BACKEND_URL, token);
+        // Unconditionally creating here — without first checking whether a
+        // session already exists — is what let two browser tabs opened a
+        // few seconds apart each create and record into their OWN separate
+        // session: neither tab's local `session` state had any way to know
+        // about the other's, since the mount-time bootstrap effect only
+        // runs once and does nothing when it finds zero sessions (correct
+        // — a page load must not auto-create). Confirmed live: two tabs,
+        // two different session ids in the backend log, both accepting
+        // audio, and the second audio writer was never rejected with 4408
+        // because the two writers were never attached to the same session
+        // to begin with. Re-listing right before deciding is what makes
+        // this button behave the same as the bootstrap: adopt a lone
+        // session, ask when there's more than one, and only create when
+        // there's genuinely none. It narrows the race to "two tabs pressed
+        // the button in the same instant," which chooseSession's own
+        // multi-session picker already exists to handle after the fact.
+        const listed = await listSessions(BACKEND_URL, token);
+        const choice = chooseSession(listed);
+        if (choice.action === 'ask') {
+          setCandidates(choice.sessions);
+          return;
+        }
+        if (choice.action === 'adopt') {
+          live = listed.find((s) => s.id === choice.id) ?? null;
+        } else {
+          live = await createSession(BACKEND_URL, token);
+        }
+        if (!live) return;
         setSession(live);
         setCandidates([]);
         dispatchCaption({ kind: 'reset' });
