@@ -16,15 +16,15 @@ import {
   Radio,
   Menu,
   ShieldAlert,
-  Cpu,
   FileText,
   ArrowLeftRight,
-  Timer,
   Pause,
   Play,
   ClipboardList,
   RefreshCw,
-  AlertTriangle
+  AlertTriangle,
+  ChevronDown,
+  ChevronUp
 } from 'lucide-react';
 // ProjectPanel.tsx has NO default export — it exports four named components.
 import { BillModal, HistoryPanel, ProjectHeaderBar, ProjectPicker } from '../components/ProjectPanel';
@@ -86,6 +86,22 @@ function textSizeClass(size: DisplayConfig['fontSize']): string {
   }
 }
 
+// The live subtitle box is the thing an operator will OBS-crop for
+// streaming, so it reads a size tier larger than the history list.
+function boxTextSizeClass(size: DisplayConfig['fontSize']): string {
+  switch (size) {
+    case 'small':
+      return 'text-2xl sm:text-3xl';
+    case 'medium':
+      return 'text-3xl sm:text-4xl';
+    case 'xlarge':
+      return 'text-5xl sm:text-6xl';
+    case 'large':
+    default:
+      return 'text-4xl sm:text-5xl';
+  }
+}
+
 export default function Admin() {
   const projects = useProjects();
   const tokenSource = useMemo(() => createOperatorTokenSource(), []);
@@ -100,10 +116,11 @@ export default function Admin() {
   const [report, setReport] = useState<ReportDonePayload | null>(null);
   const [pingMs, setPingMs] = useState<number | null>(null);
 
-  const [config, setConfig] = useState<DisplayConfig>({ fontSize: 'large', showOriginal: true, showLatency: true });
+  const [config, setConfig] = useState<DisplayConfig>({ fontSize: 'large', showOriginal: false, showLatency: false });
   const [activeTab, setActiveTab] = useState<'languages' | 'dictionary'>('languages');
   const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showAllHistory, setShowAllHistory] = useState(false);
   const [finishedProject, setFinishedProject] = useState<Project | null>(null);
 
   // Captions have no delete command in protocol v1 (they are server-authored
@@ -122,6 +139,11 @@ export default function Admin() {
   const bootstrapped = useRef(false);
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
   const pendingPings = useRef<Map<string, number>>(new Map());
+  // Which session's section report we have already sent control.report_start
+  // for — a session is recorded automatically for its whole life, so there
+  // is no manual "start recording" button; this ref just stops the effect
+  // below from re-sending the command on every render.
+  const reportStartedForSessionRef = useRef<string | null>(null);
 
   // `useProjects()` returns a fresh object literal every render, so
   // `detachAsrSession` changes identity on every render too. Effects below
@@ -218,6 +240,16 @@ export default function Admin() {
     detachAsrSessionRef.current();
   }, [socket.sessionGone]);
 
+  // ── Recording is automatic: start the section report the moment the
+  //    control socket for this session is open, stop it when the session
+  //    ends (in stopSessionAndMic below) — there is no manual record button.
+  useEffect(() => {
+    if (!session || socket.status !== 'open') return;
+    if (reportStartedForSessionRef.current === session.id) return;
+    reportStartedForSessionRef.current = session.id;
+    socket.send(cmd.reportStart(session.id));
+  }, [session?.id, socket.status]);
+
   // ── Live socket latency, mirroring the old ping-check/pong-check heartbeat ──
   useEffect(() => {
     if (socket.status !== 'open' || !session) {
@@ -278,6 +310,7 @@ export default function Admin() {
         setCandidates([]);
         dispatchCaption({ kind: 'reset' });
         setHiddenSeqs(new Set());
+        setReport(null);
         projects.attachAsrSession(live.id, live.source_lang, live.target_lang);
       }
       const src = await mintSourceToken(BACKEND_URL, live.id, token);
@@ -296,6 +329,12 @@ export default function Admin() {
   const stopSessionAndMic = async () => {
     setMicActive(false);
     if (token && session) {
+      // Stop the automatic section report before the socket disconnects, so
+      // report.done (the summary) has a chance to arrive.
+      if (reportStartedForSessionRef.current === session.id && socket.status === 'open') {
+        socket.send(cmd.reportStop(session.id));
+      }
+      reportStartedForSessionRef.current = null;
       await deleteSession(BACKEND_URL, token, session.id).catch(() => undefined);
     }
     setSession(null);
@@ -327,27 +366,6 @@ export default function Admin() {
   const handleSwapLanguages = () => {
     if (!socket.welcome || !session) return;
     socket.send(cmd.setLanguages(session.id, socket.welcome.target_lang, socket.welcome.source_lang));
-  };
-
-  // ── Chunking / gate presets — same three named speeds as before, now
-  //    expressed as the backend's (min_words, min_interval_ms) pair ───────
-  const GATE_PRESETS: Array<{ value: string; minWords: number; minIntervalMs: number; label: string }> = [
-    { value: 'fast', minWords: 2, minIntervalMs: 250, label: '⚡ เร็วมาก (Fast)' },
-    { value: 'balanced', minWords: 3, minIntervalMs: 400, label: '⚖️ มาตรฐาน (Balanced)' },
-    { value: 'relaxed', minWords: 5, minIntervalMs: 700, label: '🧘 ผ่อนคลาย (Relaxed)' }
-  ];
-  const currentGatePreset = useMemo(() => {
-    const gate = socket.welcome?.gate;
-    if (!gate) return 'balanced';
-    const match = GATE_PRESETS.find((p) => p.minWords === gate.min_words && p.minIntervalMs === gate.min_interval_ms);
-    return match?.value ?? 'balanced';
-  }, [socket.welcome?.gate]);
-
-  const handleGateChange = (value: string) => {
-    if (!session) return;
-    const preset = GATE_PRESETS.find((p) => p.value === value);
-    if (!preset) return;
-    socket.send(cmd.setGate(session.id, preset.minWords, preset.minIntervalMs));
   };
 
   // ── Caption item actions ─────────────────────────────────────────────────
@@ -429,6 +447,16 @@ export default function Admin() {
   const targetLang = welcome?.target_lang ?? 'en';
   const isListening = capture.status === 'sending';
   const micPermissionError = capture.status === 'error';
+
+  // The live subtitle box always shows ONE caption at a time — the latest —
+  // like a YouTube subtitle, so an operator can crop just this box in OBS
+  // for streaming. Source text tracks the in-progress interim while the
+  // target lags behind it until its own translation arrives, matching the
+  // two-stage delivery the wire protocol uses.
+  const latestCaption = captions.length > 0 ? captions[captions.length - 1] : null;
+  const boxSourceText = captionState.interim?.sourceText || latestCaption?.sourceText || '';
+  const boxTargetText = latestCaption?.targetText ?? '';
+  const isEditingBox = editingSeq !== null && editingSeq === latestCaption?.seq;
 
   // ── No project selected: the picker is the whole screen, as it always was ──
   if (!projects.currentProject) {
@@ -634,21 +662,6 @@ export default function Admin() {
           <div className="flex-1 p-4 overflow-y-auto space-y-4">
             {activeTab === 'languages' && (
               <div className="space-y-4">
-                <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
-                      <Cpu className="w-4 h-4 text-[#DE5C8E]" />
-                      <span>ระบบแปลงเสียงพูด (Speech ASR)</span>
-                    </span>
-                    <span className="text-[10px] bg-emerald-50 text-emerald-800 font-semibold px-2 py-0.5 rounded-md border border-emerald-200">
-                      Chirp 3 Engine
-                    </span>
-                  </div>
-                  <p className="text-xs text-slate-500 leading-relaxed">
-                    เอนจิน Google Cloud Speech &amp; Chirp แปลงเสียงสดเป็นข้อความอัตโนมัติ ควบคุมโดยเซิร์ฟเวอร์ ASR โดยตรง
-                  </p>
-                </div>
-
                 <div className="space-y-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold text-slate-800">คู่ภาษาแปลสด (Thai ↔ English)</span>
@@ -695,35 +708,6 @@ export default function Admin() {
                 </div>
 
                 <div>
-                  <div className="flex items-center justify-between mb-1.5">
-                    <label className="block text-xs font-bold text-slate-700">ความไวการตัดช่วงแปลสด (Live Chunking)</label>
-                    {welcome && (
-                      <span className="text-[10px] text-[#DE5C8E] font-semibold flex items-center gap-1">
-                        <Timer className="w-3 h-3" />
-                        <span>
-                          {welcome.gate.min_words} คำ / {welcome.gate.min_interval_ms}ms
-                        </span>
-                      </span>
-                    )}
-                  </div>
-                  <select
-                    value={currentGatePreset}
-                    onChange={(e) => handleGateChange(e.target.value)}
-                    disabled={disabled}
-                    className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium disabled:opacity-60"
-                  >
-                    {GATE_PRESETS.map((p) => (
-                      <option key={p.value} value={p.value}>
-                        {p.label}
-                      </option>
-                    ))}
-                  </select>
-                  <p className="mt-1 text-[11px] text-slate-500 leading-normal">
-                    กำหนดจังหวะที่ระบบจะส่งคำแปลระหว่างที่ผู้พูดยังพูดไม่จบประโยค
-                  </p>
-                </div>
-
-                <div>
                   <label className="block text-xs font-bold text-slate-700 mb-1.5">ขนาดตัวอักษรข้อความแปล (Font Size)</label>
                   <select
                     value={config.fontSize}
@@ -758,20 +742,6 @@ export default function Admin() {
                   </label>
                 </div>
 
-                {session && (
-                  <div className="pt-3 border-t border-slate-200">
-                    <button
-                      onClick={() => socket.send(welcome?.report.active ? cmd.reportStop(session.id) : cmd.reportStart(session.id))}
-                      disabled={disabled}
-                      className="w-full py-2 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 flex items-center justify-center gap-1.5 disabled:opacity-40"
-                    >
-                      <ClipboardList className="w-3.5 h-3.5 text-[#DE5C8E]" />
-                      <span>
-                        {welcome?.report.active ? `หยุดบันทึกช่วง (${welcome.report.count} รายการ)` : 'เริ่มบันทึกช่วงเพื่อสรุป'}
-                      </span>
-                    </button>
-                  </div>
-                )}
               </div>
             )}
 
@@ -892,31 +862,113 @@ export default function Admin() {
                   )}
                 </div>
               </div>
-              {welcome && (
-                <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 bg-white text-[11px] font-semibold text-emerald-800 border border-emerald-300 rounded-md shadow-2xs shrink-0">
-                  <Timer className="w-3 h-3 text-emerald-600" />
-                  <span>ตัดวรรค ~{welcome.gate.min_interval_ms}ms</span>
-                </span>
-              )}
             </div>
           )}
 
-          <div ref={transcriptScrollRef} className="flex-1 p-3.5 sm:p-6 overflow-y-auto space-y-3.5">
-            {captions.length === 0 ? (
-              <div className="h-full flex flex-col items-center justify-center text-center p-6 text-slate-400 space-y-3">
-                <div className="w-14 h-14 rounded-2xl bg-white border border-slate-200 shadow-xs flex items-center justify-center text-[#DE5C8E]">
-                  <Mic className="w-7 h-7" />
+          {/* ─────────────────────────────────────────────────────────────
+              LIVE SUBTITLE — one box, one caption at a time. This is the
+              region an operator will window-crop in OBS to stream the
+              live translation, so it stays uncluttered by history/edit
+              chrome (that lives in the collapsible panel below instead).
+          ────────────────────────────────────────────────────────────── */}
+          <div className="flex-1 flex flex-col items-center justify-center p-4 sm:p-8 min-h-0">
+            <div className="relative w-full max-w-4xl bg-white rounded-2xl border border-slate-200 shadow-sm px-6 py-10 sm:px-12 sm:py-14 text-center">
+              {latestCaption && !isEditingBox && (
+                <div className="absolute top-3 right-3 flex items-center gap-1">
+                  <button
+                    onClick={() => handleCopyItem(latestCaption)}
+                    className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
+                    title="คัดลอกข้อความ"
+                  >
+                    {copiedSeq === latestCaption.seq ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                  </button>
+                  <button
+                    onClick={() => startEditing(latestCaption)}
+                    className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
+                    title="แก้ไขคำแปล"
+                  >
+                    <Edit2 className="w-3.5 h-3.5" />
+                  </button>
                 </div>
-                <div className="space-y-1 max-w-sm">
-                  <div className="font-bold text-slate-700 text-sm">พร้อมรับเสียงจากไมโครโฟน</div>
-                  <p className="text-xs text-slate-400 leading-relaxed">
-                    กดปุ่ม <strong>&quot;เริ่ม Session&quot;</strong> ด้านบน จากนั้นพูดใส่ไมโครโฟนเพื่อทำการแปลภาษาแบบเรียลไทม์
+              )}
+
+              {!latestCaption && !boxSourceText ? (
+                <div className="flex flex-col items-center gap-3 text-slate-400">
+                  <div className="w-14 h-14 rounded-2xl bg-slate-50 border border-slate-200 flex items-center justify-center text-[#DE5C8E]">
+                    <Mic className="w-7 h-7" />
+                  </div>
+                  <div className="max-w-sm">
+                    <div className="font-bold text-slate-700 text-sm">พร้อมรับเสียงจากไมโครโฟน</div>
+                    <p className="text-xs text-slate-400 leading-relaxed mt-1">
+                      กดปุ่ม <strong>&quot;เริ่ม Session&quot;</strong> ด้านบน จากนั้นพูดใส่ไมโครโฟนเพื่อทำการแปลภาษาแบบเรียลไทม์
+                    </p>
+                  </div>
+                </div>
+              ) : isEditingBox ? (
+                <div className="space-y-3 text-left max-w-2xl mx-auto">
+                  <label className="text-xs font-bold text-slate-600 block">คำแปล:</label>
+                  <input
+                    type="text"
+                    autoFocus
+                    value={editDraft}
+                    onChange={(e) => setEditDraft(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && saveEdit()}
+                    className="w-full p-3 text-lg font-bold text-slate-900 text-center border border-slate-300 rounded-lg outline-none focus:border-[#DE5C8E]"
+                  />
+                  <div className="flex items-center justify-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setEditingSeq(null)}
+                      className="px-3.5 py-1.5 text-xs text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium transition-all"
+                    >
+                      ยกเลิก
+                    </button>
+                    <button
+                      type="button"
+                      onClick={saveEdit}
+                      className="px-3.5 py-1.5 text-xs text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg font-semibold flex items-center gap-1.5 shadow-xs transition-all"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      <span>บันทึก</span>
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {config.showOriginal && boxSourceText && <p className="text-slate-400 text-base sm:text-lg mb-3">{boxSourceText}</p>}
+                  <p className={`${boxTextSizeClass(config.fontSize)} font-bold text-slate-900 leading-snug tracking-tight`}>
+                    {boxTargetText || <span className="text-slate-300 font-normal text-2xl sm:text-3xl">กำลังแปล…</span>}
                   </p>
-                </div>
-              </div>
-            ) : (
-              captions.map((item, index) => {
-                const isEditing = editingSeq === item.seq;
+                  {config.showLatency && latestCaption?.latencyMs ? (
+                    <span className="mt-3 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 font-mono text-[10px] text-slate-500 border border-slate-200">
+                      <Zap className="w-3 h-3 text-amber-500" />
+                      <span>{latestCaption.latencyMs}ms</span>
+                    </span>
+                  ) : null}
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* ─────────────────────────────────────────────────────────────
+              HISTORY — collapsed by default so the subtitle box above stays
+              the primary view; full edit/hide/copy tooling lives here.
+          ────────────────────────────────────────────────────────────── */}
+          {captions.length > 0 && (
+            <div className="border-t border-slate-200 bg-white shrink-0">
+              <button
+                onClick={() => setShowAllHistory((v) => !v)}
+                className="w-full flex items-center justify-between px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+              >
+                <span>ประวัติทั้งหมด ({captions.length} รายการ)</span>
+                {showAllHistory ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+              </button>
+              {showAllHistory && (
+                <div ref={transcriptScrollRef} className="max-h-64 overflow-y-auto p-3.5 space-y-3 border-t border-slate-100">
+                  {captions.map((item, index) => {
+                // Editing the latest caption happens in the box above, not
+                // duplicated here.
+                const isEditing = editingSeq === item.seq && item.seq !== latestCaption?.seq;
                 const isLatest = index === captions.length - 1;
                 return (
                   <div
@@ -1021,9 +1073,11 @@ export default function Admin() {
                     )}
                   </div>
                 );
-              })
-            )}
-          </div>
+                  })}
+                </div>
+              )}
+            </div>
+          )}
 
           {report && (
             <div className="p-3.5 bg-white border-t border-slate-200 shrink-0 space-y-1.5 max-h-40 overflow-y-auto">
