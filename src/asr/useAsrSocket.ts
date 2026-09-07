@@ -64,6 +64,21 @@ export function useAsrSocket(opts: {
   useEffect(() => {
     if (!sessionId || !token) return;
 
+    // This effect re-runs once per NEW session (sessionId/token change) as
+    // well as on cleanup/remount, but `connect()` below is ALSO called on
+    // every in-session reconnect attempt via the retry `setTimeout`. Reset
+    // the exposed state here, at the effect's own top level, so it fires
+    // exactly once per new session — never on a same-session reconnect,
+    // which must NOT wipe `welcome` (a caption feed re-showing "loading"
+    // every couple of seconds during a blip would be its own regression).
+    //
+    // Without this, `giveUp` is a sticky `s.giveUp || exhausted` that can
+    // only ever go true -> true across sessions (the give-up cleanup then
+    // fires once per page load, not once per dead backend), and `welcome`
+    // survives from the old session, leaving stale `report.active` state
+    // that silently defeats the auto-report-start effect in Admin.tsx.
+    setState({ status: 'connecting', welcome: null, error: null, sessionGone: false, giveUp: false });
+
     let disposed = false;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
     let consecutiveFailures = 0;

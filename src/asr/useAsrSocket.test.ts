@@ -408,4 +408,47 @@ describe('useAsrSocket', () => {
     expect(result.current.sessionGone).toBe(true);
     expect(result.current.giveUp).toBe(false);
   });
+
+  it('resets giveUp and welcome for a new session after the previous one gave up', async () => {
+    vi.useFakeTimers();
+    try {
+      const { result, rerender } = renderHook(
+        (props: { sessionId: string }) => useAsrSocket({ ...base, sessionId: props.sessionId, onFrame: () => {} }),
+        { initialProps: { sessionId: 'sess_ab12' } }
+      );
+
+      // Seed `welcome` on the first session so we can prove it gets wiped.
+      act(() => {
+        FakeWebSocket.instances[0].open();
+        FakeWebSocket.instances[0].receive(golden('session_welcome'));
+      });
+      expect(result.current.welcome).not.toBeNull();
+
+      // Drive the first session all the way to giveUp via the same
+      // 1006-exhaustion pattern used above.
+      for (let attempt = 1; attempt <= MAX_RECONNECT_ATTEMPTS; attempt++) {
+        act(() => {
+          FakeWebSocket.instances[attempt - 1].serverClose(1006);
+        });
+        if (attempt < MAX_RECONNECT_ATTEMPTS) {
+          await act(async () => {
+            await vi.advanceTimersByTimeAsync(RECONNECT_DELAY_MS);
+          });
+        }
+      }
+      expect(result.current.giveUp).toBe(true);
+
+      // A brand new session (e.g. the operator restarted the backend and
+      // started session B) must start with a clean slate — a sticky
+      // `s.giveUp || exhausted` would otherwise leave giveUp permanently
+      // true, and a never-cleared `welcome` would leave session B looking
+      // like it inherited session A's stale report.active state.
+      rerender({ sessionId: 'sess_new99' });
+
+      expect(result.current.giveUp).toBe(false);
+      expect(result.current.welcome).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
