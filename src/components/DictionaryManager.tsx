@@ -10,8 +10,7 @@ import {
   FileSpreadsheet,
   AlertCircle
 } from 'lucide-react';
-import type { GlossarySections } from '../asr/protocol';
-import type { GlossarySection } from '../asr/commands';
+import type { GlossarySection, GlossarySections } from '../glossary';
 
 // The backend's glossary is ONE file shared by every live session — there is
 // no per-project scoping. These three sections are exactly what the wire
@@ -27,11 +26,10 @@ export interface DictionaryManagerProps {
   sections: GlossarySections | null;
   onAdd: (section: GlossarySection, abbr: string, full: string) => void;
   onRemove: (section: GlossarySection, abbr: string) => void;
-  onReload: () => void;
   disabled: boolean;
 }
 
-export default function DictionaryManager({ sections, onAdd, onRemove, onReload, disabled }: DictionaryManagerProps) {
+export default function DictionaryManager({ sections, onAdd, onRemove, disabled }: DictionaryManagerProps) {
   const [activeSection, setActiveSection] = useState<GlossarySection>('protected_terms');
   const [searchQuery, setSearchQuery] = useState('');
   const [newTerm, setNewTerm] = useState('');
@@ -95,12 +93,11 @@ export default function DictionaryManager({ sections, onAdd, onRemove, onReload,
 
   return (
     <div className="space-y-3.5">
-      {/* The glossary is process-wide on the backend: one file shared by
-          every live session. A console that implied otherwise would let one
-          operator silently change another venue's event. */}
+      {/* The glossary is stored locally in this browser and shared by every
+          session started from it — there is no server file anymore. */}
       <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-800 text-xs leading-relaxed">
         <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-        <span>พจนานุกรมนี้ใช้ร่วมกันทุกเซสชันบนเซิร์ฟเวอร์ การแก้ไขจะมีผลกับทุกงานที่กำลังถ่ายทอดสดอยู่ในขณะนี้</span>
+        <span>พจนานุกรมนี้บันทึกไว้ในเบราว์เซอร์นี้ และใช้ร่วมกันทุก session ที่เริ่มจากเบราว์เซอร์นี้</span>
       </div>
 
       {/* Section tabs */}
@@ -199,15 +196,6 @@ export default function DictionaryManager({ sections, onAdd, onRemove, onReload,
           <Plus className="w-4 h-4" />
         </button>
       </div>
-
-      <button
-        type="button"
-        onClick={onReload}
-        disabled={disabled}
-        className="w-full py-1.5 text-[11px] text-slate-500 hover:text-slate-800 font-medium disabled:opacity-40"
-      >
-        โหลดพจนานุกรมใหม่จากไฟล์บนเซิร์ฟเวอร์
-      </button>
 
       {/* Paste-from-Excel modal */}
       {showPasteModal && (
