@@ -3,7 +3,11 @@ import type { GlossarySections } from '../src/glossary';
 // Injectable so tests never touch the real network or the @google/genai
 // module — server.ts wires the real SDK to this shape (see Task 7).
 export interface GenerateContentClient {
-  generateContent(args: { model: string; contents: unknown; config?: unknown }): Promise<{ text: string }>;
+  // The real @google/genai SDK types GenerateContentResponse.text as
+  // `string | undefined` (e.g. a safety-blocked or otherwise empty
+  // response) — match that here instead of letting non-strict TypeScript
+  // paper over the possibility of `undefined` at the call sites below.
+  generateContent(args: { model: string; contents: unknown; config?: unknown }): Promise<{ text: string | undefined }>;
 }
 
 export interface TranscribeChunkInput {
@@ -95,6 +99,9 @@ export async function transcribeChunk(
     }
   });
 
+  if (!response.text) {
+    throw new Error('Gemini returned an empty transcription response (possibly safety-blocked)');
+  }
   let parsed: { source_text?: string; target_text?: string };
   try {
     parsed = JSON.parse(response.text);
@@ -123,5 +130,8 @@ export async function summarizeTranscript(
     model,
     contents: [{ role: 'user', parts: [{ text: prompt }] }]
   });
+  if (!response.text) {
+    throw new Error('Gemini returned an empty summary response (possibly safety-blocked)');
+  }
   return response.text.trim();
 }
