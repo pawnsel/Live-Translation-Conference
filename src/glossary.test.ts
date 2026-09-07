@@ -47,4 +47,32 @@ describe('loadGlossary', () => {
     localStorage.setItem(GLOSSARY_STORAGE_KEY, '{not json');
     expect(loadGlossary()).toEqual(emptyGlossary());
   });
+
+  it('falls back to an empty section when a section deserializes to a non-object shape', () => {
+    localStorage.setItem(
+      GLOSSARY_STORAGE_KEY,
+      JSON.stringify({
+        protected_terms: 'not an object',
+        person_names: ['also', 'not', 'an', 'object'],
+        thai_corrections: { ok: 'fine' }
+      })
+    );
+    expect(loadGlossary()).toEqual({
+      protected_terms: {},
+      person_names: {},
+      thai_corrections: { ok: 'fine' }
+    });
+  });
+
+  it('falls back to an empty section when a section has non-string values', () => {
+    localStorage.setItem(
+      GLOSSARY_STORAGE_KEY,
+      JSON.stringify({
+        protected_terms: { term: 123 },
+        person_names: {},
+        thai_corrections: {}
+      })
+    );
+    expect(loadGlossary()).toEqual(emptyGlossary());
+  });
 });
