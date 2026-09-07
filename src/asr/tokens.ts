@@ -67,9 +67,15 @@ export async function mintSourceToken(
   if (response.status === 404) {
     throw new Error(`Session ${sessionId} no longer exists — create a new one`);
   }
-  const body = (await response.json().catch(() => ({}))) as { token?: string; error?: string };
+  // This endpoint is served by the Python/FastAPI backend (server/main.py's
+  // capture_link handler), NOT this app's own Node server — FastAPI's
+  // HTTPException always serialises its failure message as `{"detail": ...}`,
+  // never `{"error": ...}` (that shape belongs to createOperatorTokenSource's
+  // `load()` above, which really does call this app's Node server). Confirmed
+  // against server/main.py: `raise HTTPException(status_code=404, detail=...)`.
+  const body = (await response.json().catch(() => ({}))) as { token?: string; detail?: string };
   if (!response.ok || !body.token) {
-    throw new Error(body.error || `Could not mint a capture token (HTTP ${response.status})`);
+    throw new Error(body.detail || `Could not mint a capture token (HTTP ${response.status})`);
   }
   return body.token;
 }

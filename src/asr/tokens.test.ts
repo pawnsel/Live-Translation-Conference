@@ -84,8 +84,12 @@ describe('mintSourceToken', () => {
     await expect(mintSourceToken('http://localhost:8765', 'sess_x', 'op-1', impl)).rejects.toThrow(/Could not mint a capture token.*HTTP 500/);
   });
 
-  it('prefers the broker error message over the generic HTTP-status message', async () => {
-    const { impl } = jsonFetch([{ ok: false, status: 503, body: { error: 'ASR recognizer pool exhausted' } }]);
+  it('prefers the backend detail message over the generic HTTP-status message', async () => {
+    // The capture-link endpoint is served by the FastAPI backend, which
+    // serialises HTTPException failures as {"detail": ...} — never
+    // {"error": ...} (that shape is specific to this app's own Node broker,
+    // exercised by createOperatorTokenSource above).
+    const { impl } = jsonFetch([{ ok: false, status: 503, body: { detail: 'ASR recognizer pool exhausted' } }]);
 
     await expect(mintSourceToken('http://localhost:8765', 'sess_x', 'op-1', impl)).rejects.toThrow(/ASR recognizer pool exhausted/);
   });
