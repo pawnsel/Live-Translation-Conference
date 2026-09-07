@@ -3,7 +3,9 @@ import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import { createServer } from "http";
-import { createTokenBroker } from "./server/asrTokenBroker";
+import { GoogleGenAI } from "@google/genai";
+import { registerGeminiRoutes } from "./server/geminiRoutes";
+import type { GenerateContentClient } from "./server/gemini";
 
 async function startServer() {
   const app = express();
@@ -11,29 +13,31 @@ async function startServer() {
 
   const httpServer = createServer(app);
 
-  app.use(express.json());
+  // Transcript items for a long session add up; the default 100kb JSON body
+  // limit is too small for /api/gemini/summarize's full-transcript payload.
+  app.use(express.json({ limit: "5mb" }));
 
-  const asrBroker = createTokenBroker({
-    backendUrl: process.env.ASR_BACKEND_URL || "http://localhost:8765",
-    password: process.env.ASR_OPERATOR_PASSWORD || "",
-  });
-
-  // The ONE thing this server still protects: the shared operator password.
-  // The browser gets a token and talks to Python directly for everything
-  // else, because control commands travel over the WebSocket and need a real
-  // operator token regardless — proxying the HTTP half would guard nothing.
-  app.post("/api/asr/token", async (_req, res) => {
-    if (!process.env.ASR_OPERATOR_PASSWORD) {
-      res.status(503).json({ error: "ASR_OPERATOR_PASSWORD is not configured on the server" });
-      return;
-    }
-    try {
-      const token = await asrBroker.getToken();
-      res.json(token);
-    } catch (err: any) {
-      res.status(503).json({ error: err?.message || "Could not obtain an ASR token" });
-    }
-  });
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (apiKey) {
+    const genAI = new GoogleGenAI({ apiKey });
+    const client: GenerateContentClient = {
+      generateContent: (args) =>
+        genAI.models.generateContent(args as Parameters<typeof genAI.models.generateContent>[0]),
+    };
+    registerGeminiRoutes(app, {
+      client,
+      model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+      summaryModel: process.env.GEMINI_SUMMARY_MODEL || process.env.GEMINI_MODEL || "gemini-2.5-flash",
+    });
+  } else {
+    // No key configured — fail loudly and specifically rather than letting
+    // the client's fetch hit a generic 404 with no explanation.
+    const unconfigured = (_req: express.Request, res: express.Response) => {
+      res.status(503).json({ error: "GEMINI_API_KEY is not configured on the server" });
+    };
+    app.post("/api/gemini/transcribe", unconfigured);
+    app.post("/api/gemini/summarize", unconfigured);
+  }
 
   // API endpoints
   app.get("/api/health", (req, res) => {
