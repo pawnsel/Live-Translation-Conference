@@ -17,9 +17,22 @@ export interface AsrSocketState {
   welcome: WelcomePayload | null;
   error: string | null;
   sessionGone: boolean;
+  /** True once consecutive retryable-close reconnects have been exhausted
+   *  without a single successful open. A 4404 (the backend explicitly
+   *  forgetting a session) is not the only way a session becomes
+   *  unreachable — a hard kill or a crash closes the socket with 1006
+   *  ("abnormal closure", no close frame at all), which this hook's own
+   *  fallback treats as retryable. Retrying THAT forever, at a fixed
+   *  interval, with the operator never told it stopped working, is the
+   *  exact failure this flag exists to end. */
+  giveUp: boolean;
 }
 
 const RECONNECT_DELAY_MS = 2000;
+// After this many consecutive failed reconnects with no successful open in
+// between, stop retrying automatically and surface `giveUp` instead —
+// roughly 10s of silence is long enough to know this isn't a blip.
+const MAX_RECONNECT_ATTEMPTS = 5;
 
 function toWsUrl(backendUrl: string, path: string): string {
   const url = new URL(backendUrl);
@@ -41,6 +54,7 @@ export function useAsrSocket(opts: {
     welcome: null,
     error: null,
     sessionGone: false,
+    giveUp: false,
   });
 
   const socketRef = useRef<WebSocket | null>(null);
@@ -52,6 +66,7 @@ export function useAsrSocket(opts: {
 
     let disposed = false;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let consecutiveFailures = 0;
 
     const connect = () => {
       if (disposed) return;
@@ -64,6 +79,9 @@ export function useAsrSocket(opts: {
 
       socket.onopen = () => {
         if (disposed) return;
+        // A real open proves the backend is reachable again — a retry budget
+        // from a past, unrelated outage must not count against a fresh one.
+        consecutiveFailures = 0;
         setState((s) => ({ ...s, status: 'open', error: null }));
       };
 
@@ -123,15 +141,23 @@ export function useAsrSocket(opts: {
       socket.onclose = (event) => {
         if (disposed) return;
         const described = describeCloseCode(event.code);
+        // A 4404 session id can only fail again. Retrying it would spin
+        // forever against a backend that restarted. A retryable close (e.g.
+        // 1006, "abnormal closure" — what a killed or crashed process
+        // produces, since there is no time to send a proper close frame) is
+        // different: it MIGHT be a blip, so it earns retries — but only up
+        // to a budget. Retrying forever at a fixed interval with nothing
+        // ever telling the operator it stopped working is the same class of
+        // failure as mishandling 4404, just reached through 1006 instead.
+        const exhausted = described.retryable && ++consecutiveFailures >= MAX_RECONNECT_ATTEMPTS;
         setState((s) => ({
           ...s,
           status: 'closed',
           sessionGone: described.sessionGone,
-          error: event.code === 1000 ? s.error : described.message,
+          giveUp: s.giveUp || exhausted,
+          error: event.code === 1000 ? s.error : exhausted ? 'ติดต่อเซิร์ฟเวอร์ ASR ไม่ได้หลายครั้งติดต่อกัน — เซิร์ฟเวอร์อาจไม่ทำงาน กรุณาตรวจสอบแล้วเริ่ม Session ใหม่' : described.message,
         }));
-        // A 4404 session id can only fail again. Retrying it would spin
-        // forever against a backend that restarted.
-        if (described.retryable) {
+        if (described.retryable && !exhausted) {
           retryTimer = setTimeout(connect, RECONNECT_DELAY_MS);
         }
       };

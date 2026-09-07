@@ -203,9 +203,23 @@ export default function Admin() {
       } catch (err) {
         // A 401/500/network blip is not the same as a 404 — the session may
         // still be alive. Surface it instead of silently going dark; do not
-        // touch session/mic state, so a transient failure doesn't tear down
-        // a healthy session.
-        setTokenError((err as Error).message);
+        // touch session/mic state here, so a transient failure doesn't tear
+        // down a healthy session — the control socket's own retry-budget
+        // (useAsrSocket's `giveUp`) is what eventually does that if the
+        // backend is really gone, not this poll.
+        //
+        // `fetch()` itself rejects with a TypeError when the request never
+        // reached a server at all (connection refused, DNS failure, offline)
+        // — as opposed to `getSession`'s own thrown Errors, which already
+        // carry a specific "Could not read session (HTTP …)" message. The
+        // raw TypeError's message is the browser's own wording ("Failed to
+        // fetch" in Chrome, "NetworkError…" in Firefox) — not something an
+        // operator at a live event can act on.
+        setTokenError(
+          err instanceof TypeError
+            ? 'ติดต่อเซิร์ฟเวอร์ ASR ไม่ได้ (network error) — กำลังลองใหม่'
+            : (err as Error).message
+        );
         return;
       }
       if (fresh === null) {
@@ -258,12 +272,20 @@ export default function Admin() {
   const socket = useAsrSocket({ backendUrl: BACKEND_URL, sessionId: session?.id ?? null, token, onFrame });
 
   useEffect(() => {
-    if (!socket.sessionGone) return;
+    // `sessionGone` (4404, the backend explicitly forgetting a session) and
+    // `giveUp` (retryable closes like 1006 exhausted their retry budget —
+    // what a killed or crashed backend actually produces) get the same
+    // response: the console cannot tell, from a client, whether the exact
+    // problem is "no such session" or "no such server," and there is no
+    // meaningfully different thing to do about either. Continuing to show
+    // "live" while both are dead is strictly worse than resetting to the
+    // start-a-session screen.
+    if (!socket.sessionGone && !socket.giveUp) return;
     setSession(null);
     setMicActive(false);
     setSourceToken(null);
     detachAsrSessionRef.current();
-  }, [socket.sessionGone]);
+  }, [socket.sessionGone, socket.giveUp]);
 
   // ── Recording is automatic: start the section report the moment the
   //    control socket for this session is open, stop it when the session

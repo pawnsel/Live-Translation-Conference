@@ -322,4 +322,90 @@ describe('useAsrSocket', () => {
       vi.useRealTimers();
     }
   });
+
+  // Must match the implementation's MAX_RECONNECT_ATTEMPTS (src/asr/useAsrSocket.ts).
+  const MAX_RECONNECT_ATTEMPTS = 5;
+
+  it('stops retrying and sets giveUp after the retry budget is exhausted on a killed backend (1006)', async () => {
+    vi.useFakeTimers();
+    try {
+      const { result } = renderHook(() => useAsrSocket({ ...base, onFrame: () => {} }));
+      expect(FakeWebSocket.instances).toHaveLength(1);
+
+      // A killed (not gracefully closed) process produces 1006 — an
+      // "abnormal closure" the server never sends deliberately. It is not
+      // in closeCodes.ts's table, so it falls to the retryable-by-default
+      // fallback: unlike 4404, this MUST be retried, but only up to a budget.
+      for (let attempt = 1; attempt <= MAX_RECONNECT_ATTEMPTS; attempt++) {
+        act(() => {
+          FakeWebSocket.instances[attempt - 1].serverClose(1006);
+        });
+        if (attempt < MAX_RECONNECT_ATTEMPTS) {
+          await act(async () => {
+            await vi.advanceTimersByTimeAsync(RECONNECT_DELAY_MS);
+          });
+          expect(FakeWebSocket.instances).toHaveLength(attempt + 1);
+        }
+      }
+
+      expect(result.current.giveUp).toBe(true);
+      expect(result.current.error).toMatch(/ติดต่อเซิร์ฟเวอร์ ASR ไม่ได้/);
+
+      const instancesAtGiveUp = FakeWebSocket.instances.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(RECONNECT_DELAY_MS * 3);
+      });
+
+      // No further reconnect attempts after giving up — this is the exact
+      // "spins forever against a dead backend" failure the give-up budget
+      // exists to end.
+      expect(FakeWebSocket.instances).toHaveLength(instancesAtGiveUp);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resets the retry budget after a successful open, so a recovered blip does not count toward a later outage', async () => {
+    vi.useFakeTimers();
+    try {
+      const { result } = renderHook(() => useAsrSocket({ ...base, onFrame: () => {} }));
+
+      // MAX_RECONNECT_ATTEMPTS - 1 failures, none reaching the budget.
+      for (let attempt = 1; attempt < MAX_RECONNECT_ATTEMPTS; attempt++) {
+        act(() => FakeWebSocket.instances[attempt - 1].serverClose(1006));
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(RECONNECT_DELAY_MS);
+        });
+      }
+      expect(result.current.giveUp).toBe(false);
+
+      // A genuine recovery — the next connection opens successfully.
+      act(() => FakeWebSocket.instances[FakeWebSocket.instances.length - 1].open());
+      expect(result.current.giveUp).toBe(false);
+
+      // If the counter had NOT reset, one more failure here would be the
+      // (MAX_RECONNECT_ATTEMPTS)th and would trip giveUp. It must not.
+      act(() => FakeWebSocket.instances[FakeWebSocket.instances.length - 1].serverClose(1006));
+      expect(result.current.giveUp).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a 4404 sets sessionGone without ever setting giveUp', async () => {
+    const { result } = renderHook(() => useAsrSocket({ ...base, onFrame: () => {} }));
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+
+    act(() => {
+      FakeWebSocket.instances[0].open();
+      FakeWebSocket.instances[0].serverClose(4404);
+    });
+
+    // These are deliberately distinct signals — 4404 means the backend
+    // explicitly said "no such session," which is not the same claim as
+    // "we gave up trying to reach it." 4404 is not retryable at all, so it
+    // must never increment toward the give-up budget either.
+    expect(result.current.sessionGone).toBe(true);
+    expect(result.current.giveUp).toBe(false);
+  });
 });
