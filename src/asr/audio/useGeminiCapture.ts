@@ -39,7 +39,7 @@ export function useGeminiCapture(opts: {
   context: string;
   onResult: (result: CaptionResult) => void;
   deviceId?: string;
-}): GeminiCaptureState & { flush: () => Promise<void> } {
+}): GeminiCaptureState & { flush: () => Promise<CaptionResult | null> } {
   const { active, deviceId } = opts;
   const [state, setState] = useState<GeminiCaptureState>({ status: 'idle', error: null, lastChunkError: null });
 
@@ -62,12 +62,12 @@ export function useGeminiCapture(opts: {
   // Set by the effect below to whatever function can force-flush the
   // in-progress chunk right now; read by the stable flush() this hook
   // returns, so callers get one stable identity across renders.
-  const flushImplRef = useRef<() => Promise<void>>(async () => undefined);
+  const flushImplRef = useRef<() => Promise<CaptionResult | null>>(async () => null);
 
   useEffect(() => {
     if (!active) {
       setState({ status: 'idle', error: null, lastChunkError: null });
-      flushImplRef.current = async () => undefined;
+      flushImplRef.current = async () => null;
       return;
     }
 
@@ -114,7 +114,7 @@ export function useGeminiCapture(opts: {
       );
     };
 
-    const sendChunk = async (samples: Int16Array) => {
+    const sendChunk = async (samples: Int16Array): Promise<CaptionResult | null> => {
       const seq = seqCounter++;
       const sourceLang = sourceLangRef.current;
       const targetLang = targetLangRef.current;
@@ -137,18 +137,20 @@ export function useGeminiCapture(opts: {
         if (!res.ok || !body.source_text || !body.target_text) {
           throw new Error(body.error || `Gemini transcription failed (HTTP ${res.status})`);
         }
-        if (disposed) return;
+        if (disposed) return null;
         setState((s) => ({ ...s, lastChunkError: null }));
-        reorder.push(seq, {
+        const result: CaptionResult = {
           seq,
           sourceText: body.source_text,
           targetText: body.target_text,
           sourceLang,
           targetLang,
           latencyMs: body.latencyMs ?? Date.now() - startedAt
-        });
+        };
+        reorder.push(seq, result);
+        return result;
       } catch (err) {
-        if (disposed) return;
+        if (disposed) return null;
         // One failed chunk does not end the session — drop it and keep
         // listening, the same philosophy the old backend's backpressure
         // handling used for a dropped audio frame.
@@ -157,6 +159,7 @@ export function useGeminiCapture(opts: {
           lastChunkError: err instanceof Error ? err.message : 'ส่งเสียงไปยัง Gemini ไม่สำเร็จ'
         }));
         reorder.push(seq, null);
+        return null;
       }
     };
 
@@ -243,7 +246,8 @@ export function useGeminiCapture(opts: {
 
       flushImplRef.current = async () => {
         const remaining = chunker?.flush();
-        if (remaining) await sendChunk(remaining);
+        if (!remaining) return null;
+        return sendChunk(remaining);
       };
 
       setState((s) => ({ ...s, status: 'listening' }));
@@ -256,7 +260,7 @@ export function useGeminiCapture(opts: {
 
     return () => {
       disposed = true;
-      flushImplRef.current = async () => undefined;
+      flushImplRef.current = async () => null;
       teardown();
     };
   }, [active, deviceId]);

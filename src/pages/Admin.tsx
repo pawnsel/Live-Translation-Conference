@@ -198,12 +198,13 @@ export default function Admin() {
   // Ending the session flushes whatever audio is still buffered (so the
   // last few words of a sentence aren't lost), then asks Gemini for a
   // summary of the whole transcript before letting go of the session id.
-  const stopSessionAndMic = async () => {
-    await capture.flush();
+  const stopSessionAndMic = async (): Promise<CaptionResult | null> => {
+    const flushed = await capture.flush();
     setMicActive(false);
     if (sessionId) {
       setEndingSession(true);
       const items = allCaptions.map((c) => ({ source_text: c.sourceText, target_text: c.targetText }));
+      if (flushed) items.push({ source_text: flushed.sourceText, target_text: flushed.targetText });
       try {
         const res = await fetch('/api/gemini/summarize', {
           method: 'POST',
@@ -227,13 +228,29 @@ export default function Admin() {
     setSessionId(null);
     setPaused(false);
     projects.detachAsrSession();
+    return flushed;
   };
 
   const isSessionActive = !!sessionId && micActive;
 
   const handleRequestFinishProject = async () => {
-    await stopSessionAndMic();
-    const finished = projects.finishProject(allCaptions);
+    const flushed = await stopSessionAndMic();
+    const captionsForProject = flushed
+      ? [
+          ...allCaptions,
+          {
+            seq: flushed.seq,
+            sourceText: flushed.sourceText,
+            targetText: flushed.targetText,
+            sourceLang: flushed.sourceLang,
+            targetLang: flushed.targetLang,
+            ts: Date.now() / 1000,
+            latencyMs: flushed.latencyMs,
+            isEdited: false
+          }
+        ]
+      : allCaptions;
+    const finished = projects.finishProject(captionsForProject);
     dispatchCaption({ kind: 'reset' });
     setHiddenSeqs(new Set());
     if (finished) setFinishedProject(finished);
