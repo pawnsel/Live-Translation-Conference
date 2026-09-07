@@ -22,7 +22,8 @@ export interface DisplayConfig {
 
 export interface ProjectSession {
   id: string;
-  /** The Python session this recording ran against. Dies with the backend. */
+  /** A locally-generated session identifier (`local_${Date.now()}`), not
+   *  tied to any server-side session — there is no backend to die with. */
   asrSessionId: string;
   startedAt: number;
   endedAt?: number;
@@ -57,7 +58,9 @@ export interface Project {
   endedAt?: number;
   bill?: ProjectBill;
   autoFinished?: boolean;
-  /** The live Python session, if one is currently attached. Null after a
-   *  backend restart, which invalidates every session id it ever issued. */
+  /** The locally-generated session identifier of the currently attached
+   *  session, if any (see `ProjectSession.asrSessionId`). Null when no
+   *  session is attached — there is no backend, so nothing else can
+   *  invalidate it. */
   asrSessionId?: string | null;
 }

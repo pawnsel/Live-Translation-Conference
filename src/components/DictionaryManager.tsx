@@ -12,10 +12,11 @@ import {
 } from 'lucide-react';
 import type { GlossarySection, GlossarySections } from '../glossary';
 
-// The backend's glossary is ONE file shared by every live session — there is
-// no per-project scoping. These three sections are exactly what the wire
-// protocol defines; adding a fourth here would not correspond to anything
-// the server understands.
+// The glossary is persisted to localStorage per-browser via src/glossary.ts
+// — it is not shared across sessions or sent over any wire protocol. These
+// three sections are exactly what GlossarySections (src/glossary.ts) and the
+// Gemini prompt-building code understand; adding a fourth here would not
+// correspond to anything else in the pipeline.
 const SECTIONS: Array<{ key: GlossarySection; label: string; hint: string }> = [
   { key: 'protected_terms', label: 'ศัพท์เฉพาะ', hint: 'ไทย → อังกฤษ: คำที่ต้องคงคำแปลไว้เสมอ เช่น ความดันโลหิตสูง → hypertension' },
   { key: 'person_names', label: 'ชื่อบุคคล', hint: 'ไทย → อังกฤษ: ชื่อผู้พูดที่ถอดเสียงเป็นอังกฤษ เช่น นพ. สมชาย → Dr. Somchai' },
