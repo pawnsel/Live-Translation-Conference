@@ -44,8 +44,8 @@ export function useGeminiCapture(opts: {
   const [state, setState] = useState<GeminiCaptureState>({ status: 'idle', error: null, lastChunkError: null });
 
   // Latest-value refs for everything a chunk send needs but that must NOT
-  // tear down and restart the mic when it changes — mirrors the onFrameRef
-  // pattern the old control-socket hook (useAsrSocket.ts) used.
+  // tear down and restart the mic when it changes — uses a stable ref pattern
+  // to avoid tearing down and restarting the mic on option changes.
   const pausedRef = useRef(opts.paused);
   pausedRef.current = opts.paused;
   const sourceLangRef = useRef(opts.sourceLang);
@@ -171,9 +171,8 @@ export function useGeminiCapture(opts: {
         return;
       }
 
-      // No backend audio-processing chain to fight anymore — unlike the old
-      // useAudioCapture.ts, the browser's own echo/noise/gain cleanup stays
-      // on.
+      // The browser's own echo/noise/gain cleanup is enabled; no need for
+      // additional backend audio processing.
       const constraints: MediaTrackConstraints = {
         echoCancellation: true,
         noiseSuppression: true,
