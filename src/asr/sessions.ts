@@ -33,12 +33,34 @@ function authHeaders(token: string): Record<string, string> {
   return { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
 }
 
+// None of these calls had a timeout: `fetch()` can hang far longer than an
+// operator will wait — TCP-level failures against a server that just
+// vanished are not always an immediate rejection — and every caller in
+// Admin.tsx guards its own loading flag (`starting`, `endingSession`) with a
+// `finally` that only ever runs once the awaited promise SETTLES. A fetch
+// that never settles therefore wedges a button disabled forever with no
+// console error and no visible explanation — confirmed live: the operator
+// saw exactly that, a greyed-out "เริ่ม Session" that stayed unclickable
+// across a hard refresh's worth of retrying the same stuck flow.
+const REQUEST_TIMEOUT_MS = 10000;
+
+async function fetchWithTimeout(fetchImpl: typeof fetch, url: string, init: RequestInit): Promise<Response> {
+  try {
+    return await fetchImpl(url, { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'TimeoutError') {
+      throw new Error(`เซิร์ฟเวอร์ไม่ตอบสนองภายใน ${REQUEST_TIMEOUT_MS / 1000} วินาที (server did not respond in time)`);
+    }
+    throw err;
+  }
+}
+
 export async function listSessions(
   backendUrl: string,
   token: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<SessionSnapshot[]> {
-  const response = await fetchImpl(`${backendUrl.replace(/\/+$/, '')}/sessions`, {
+  const response = await fetchWithTimeout(fetchImpl, `${backendUrl.replace(/\/+$/, '')}/sessions`, {
     headers: authHeaders(token),
   });
   if (!response.ok) throw new Error(`Could not list sessions (HTTP ${response.status})`);
@@ -50,7 +72,7 @@ export async function createSession(
   token: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<SessionSnapshot> {
-  const response = await fetchImpl(`${backendUrl.replace(/\/+$/, '')}/sessions`, {
+  const response = await fetchWithTimeout(fetchImpl, `${backendUrl.replace(/\/+$/, '')}/sessions`, {
     method: 'POST',
     headers: authHeaders(token),
     // "remote" is required: a local session opens the SERVER's microphone,
@@ -70,7 +92,7 @@ export async function getSession(
   id: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<SessionSnapshot | null> {
-  const response = await fetchImpl(`${backendUrl.replace(/\/+$/, '')}/sessions/${id}`, {
+  const response = await fetchWithTimeout(fetchImpl, `${backendUrl.replace(/\/+$/, '')}/sessions/${id}`, {
     headers: authHeaders(token),
   });
   // A forgotten session is the normal consequence of a backend restart, not
@@ -86,7 +108,7 @@ export async function deleteSession(
   id: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<void> {
-  const response = await fetchImpl(`${backendUrl.replace(/\/+$/, '')}/sessions/${id}`, {
+  const response = await fetchWithTimeout(fetchImpl, `${backendUrl.replace(/\/+$/, '')}/sessions/${id}`, {
     method: 'DELETE',
     headers: authHeaders(token),
   });
