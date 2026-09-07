@@ -665,7 +665,14 @@ export default function Admin() {
 
           <button
             onClick={isSessionActive ? stopSessionAndMic : startSessionAndMic}
-            disabled={starting || endingSession || (!session && candidates.length > 1)}
+            // Deliberately NOT disabled just because `candidates` is
+            // populated: startSessionAndMic re-lists and re-decides fresh on
+            // every press, so a stale picker (sessions that ended elsewhere
+            // since it was shown) cannot wedge this button — pressing it
+            // again re-evaluates current backend truth. A permanent disable
+            // here once left an operator with no way to recover except
+            // reloading the page.
+            disabled={starting || endingSession}
             className={`px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2 transition-all shadow-xs whitespace-nowrap disabled:opacity-50 ${
               isSessionActive ? 'bg-rose-600 hover:bg-rose-700 text-white animate-pulse' : 'bg-[#DE5C8E] hover:bg-[#c94577] text-white'
             }`}
