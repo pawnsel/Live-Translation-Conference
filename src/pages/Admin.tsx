@@ -291,11 +291,24 @@ export default function Admin() {
   //    control socket for this session is open, stop it when the session
   //    ends (in stopSessionAndMic below) — there is no manual record button.
   useEffect(() => {
-    if (!session || socket.status !== 'open') return;
+    if (!session || socket.status !== 'open' || !socket.welcome) return;
     if (reportStartedForSessionRef.current === session.id) return;
     reportStartedForSessionRef.current = session.id;
-    socket.send(cmd.reportStart(session.id));
-  }, [session?.id, socket.status]);
+    // Only start if nobody already has. The backend resets the collected
+    // items to empty on EVERY control.report_start, even one already
+    // active — so a second tab adopting an already-live session (the
+    // normal, intended way for a colleague to also open the console) must
+    // never resend it: that would silently discard everything the first
+    // tab has gathered so far. `welcome.report` is the live projection of
+    // report.state broadcasts, so this reflects current server truth, not
+    // just what this tab remembers from its own mount. Confirmed live: a
+    // third tab joining reset an already-recording session to 0 items,
+    // and the operator ending it saw "จบ Session" resolve almost
+    // instantly — nothing to wait for, because there was nothing left.
+    if (!socket.welcome.report.active) {
+      socket.send(cmd.reportStart(session.id));
+    }
+  }, [session?.id, socket.status, socket.welcome]);
 
   // ── Live socket latency, mirroring the old ping-check/pong-check heartbeat ──
   useEffect(() => {
@@ -409,7 +422,13 @@ export default function Admin() {
       // the session's client list server-side, so a report.done that
       // arrives even a moment later broadcasts to nobody — this is what
       // actually produced "no report" rather than any backend defect.
-      if (reportStartedForSessionRef.current === session.id && socket.status === 'open') {
+      //
+      // Gated on `welcome.report.active` (current server truth), not on
+      // whether THIS tab is the one that happened to send report_start:
+      // any tab adopting a shared session can be the one that presses
+      // "จบ Session," and it must still stop and wait for the report
+      // regardless of which tab originally started it.
+      if (socket.welcome?.report.active && socket.status === 'open') {
         socket.send(cmd.reportStop(session.id));
         reportStartedForSessionRef.current = null;
         setEndingSession(true);
