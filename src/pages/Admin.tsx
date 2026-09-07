@@ -58,6 +58,11 @@ const SOURCE_TOKEN_REFRESH_MS = 12 * 3600 * 1000 * 0.8;
 // short, minutes-scale poll is therefore both sufficient and more robust
 // than one long timer.
 const OPERATOR_TOKEN_POLL_MS = 5 * 60 * 1000;
+// Bounded wait for the section-report summary before a session is deleted.
+// The backend's own Vertex/Gemini call times out at 30s (SUMMARIZE_TIMEOUT_SEC);
+// this stays under that so ending a session is never stuck longer than the
+// backend itself would give up.
+const REPORT_WAIT_TIMEOUT_MS = 20000;
 
 // Only the pair the backend actually supports (protocol-v1.md: "Supported
 // pairs: th⇄en"). Anything else is not a language the server will accept.
@@ -144,6 +149,12 @@ export default function Admin() {
   // is no manual "start recording" button; this ref just stops the effect
   // below from re-sending the command on every render.
   const reportStartedForSessionRef = useRef<string | null>(null);
+  // Resolves the promise stopSessionAndMic awaits after sending report_stop.
+  // DELETE /sessions/{id} force-closes and clears the session's client list
+  // server-side — if it ran before summarize() (a real network call, even on
+  // failure) finished, report.done would broadcast to nobody. This is what
+  // makes ending a session wait for the report instead of racing it away.
+  const resolvePendingReportRef = useRef<(() => void) | null>(null);
 
   // `useProjects()` returns a fresh object literal every render, so
   // `detachAsrSession` changes identity on every render too. Effects below
@@ -221,6 +232,14 @@ export default function Admin() {
       setGlossary((frame.data as { glossary: { sections: GlossarySections } }).glossary.sections);
     } else if (frame.type === 'report.done') {
       setReport(frame.data as ReportDonePayload);
+      resolvePendingReportRef.current?.();
+    } else if (frame.type === 'report.state') {
+      // The backend acks report_stop with report.state BEFORE it attempts
+      // the (network-bound) summary. When there was nothing gathered, no
+      // report.done will ever follow — stop waiting immediately instead of
+      // sitting out the full timeout for no reason.
+      const d = frame.data as { active: boolean; count: number };
+      if (!d.active && d.count === 0) resolvePendingReportRef.current?.();
     } else if (frame.type === 'control.pong' && frame.id) {
       const sentAt = pendingPings.current.get(frame.id);
       if (sentAt !== undefined) {
@@ -290,6 +309,7 @@ export default function Admin() {
   //    single Start/Stop button (the backend's create/adopt/end machinery
   //    sits behind it rather than being exposed as separate controls) ──────
   const [starting, setStarting] = useState(false);
+  const [endingSession, setEndingSession] = useState(false);
 
   const adoptCandidate = async (id: string) => {
     if (!token) return;
@@ -329,12 +349,28 @@ export default function Admin() {
   const stopSessionAndMic = async () => {
     setMicActive(false);
     if (token && session) {
-      // Stop the automatic section report before the socket disconnects, so
-      // report.done (the summary) has a chance to arrive.
+      // Stop the automatic section report and WAIT for its outcome before
+      // deleting the session. Deleting force-closes the socket and clears
+      // the session's client list server-side, so a report.done that
+      // arrives even a moment later broadcasts to nobody — this is what
+      // actually produced "no report" rather than any backend defect.
       if (reportStartedForSessionRef.current === session.id && socket.status === 'open') {
         socket.send(cmd.reportStop(session.id));
+        reportStartedForSessionRef.current = null;
+        setEndingSession(true);
+        await new Promise<void>((resolve) => {
+          let settled = false;
+          const done = () => {
+            if (settled) return;
+            settled = true;
+            resolvePendingReportRef.current = null;
+            resolve();
+          };
+          resolvePendingReportRef.current = done;
+          setTimeout(done, REPORT_WAIT_TIMEOUT_MS);
+        });
+        setEndingSession(false);
       }
-      reportStartedForSessionRef.current = null;
       await deleteSession(BACKEND_URL, token, session.id).catch(() => undefined);
     }
     setSession(null);
@@ -563,13 +599,21 @@ export default function Admin() {
 
           <button
             onClick={isSessionActive ? stopSessionAndMic : startSessionAndMic}
-            disabled={starting || (!session && candidates.length > 1)}
+            disabled={starting || endingSession || (!session && candidates.length > 1)}
             className={`px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2 transition-all shadow-xs whitespace-nowrap disabled:opacity-50 ${
               isSessionActive ? 'bg-rose-600 hover:bg-rose-700 text-white animate-pulse' : 'bg-[#DE5C8E] hover:bg-[#c94577] text-white'
             }`}
           >
             {isSessionActive ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
-            <span>{starting ? 'กำลังเริ่ม…' : isSessionActive ? 'จบ Session' : 'เริ่ม Session'}</span>
+            <span>
+              {starting
+                ? 'กำลังเริ่ม…'
+                : endingSession
+                ? 'กำลังสรุปผลการประชุม…'
+                : isSessionActive
+                ? 'จบ Session'
+                : 'เริ่ม Session'}
+            </span>
           </button>
         </div>
       </header>
@@ -1085,7 +1129,19 @@ export default function Admin() {
                 <ClipboardList className="w-3.5 h-3.5 text-[#DE5C8E]" />
                 <span>สรุปช่วงการประชุม</span>
               </h2>
-              <p className="text-xs text-slate-600 whitespace-pre-wrap leading-relaxed">{report.summary}</p>
+              {report.summary ? (
+                <p className="text-xs text-slate-600 whitespace-pre-wrap leading-relaxed">{report.summary}</p>
+              ) : (
+                // The backend still sends report.done with an empty summary
+                // when the Gemini/Vertex call fails (quota, disabled API,
+                // network) — it ships the raw transcript regardless rather
+                // than losing the session's record entirely. Say so plainly
+                // instead of leaving a blank panel that looks broken.
+                <p className="text-xs text-amber-700 flex items-center gap-1.5">
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                  <span>สรุปด้วย AI ไม่สำเร็จ (ตรวจสอบสิทธิ์ Vertex AI ฝั่งเซิร์ฟเวอร์) — บันทึกไว้ {report.items.length} ข้อความ ดูได้ที่ &quot;ประวัติทั้งหมด&quot; ด้านบน</span>
+                </p>
+              )}
             </div>
           )}
         </main>
