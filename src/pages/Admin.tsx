@@ -372,10 +372,14 @@ export default function Admin() {
 
   const adoptCandidate = async (id: string) => {
     if (!token) return;
-    const found = await getSession(BACKEND_URL, token, id);
-    setSession(found);
-    setCandidates([]);
-    if (found) projects.attachAsrSession(found.id, found.source_lang, found.target_lang);
+    try {
+      const found = await getSession(BACKEND_URL, token, id);
+      setSession(found);
+      setCandidates([]);
+      if (found) projects.attachAsrSession(found.id, found.source_lang, found.target_lang);
+    } catch (err) {
+      setTokenError((err as Error).message);
+    }
   };
 
   const startSessionAndMic = async () => {
