@@ -10,7 +10,6 @@ import {
   Trash2,
   Sparkles,
   Zap,
-  Activity,
   Edit2,
   Menu,
   ShieldAlert,
@@ -20,38 +19,39 @@ import {
   Play,
   ClipboardList,
   RefreshCw,
-  AlertTriangle,
   ChevronDown,
   ChevronUp,
   User
 } from 'lucide-react';
-// ProjectPanel.tsx has NO default export — it exports five named components.
-import { BillModal, HistoryPanel, ProjectHeaderBar, ProjectPicker, SessionHistoryModal } from '../components/ProjectPanel';
+// ProjectPanel.tsx has NO default export — it exports named components only.
+import {
+  BillModal,
+  HistoryPanel,
+  ProjectHeaderBar,
+  ProjectPicker,
+  SessionHistoryModal,
+  SessionSummaryModal
+} from '../components/ProjectPanel';
 import DictionaryManager from '../components/DictionaryManager';
 import { captionsReducer, initialCaptionState, selectCaptions, type Caption } from '../asr/captions';
 import { useGeminiLiveCapture, type CaptionResult } from '../asr/audio/useGeminiLiveCapture';
 import SubtitleText from '../components/SubtitleText';
 import { useProjects } from '../hooks/useProjects';
 import { loadGlossary, saveGlossary, type GlossarySection, type GlossarySections } from '../glossary';
-import type { DisplayConfig, Project } from '../types';
+import type { DisplayConfig, Project, ProjectSession } from '../types';
 
-const PING_INTERVAL_MS = 3000;
-// Bounded wait for the end-of-session summary before giving up and showing
-// the "AI summary failed" fallback — keeps ending a session from hanging on
-// a stuck Gemini call.
+// Bounded wait for a summary before giving up and showing the "AI summary
+// failed" state — keeps a stuck call from spinning forever.
 const REPORT_WAIT_TIMEOUT_MS = 20000;
 
+// There is no sign-in yet; the header shows a placeholder until accounts and
+// the profile page land, and everything reads this one constant.
+const CURRENT_USER_NAME = 'ผู้ใช้งาน';
+
 // Only the pair this console supports. Anything else is not a language
-// Gemini is instructed to expect.
+// the model is instructed to expect.
 const LANGS: Record<'th' | 'en', string> = { th: 'ไทย (Thai)', en: 'อังกฤษ (English)' };
 const other = (lang: string) => (lang === 'th' ? 'en' : 'th');
-
-interface ReportResult {
-  summary: string;
-  items: number;
-  /** Gemini is still working on it — the session has already ended. */
-  pending?: boolean;
-}
 
 function formatSrtTime(ms: number): string {
   const h = String(Math.floor(ms / 3600000)).padStart(2, '0');
@@ -100,15 +100,16 @@ export default function Admin() {
   const [targetLang, setTargetLangState] = useState<'th' | 'en'>('en');
   const [paused, setPaused] = useState(false);
   const [glossary, setGlossary] = useState<GlossarySections>(() => loadGlossary());
-  const [report, setReport] = useState<ReportResult | null>(null);
-  const reportOwnerRef = useRef<string | null>(null);
-  const [pingMs, setPingMs] = useState<number | null>(null);
 
-  const [config, setConfig] = useState<DisplayConfig>({ fontSize: 'large', showOriginal: false, showLatency: false });
+  const [config, setConfig] = useState<DisplayConfig>({ fontSize: 'medium', showOriginal: false, showLatency: false });
   const [activeTab, setActiveTab] = useState<'languages' | 'dictionary'>('languages');
   const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [showSessionHistory, setShowSessionHistory] = useState(false);
+  // Which session's summary popup is open, by ProjectSession id. The session
+  // itself is read from the live project record, so a summary that arrives
+  // while the popup is open fills itself in.
+  const [summarySessionId, setSummarySessionId] = useState<string | null>(null);
   const [showAllHistory, setShowAllHistory] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
   const [finishedProject, setFinishedProject] = useState<Project | null>(null);
@@ -151,35 +152,6 @@ export default function Admin() {
     onResult: handleCaptureResult
   });
 
-  // ── "Ping" — round-trip time of our own server's /api/health, not a
-  //    control-socket heartbeat (there is no persistent socket anymore) ─────
-  useEffect(() => {
-    if (!sessionId || !micActive) {
-      setPingMs(null);
-      return;
-    }
-    let cancelled = false;
-    const probe = async () => {
-      const startedAt = Date.now();
-      try {
-        const res = await fetch('/api/health', { signal: AbortSignal.timeout(4000) });
-        if (!res.ok) throw new Error('unhealthy');
-        if (!cancelled) setPingMs(Date.now() - startedAt);
-      } catch {
-        if (!cancelled) setPingMs(null);
-      }
-    };
-    // Fire one probe immediately — otherwise Ping reads "--" for the first
-    // PING_INTERVAL_MS of every session, since setInterval's first callback
-    // doesn't fire until the interval has already elapsed once.
-    void probe();
-    const timer = setInterval(probe, PING_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [sessionId, micActive]);
-
   // ── Session + mic as one combined "Session" toggle, matching the original
   //    single Start/Stop button ─────────────────────────────────────────────
   const [endingSession, setEndingSession] = useState(false);
@@ -190,74 +162,23 @@ export default function Admin() {
     setSessionId(id);
     dispatchCaption({ kind: 'reset' });
     setHiddenSeqs(new Set());
-    setReport(null);
-    // The previous session's summary may still be in flight; it no longer
-    // owns this panel.
-    reportOwnerRef.current = null;
     projects.attachAsrSession(id, sourceLang, targetLang);
     setMicActive(true);
   };
 
   // Ending the session flushes whatever audio is still buffered (so the last
-  // few words of a sentence aren't lost), then hands the transcript to Gemini
-  // for a summary — in the background. The operator gets the console back
-  // immediately; the summary lands in the report panel and the session
-  // history when it is ready.
-  const summarizeInBackground = async (asrSessionId: string, items: { source_text: string; target_text: string }[]) => {
-    // The panel belongs to whichever session ended most recently. A summary
-    // that resolves after the operator has already started the next session
-    // must still be SAVED, but must not pop up over the new session's panel.
-    const showIfStillOwner = (result: ReportResult) => {
-      if (reportOwnerRef.current === asrSessionId) setReport(result);
-    };
-    try {
-      const res = await fetch('/api/gemini/summarize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ items }),
-        signal: AbortSignal.timeout(REPORT_WAIT_TIMEOUT_MS)
-      });
-      const data = (await res.json()) as { summary?: string; items?: number };
-      const summary = data.summary ?? '';
-      const itemCount = data.items ?? items.length;
-      showIfStillOwner({ summary, items: itemCount });
-      projects.saveSessionSummary(asrSessionId, summary, itemCount);
-    } catch {
-      // An AI failure never loses the transcript, it just ships without a
-      // summary.
-      showIfStillOwner({ summary: '', items: items.length });
-      projects.saveSessionSummary(asrSessionId, '', items.length);
-    }
-  };
-
-  const stopSessionAndMic = async (): Promise<CaptionResult | null> => {
+  // few words of a sentence aren't lost) and files that transcript under the
+  // session. Nothing is sent to the AI here: a summary costs a model call, so
+  // it happens only when the operator asks for one from the session history.
+  const stopSessionAndMic = async (): Promise<Caption[]> => {
     // Disable the "End Session" button immediately, before the await below —
-    // otherwise a second click fires a duplicate flush and summarize.
+    // otherwise a second click fires a duplicate flush.
     setEndingSession(true);
     const flushed = await capture.flush();
     setMicActive(false);
-    if (sessionId) {
-      const items = allCaptions.map((c) => ({ source_text: c.sourceText, target_text: c.targetText }));
-      if (flushed) items.push({ source_text: flushed.sourceText, target_text: flushed.targetText });
-      reportOwnerRef.current = sessionId;
-      setReport({ summary: '', items: items.length, pending: true });
-      projects.markSessionSummarizing(sessionId);
-      // Deliberately not awaited — this is what keeps ending a session
-      // instant instead of blocking on a call that can take 20 seconds.
-      void summarizeInBackground(sessionId, items);
-    }
-    setEndingSession(false);
-    setSessionId(null);
-    setPaused(false);
-    projects.detachAsrSession();
-    return flushed;
-  };
-
-  const isSessionActive = !!sessionId && micActive;
-
-  const handleRequestFinishProject = async () => {
-    const flushed = await stopSessionAndMic();
-    const captionsForProject = flushed
+    // The flushed caption arrives too late for the reducer to have re-rendered
+    // this component, so it is folded in by hand.
+    const sessionCaptions: Caption[] = flushed
       ? [
           ...allCaptions,
           {
@@ -272,6 +193,44 @@ export default function Admin() {
           }
         ]
       : allCaptions;
+    if (sessionId) projects.saveSessionTranscript(sessionId, sessionCaptions);
+    setEndingSession(false);
+    setSessionId(null);
+    setPaused(false);
+    projects.detachAsrSession();
+    return sessionCaptions;
+  };
+
+  const isSessionActive = !!sessionId && micActive;
+
+  // On-demand summary for one recorded session, from the transcript kept with
+  // it. Opens the popup straight away so the operator watches it fill in.
+  const summarizeSession = async (session: ProjectSession) => {
+    const transcripts = session.transcripts ?? [];
+    if (transcripts.length === 0 || !session.endedAt) return;
+    if (projects.summarizingIds.has(session.asrSessionId)) return;
+
+    setSummarySessionId(session.id);
+    projects.markSessionSummarizing(session.asrSessionId);
+    const items = transcripts.map((c) => ({ source_text: c.sourceText, target_text: c.targetText }));
+    try {
+      const res = await fetch('/api/gemini/summarize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items }),
+        signal: AbortSignal.timeout(REPORT_WAIT_TIMEOUT_MS)
+      });
+      const data = (await res.json()) as { summary?: string; items?: number };
+      projects.saveSessionSummary(session.asrSessionId, data.summary ?? '', data.items ?? items.length);
+    } catch {
+      // An AI failure never loses the transcript — the session keeps it, and
+      // the operator can ask again.
+      projects.saveSessionSummary(session.asrSessionId, '', items.length);
+    }
+  };
+
+  const handleRequestFinishProject = async () => {
+    const captionsForProject = await stopSessionAndMic();
     const finished = projects.finishProject(captionsForProject);
     dispatchCaption({ kind: 'reset' });
     setHiddenSeqs(new Set());
@@ -395,6 +354,10 @@ export default function Admin() {
   const boxTargetText = capture.partialTarget || latestCaption?.targetText || '';
   const isEditingBox = editingSeq !== null && editingSeq === latestCaption?.seq;
 
+  // Read live off the project record so the popup fills itself in the moment
+  // the summary lands, rather than holding a stale copy of the session.
+  const summarySession = projects.currentProject?.sessions.find((s) => s.id === summarySessionId) ?? null;
+
   // ── No project selected: the picker is the whole screen, as it always was ──
   if (!projects.currentProject) {
     return (
@@ -420,7 +383,18 @@ export default function Admin() {
         <SessionHistoryModal
           project={projects.currentProject}
           summarizingIds={projects.summarizingIds}
+          onSummarize={summarizeSession}
+          onViewSummary={(session) => setSummarySessionId(session.id)}
           onClose={() => setShowSessionHistory(false)}
+        />
+      )}
+      {summarySession && (
+        <SessionSummaryModal
+          project={projects.currentProject}
+          session={summarySession}
+          isSummarizing={projects.summarizingIds.has(summarySession.asrSessionId)}
+          onSummarize={summarizeSession}
+          onClose={() => setSummarySessionId(null)}
         />
       )}
 
@@ -443,7 +417,6 @@ export default function Admin() {
             </div>
             <div className="flex flex-col">
               <span className="font-bold text-sm text-slate-900 tracking-tight leading-none">AI Live Translator</span>
-              <span className="text-[11px] text-slate-400 font-medium leading-tight mt-0.5">Powered by Google Gemini</span>
             </div>
           </div>
 
@@ -467,38 +440,9 @@ export default function Admin() {
         </div>
 
         <div className="flex items-center gap-2 sm:gap-3">
-          <div
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold transition-all ${
-              isSessionActive
-                ? 'bg-emerald-50 text-emerald-700 border border-emerald-300 ring-2 ring-emerald-100'
-                : 'bg-slate-100 text-slate-500 border border-slate-200'
-            }`}
-          >
-            {isSessionActive ? (
-              <>
-                <span className="relative flex h-2 w-2">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
-                </span>
-                <span className="tracking-wider text-[11px] font-bold uppercase whitespace-nowrap">
-                  {paused ? 'พักการถอดความ' : 'กำลังแปลสด'}
-                </span>
-              </>
-            ) : (
-              <>
-                <span className="w-2 h-2 rounded-full bg-slate-400" />
-                <span className="text-[11px] whitespace-nowrap">พร้อมใช้งาน</span>
-              </>
-            )}
-          </div>
-
-          {/* Latency lives in the subtitle box (config.showLatency); only
-              Ping is unique to this bar. */}
-          <div className="hidden md:flex items-center gap-2 bg-slate-100 px-3 py-1.5 rounded-full text-[11px] font-mono border border-slate-200">
-            <Activity className={`w-3.5 h-3.5 ${isSessionActive ? 'text-emerald-600' : 'text-slate-400'}`} />
-            <span className="text-slate-500">Ping:</span>
-            <span className="font-semibold text-slate-800">{pingMs !== null ? `${pingMs}ms` : '--'}</span>
-          </div>
+          <span className="hidden sm:block text-xs font-semibold text-slate-700 truncate max-w-40" title={CURRENT_USER_NAME}>
+            {CURRENT_USER_NAME}
+          </span>
 
           {/* The record control itself now lives in the middle of the screen;
               this corner is reserved for the operator's own account. */}
@@ -526,7 +470,7 @@ export default function Admin() {
                       <User className="w-4 h-4" />
                     </div>
                     <div className="min-w-0">
-                      <div className="text-xs font-bold text-slate-800 truncate">ผู้ดูแลระบบ</div>
+                      <div className="text-xs font-bold text-slate-800 truncate">{CURRENT_USER_NAME}</div>
                       <div className="text-[11px] text-slate-400 truncate">ยังไม่ได้เข้าสู่ระบบ</div>
                     </div>
                   </div>
@@ -1018,33 +962,6 @@ export default function Admin() {
             </div>
           )}
 
-          {report && (
-            <div className="p-3.5 bg-white border-t border-slate-200 shrink-0 space-y-1.5 max-h-40 overflow-y-auto">
-              <h2 className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
-                <ClipboardList className="w-3.5 h-3.5 text-[#DE5C8E]" />
-                <span>สรุปช่วงการประชุม</span>
-              </h2>
-              {report.pending ? (
-                <p className="text-xs text-slate-500 flex items-center gap-1.5">
-                  <span className="relative flex h-2 w-2">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#DE5C8E] opacity-75" />
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-[#DE5C8E]" />
-                  </span>
-                  <span>กำลังสรุปผลการประชุม… ({report.items} ข้อความ) — ใช้งานต่อได้เลย ไม่ต้องรอ</span>
-                </p>
-              ) : report.summary ? (
-                <p className="text-xs text-slate-600 whitespace-pre-wrap leading-relaxed">{report.summary}</p>
-              ) : (
-                // The transcript is preserved even when the summarize call
-                // itself fails (quota, network) — say so plainly instead of
-                // leaving a blank panel that looks broken.
-                <p className="text-xs text-amber-700 flex items-center gap-1.5">
-                  <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                  <span>สรุปด้วย AI ไม่สำเร็จ — บันทึกไว้ {report.items} ข้อความ ดูได้ที่ &quot;ประวัติทั้งหมด&quot; ด้านบน</span>
-                </p>
-              )}
-            </div>
-          )}
         </main>
       </div>
     </div>

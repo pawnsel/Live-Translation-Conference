@@ -165,6 +165,80 @@ describe('useProjects — attachAsrSession', () => {
   });
 });
 
+describe('useProjects — per-session transcripts', () => {
+  const items = [
+    {
+      seq: 0,
+      sourceText: 'สวัสดีครับ',
+      targetText: 'Hello',
+      sourceLang: 'th',
+      targetLang: 'en',
+      ts: 1,
+      latencyMs: 120,
+      isEdited: false
+    }
+  ];
+
+  it('files a transcript under the session that recorded it, so it can be summarised later', () => {
+    const result = setupWithProject();
+
+    act(() => {
+      result.current.attachAsrSession('asr_1', 'th', 'en');
+    });
+    act(() => {
+      result.current.saveSessionTranscript('asr_1', items);
+    });
+
+    expect(result.current.currentProject!.sessions[0].transcripts).toEqual(items);
+  });
+
+  // Regression: finishing a project used to write a snapshot of the project
+  // taken at render time, which silently threw away the session transcript
+  // saved moments earlier when the live session was stopped — leaving that
+  // session unsummarisable forever. All three calls land in one batch here,
+  // which is exactly how "จบโปรเจกต์" runs them.
+  it('regression: finishing a project keeps a transcript saved in the same batch', () => {
+    const result = setupWithProject();
+
+    act(() => {
+      result.current.attachAsrSession('asr_1', 'th', 'en');
+    });
+
+    vi.advanceTimersByTime(1000);
+
+    act(() => {
+      result.current.saveSessionTranscript('asr_1', items);
+      result.current.detachAsrSession();
+      result.current.finishProject(items);
+    });
+
+    const ended = result.current.endedProjects[0];
+    expect(ended).toBeDefined();
+    expect(ended.sessions).toHaveLength(1);
+    expect(ended.sessions[0].transcripts).toEqual(items);
+  });
+
+  it('attaches a summary to the session that owns the ASR id', () => {
+    const result = setupWithProject();
+
+    act(() => {
+      result.current.attachAsrSession('asr_1', 'th', 'en');
+    });
+    act(() => {
+      result.current.markSessionSummarizing('asr_1');
+    });
+    expect(result.current.summarizingIds.has('asr_1')).toBe(true);
+
+    act(() => {
+      result.current.saveSessionSummary('asr_1', 'สรุปการประชุม', 1);
+    });
+
+    expect(result.current.summarizingIds.has('asr_1')).toBe(false);
+    expect(result.current.currentProject!.sessions[0].summary).toBe('สรุปการประชุม');
+    expect(result.current.currentProject!.sessions[0].reportItemCount).toBe(1);
+  });
+});
+
 describe('useProjects — localStorage migration', () => {
   it('loads a project saved before transcripts/asrSessionId existed with sane defaults', () => {
     const legacyProject = {

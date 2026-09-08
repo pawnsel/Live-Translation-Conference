@@ -200,10 +200,25 @@ export function useProjects() {
     setProjects((prev) => prev.map((p: Project) => (p.id === projectId ? { ...p, transcripts } : p)));
   }, []);
 
-  // Attaches a report.done summary to whichever ProjectSession recorded that
-  // ASR session, wherever it lives — searched by `asrSessionId` inside the
+  // Keeps each session's own captions with the session record, so the
+  // operator can ask for its summary minutes or days later — summarising is
+  // on demand, not something that fires the moment a session ends.
+  const saveSessionTranscript = useCallback((asrSessionId: string, transcripts: TranscriptItem[]) => {
+    setProjects((prev) =>
+      prev.map((p) => {
+        const idx = p.sessions.findIndex((s) => s.asrSessionId === asrSessionId);
+        if (idx === -1) return p;
+        const sessions = p.sessions.slice();
+        sessions[idx] = { ...sessions[idx], transcripts };
+        return { ...p, sessions };
+      })
+    );
+  }, []);
+
+  // Attaches a summary to whichever ProjectSession recorded that ASR
+  // session, wherever it lives — searched by `asrSessionId` inside the
   // updater rather than gated on `currentProject`, so it stays correct even
-  // if a late-arriving report resolves after the project selection moved on.
+  // if the summary resolves after the project selection moved on.
   // No P2 database exists yet, so this is the "mock" persistence: the same
   // localStorage record every other project field already rides on.
   const saveSessionSummary = useCallback((asrSessionId: string, summary: string, reportItemCount: number) => {
@@ -224,8 +239,8 @@ export function useProjects() {
     );
   }, []);
 
-  // Summarising runs in the background after a session ends, so the history
-  // view needs to tell "still working on it" apart from "no summary".
+  // Summarising is a request that can take many seconds, so the history view
+  // needs to tell "still working on it" apart from "not summarised yet".
   // Deliberately NOT persisted: a reload kills the in-flight request, and a
   // flag stored in localStorage would leave that session showing a spinner
   // forever.
@@ -237,20 +252,24 @@ export function useProjects() {
     if (!currentProject) return undefined;
 
     const now = Date.now();
-    const { closedSessions, bill } = buildBill(currentProject, transcripts, now);
-    const finished: Project = {
-      ...currentProject,
-      status: 'ended',
-      sessions: closedSessions,
-      transcripts,
-      endedAt: now,
-      bill
-    };
 
-    setProjects((prev) => prev.map((p: Project) => (p.id === currentProject.id ? finished : p)));
+    setProjects((prev) =>
+      prev.map((p: Project) => {
+        if (p.id !== currentProject.id) return p;
+        // Built from the freshest record rather than the render-time copy:
+        // finishing a project stops the live session first, and that write
+        // (the session's own transcript) must survive this one.
+        const { closedSessions, bill } = buildBill(p, transcripts, now);
+        return { ...p, status: 'ended' as const, sessions: closedSessions, transcripts, endedAt: now, bill };
+      })
+    );
     setSelectedProjectId(null);
 
-    return finished;
+    // What the bill modal shows. The numbers are identical to the record
+    // written above — a bill is computed from session timings and word
+    // counts, neither of which the newer write touches.
+    const { closedSessions, bill } = buildBill(currentProject, transcripts, now);
+    return { ...currentProject, status: 'ended', sessions: closedSessions, transcripts, endedAt: now, bill };
   };
 
   return {
@@ -267,6 +286,7 @@ export function useProjects() {
     detachAsrSession,
     endSession,
     saveTranscripts,
+    saveSessionTranscript,
     saveSessionSummary,
     markSessionSummarizing,
     summarizingIds,
