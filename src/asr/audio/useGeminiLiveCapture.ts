@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { FRAME_SAMPLES, SAMPLE_RATE, WORKLET_SRC } from './pcm';
-import { glossaryToPairs, glossaryToVocabulary, type GlossarySections } from '../../glossary';
+import {
+  applyEnThCorrections,
+  glossaryToPairs,
+  glossaryToVocabulary,
+  type GlossarySections
+} from '../../glossary';
 
 /** One finished utterance: what was said, and its translation. */
 export interface CaptionResult {
@@ -110,6 +115,13 @@ export function useGeminiLiveCapture(opts: {
     let startedAt = 0;
     let flushing = false;
 
+    // The en_th_corrections glossary maps English terms onto Thai ones, so
+    // it only makes sense on Thai output — applied while translating INTO
+    // English it would drop Thai words into an English sentence. The source
+    // side is never touched: "Kawin" is the correct English original.
+    const correctTarget = (text: string) =>
+      targetLang === 'th' ? applyEnThCorrections(text, glossaryRef.current) : text;
+
     const fail = (message: string) => {
       if (disposed) return;
       setState({ status: 'error', error: message });
@@ -139,7 +151,7 @@ export function useGeminiLiveCapture(opts: {
       if (quietTimer) clearTimeout(quietTimer);
       quietTimer = null;
       const sourceText = sourceBuf.trim();
-      const targetText = targetBuf.trim();
+      const targetText = correctTarget(targetBuf.trim());
       sourceBuf = '';
       targetBuf = '';
       // The caption is about to become a committed row, so the live
@@ -198,7 +210,9 @@ export function useGeminiLiveCapture(opts: {
         targetBuf += target;
         noteFragment();
       }
-      if (source || target) setPartial({ source: sourceBuf.trim(), target: targetBuf.trim() });
+      // Corrected here too, so the live subtitle doesn't show "Kawin" and
+      // then swap it for "กวิน" the moment the caption closes.
+      if (source || target) setPartial({ source: sourceBuf.trim(), target: correctTarget(targetBuf.trim()) });
     };
 
     const startAudio = async () => {

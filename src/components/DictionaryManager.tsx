@@ -14,13 +14,18 @@ import type { GlossarySection, GlossarySections } from '../glossary';
 
 // The glossary is persisted to localStorage per-browser via src/glossary.ts
 // — it is not shared across sessions or sent over any wire protocol. These
-// three sections are exactly what GlossarySections (src/glossary.ts) and the
-// Gemini prompt-building code understand; adding a fourth here would not
+// sections are exactly what GlossarySections (src/glossary.ts) and the
+// Gemini prompt-building code understand; adding another here would not
 // correspond to anything else in the pipeline.
 const SECTIONS: Array<{ key: GlossarySection; label: string; hint: string }> = [
   { key: 'protected_terms', label: 'ศัพท์เฉพาะ', hint: 'ไทย → อังกฤษ: คำที่ต้องคงคำแปลไว้เสมอ เช่น ความดันโลหิตสูง → hypertension' },
   { key: 'person_names', label: 'ชื่อบุคคล', hint: 'ไทย → อังกฤษ: ชื่อผู้พูดที่ถอดเสียงเป็นอังกฤษ เช่น นพ. สมชาย → Dr. Somchai' },
-  { key: 'thai_corrections', label: 'แก้คำไทยที่ฟังผิด', hint: 'ไทย → ไทย: แก้คำที่ระบบมักได้ยินผิด เช่น ยาพารา → ยาพาราเซตามอล' }
+  { key: 'thai_corrections', label: 'แก้คำไทยที่ฟังผิด', hint: 'ไทย → ไทย: แก้คำที่ระบบมักได้ยินผิด เช่น ยาพารา → ยาพาราเซตามอล' },
+  {
+    key: 'en_th_corrections',
+    label: 'แก้คำอังกฤษเป็นไทย',
+    hint: 'อังกฤษ → ไทย: แก้คำทับศัพท์ที่ค้างอยู่ในคำแปลไทย เช่น Kawin → กวิน (ใช้เมื่อแปลเป็นภาษาไทย และแทนที่ให้แน่นอนทุกครั้ง)'
+  }
 ];
 
 export interface DictionaryManagerProps {
@@ -102,7 +107,7 @@ export default function DictionaryManager({ sections, onAdd, onRemove, disabled 
       </div>
 
       {/* Section tabs */}
-      <div className="grid grid-cols-3 gap-1 p-1 bg-slate-50 border border-slate-200 rounded-lg text-[11px]">
+      <div className="grid grid-cols-2 gap-1 p-1 bg-slate-50 border border-slate-200 rounded-lg text-[11px]">
         {SECTIONS.map((s) => (
           <button
             key={s.key}
