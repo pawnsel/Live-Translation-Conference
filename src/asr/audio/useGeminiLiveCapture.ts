@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { FRAME_SAMPLES, SAMPLE_RATE, WORKLET_SRC } from './pcm';
-import { glossaryToVocabulary, type GlossarySections } from '../../glossary';
+import { glossaryToPairs, glossaryToVocabulary, type GlossarySections } from '../../glossary';
 
 /** One finished utterance: what was said, and its translation. */
 export interface CaptionResult {
@@ -284,7 +284,12 @@ export function useGeminiLiveCapture(opts: {
       // and customVocabulary are both setup-only there.
       ws?.send(
         JSON.stringify({
+          // Two different jobs: vocabulary sharpens what the recogniser
+          // hears, pairs pin how those terms get translated. The server
+          // turns the pairs into the instruction — the browser never sends
+          // prompt text of its own.
           customVocabulary: glossaryToVocabulary(glossaryRef.current),
+          glossaryPairs: glossaryToPairs(glossaryRef.current),
           targetLanguageCode: targetLang,
           sourceLanguageCodes: [BCP47[sourceLang] ?? sourceLang]
         })

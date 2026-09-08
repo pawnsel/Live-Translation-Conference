@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import {
   emptyGlossary,
   GLOSSARY_STORAGE_KEY,
+  glossaryToPairs,
   glossaryToVocabulary,
   loadGlossary,
   saveGlossary
@@ -106,5 +107,31 @@ describe('glossaryToVocabulary', () => {
 
   it('returns nothing for an empty glossary', () => {
     expect(glossaryToVocabulary(emptyGlossary())).toEqual([]);
+  });
+});
+
+describe('glossaryToPairs', () => {
+  it('pairs terms with the translation they must keep', () => {
+    expect(
+      glossaryToPairs({
+        protected_terms: { 'ธรรมาภิบาล': 'good governance' },
+        person_names: { 'สมชาย': 'Somchai' },
+        // Thai→Thai corrections steer the recogniser, not the translation.
+        thai_corrections: { 'ครับผม': 'ครับ' }
+      })
+    ).toEqual([
+      { term: 'ธรรมาภิบาล', translation: 'good governance' },
+      { term: 'สมชาย', translation: 'Somchai' }
+    ]);
+  });
+
+  it('skips entries missing either side', () => {
+    expect(
+      glossaryToPairs({
+        protected_terms: { 'ก': '', '  ': 'blank term' },
+        person_names: {},
+        thai_corrections: {}
+      })
+    ).toEqual([]);
   });
 });

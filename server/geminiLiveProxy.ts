@@ -25,6 +25,10 @@ const MAX_TERM_LENGTH = 100;
 // frame means this is a couple of seconds of speech, and the oldest frames
 // are the ones worth dropping.
 const MAX_PENDING_FRAMES = 150;
+// Glossary pairs become a system instruction. The client sends the pairs,
+// never the instruction text — that boundary is what stops a browser from
+// running arbitrary prompts on our billed key.
+const MAX_GLOSSARY_PAIRS = 200;
 
 export interface GeminiLiveProxyOptions {
   apiKey: string;
@@ -49,9 +53,26 @@ function sanitizeLangs(value: unknown, allowed: string[]): string[] {
   return value.filter((v): v is string => typeof v === 'string' && allowed.includes(v));
 }
 
-// The vocabulary is the one client-supplied part of the setup message, and
-// it reaches a billed API — so it is bounded and type-checked here rather
-// than trusted.
+// Client-supplied glossary text reaches a billed API, so it is bounded and
+// type-checked rather than trusted. Quotes and newlines are stripped so a
+// term cannot break out of the instruction template it is embedded in.
+function cleanTerm(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  return value.replace(/["\r\n]/g, ' ').trim().slice(0, MAX_TERM_LENGTH);
+}
+
+function buildGlossaryInstruction(value: unknown): string | null {
+  if (!Array.isArray(value)) return null;
+  const lines: string[] = [];
+  for (const pair of value.slice(0, MAX_GLOSSARY_PAIRS)) {
+    const term = cleanTerm((pair as { term?: unknown })?.term);
+    const translation = cleanTerm((pair as { translation?: unknown })?.translation);
+    if (term && translation) lines.push(`"${term}" must always be translated as "${translation}".`);
+  }
+  if (lines.length === 0) return null;
+  return `Glossary — use these exact translations, overriding your own wording:\n${lines.join('\n')}`;
+}
+
 function sanitizeVocabulary(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   const seen = new Set<string>();
@@ -77,6 +98,7 @@ export function registerGeminiLiveProxy(httpServer: HttpServer, opts: GeminiLive
     let setupSent = false;
     let configReceived = false;
     let vocabulary: string[] = [];
+    let glossaryInstruction: string | null = null;
     let targetLanguageCode = opts.targetLanguageCode;
     let sourceLanguageCodes = opts.sourceLanguageCodes;
     const pending: Buffer[] = [];
@@ -101,20 +123,22 @@ export function registerGeminiLiveProxy(httpServer: HttpServer, opts: GeminiLive
       // the API's discovery document, so only customVocabulary is used.
       if (vocabulary.length > 0) inputAudioTranscription.customVocabulary = vocabulary;
 
-      upstream.send(
-        JSON.stringify({
-          setup: {
-            model: `models/${opts.model}`,
-            generationConfig: {
-              responseModalities: ['TEXT'],
-              translationConfig: { targetLanguageCode }
-            },
-            // Without this, only the translation comes back; with it the
-            // original speech arrives too, as serverContent.inputTranscription.
-            inputAudioTranscription
-          }
-        })
-      );
+      const setup: Record<string, unknown> = {
+        model: `models/${opts.model}`,
+        generationConfig: {
+          responseModalities: ['TEXT'],
+          translationConfig: { targetLanguageCode }
+        },
+        // Without this, only the translation comes back; with it the
+        // original speech arrives too, as serverContent.inputTranscription.
+        inputAudioTranscription
+      };
+      // customVocabulary only biases what the recogniser hears; pinning how
+      // a term is TRANSLATED needs this instruction (verified: the live
+      // translate model honours it, unlike the transcribe-only model).
+      if (glossaryInstruction) setup.systemInstruction = { parts: [{ text: glossaryInstruction }] };
+
+      upstream.send(JSON.stringify({ setup }));
     };
 
     const glossaryTimer = setTimeout(sendSetup, GLOSSARY_WAIT_MS);
@@ -161,9 +185,14 @@ export function registerGeminiLiveProxy(httpServer: HttpServer, opts: GeminiLive
       if (!setupSent) {
         try {
           const parsed = JSON.parse(data.toString());
-          if (parsed?.customVocabulary !== undefined || parsed?.targetLanguageCode !== undefined) {
+          if (
+            parsed?.customVocabulary !== undefined ||
+            parsed?.targetLanguageCode !== undefined ||
+            parsed?.glossaryPairs !== undefined
+          ) {
             configReceived = true;
             vocabulary = sanitizeVocabulary(parsed.customVocabulary);
+            glossaryInstruction = buildGlossaryInstruction(parsed.glossaryPairs);
             const target = sanitizeLangs([parsed.targetLanguageCode], ALLOWED_TARGET_LANGS);
             if (target.length > 0) targetLanguageCode = target[0];
             const sources = sanitizeLangs(parsed.sourceLanguageCodes, ALLOWED_SOURCE_LANGS);

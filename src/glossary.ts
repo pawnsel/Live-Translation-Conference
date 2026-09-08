@@ -56,6 +56,33 @@ export function glossaryToVocabulary(sections: GlossarySections): string[] {
   return [...seen];
 }
 
+export interface GlossaryPair {
+  term: string;
+  translation: string;
+}
+
+// Term/translation pairs the model must honour when translating.
+// customVocabulary only affects what the recogniser HEARS — it cannot pin
+// how a term is rendered in the target language, which is the whole point
+// of the protected-terms and person-names sections. Those are sent as
+// structured pairs (never as prompt text: the server builds the
+// instruction, so a browser cannot smuggle arbitrary prompts onto the
+// billed key).
+export function glossaryToPairs(sections: GlossarySections): GlossaryPair[] {
+  const pairs: GlossaryPair[] = [];
+  const seen = new Set<string>();
+  for (const section of [sections.protected_terms ?? {}, sections.person_names ?? {}]) {
+    for (const [term, translation] of Object.entries(section)) {
+      const t = term.trim();
+      const v = translation.trim();
+      if (!t || !v || seen.has(t)) continue;
+      seen.add(t);
+      pairs.push({ term: t, translation: v });
+    }
+  }
+  return pairs;
+}
+
 export function saveGlossary(sections: GlossarySections): void {
   try {
     localStorage.setItem(GLOSSARY_STORAGE_KEY, JSON.stringify(sections));
