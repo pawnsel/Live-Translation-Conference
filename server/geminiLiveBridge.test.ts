@@ -111,3 +111,29 @@ describe('createLiveBridge', () => {
     expect(client.sent.length).toBe(before);
   });
 });
+
+describe('session resumption', () => {
+  it('asks for resumption and context compression in the first setup', () => {
+    const { client, upstreams } = makeBridge();
+    const up = upstreams[0];
+    up.readyState = OPEN;
+    up.emit('open');
+    client.emit('message', Buffer.from(JSON.stringify({ targetLanguageCode: 'en' })), false);
+
+    const setup = up.jsonSent().find((f) => f.setup)?.setup;
+    // No handle on a first connection — an empty object still opts into the
+    // sessionResumptionUpdate frames a later swap needs.
+    expect(setup.sessionResumption).toEqual({});
+    expect(setup.contextWindowCompression).toEqual({ slidingWindow: {} });
+  });
+
+  it('does not relay sessionResumptionUpdate or goAway to the client', () => {
+    const { client, upstreams } = makeBridge();
+    const up = upstreams[0];
+    completeSetup(up);
+    const before = client.sent.length;
+    up.emit('message', Buffer.from(JSON.stringify({ sessionResumptionUpdate: { newHandle: 'h1', resumable: true } })), false);
+    up.emit('message', Buffer.from(JSON.stringify({ goAway: { timeLeft: '60s' } })), false);
+    expect(client.sent.length).toBe(before);
+  });
+});

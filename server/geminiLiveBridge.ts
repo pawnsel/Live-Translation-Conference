@@ -96,6 +96,7 @@ export function createLiveBridge(client: SocketLike, opts: BridgeOptions): void 
   let glossaryInstruction: string | null = null;
   let targetLanguageCode = opts.targetLanguageCode;
   let sourceLanguageCodes = opts.sourceLanguageCodes;
+  let resumeHandle: string | null = null;
   const pending: Buffer[] = [];
 
   const closeBoth = (code?: number, reason?: string) => {
@@ -108,11 +109,9 @@ export function createLiveBridge(client: SocketLike, opts: BridgeOptions): void 
     }
   };
 
-  const sendSetup = () => {
-    if (setupSent || upstream.readyState !== OPEN) return;
-    setupSent = true;
-    clearTimeout(glossaryTimer);
-
+  // Built here rather than from the client's config frame, which is long
+  // gone by the time a swap (Task A3) needs to open a replacement session.
+  const buildSetup = (handle: string | null): Record<string, unknown> => {
     const inputAudioTranscription: Record<string, unknown> = { languageCodes: sourceLanguageCodes };
     // adaptationPhrases would do the same job but is marked deprecated in
     // the API's discovery document, so only customVocabulary is used.
@@ -120,20 +119,25 @@ export function createLiveBridge(client: SocketLike, opts: BridgeOptions): void 
 
     const setup: Record<string, unknown> = {
       model: `models/${opts.model}`,
-      generationConfig: {
-        responseModalities: ['TEXT'],
-        translationConfig: { targetLanguageCode }
-      },
-      // Without this, only the translation comes back; with it the
-      // original speech arrives too, as serverContent.inputTranscription.
-      inputAudioTranscription
+      generationConfig: { responseModalities: ['TEXT'], translationConfig: { targetLanguageCode } },
+      inputAudioTranscription,
+      // An empty object still opts into the sessionResumptionUpdate frames;
+      // a handle is only present when replacing an expiring session.
+      sessionResumption: handle ? { handle } : {},
+      // Left at the API's own defaults rather than invented token counts —
+      // without it a long meeting's session can die of context overflow well
+      // before the connection cap, making seams more frequent than necessary.
+      contextWindowCompression: { slidingWindow: {} }
     };
-    // customVocabulary only biases what the recogniser hears; pinning how
-    // a term is TRANSLATED needs this instruction (verified: the live
-    // translate model honours it, unlike the transcribe-only model).
     if (glossaryInstruction) setup.systemInstruction = { parts: [{ text: glossaryInstruction }] };
+    return setup;
+  };
 
-    upstream.send(JSON.stringify({ setup }));
+  const sendSetup = () => {
+    if (setupSent || upstream.readyState !== OPEN) return;
+    setupSent = true;
+    clearTimeout(glossaryTimer);
+    upstream.send(JSON.stringify({ setup: buildSetup(resumeHandle) }));
   };
 
   const glossaryTimer = setTimeout(sendSetup, GLOSSARY_WAIT_MS);
@@ -158,6 +162,16 @@ export function createLiveBridge(client: SocketLike, opts: BridgeOptions): void 
       upstreamReady = true;
       for (const queued of pending.splice(0)) upstream.send(queued);
     }
+
+    // Both are the proxy's business, not the browser's: relaying goAway would
+    // invite the client to react to something being handled here already.
+    if (parsed?.sessionResumptionUpdate) {
+      const update = parsed.sessionResumptionUpdate;
+      // A handle the server has declared unusable must never be offered back.
+      resumeHandle = update.resumable === false ? null : (update.newHandle ?? resumeHandle);
+      return;
+    }
+    if (parsed?.goAway) return;
 
     // This model speaks its translation as well as writing it, so most
     // frames are base64 PCM in modelTurn.parts[].inlineData — tens of KB
