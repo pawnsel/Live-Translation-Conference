@@ -42,8 +42,10 @@ import { loadGlossary, saveGlossary, type GlossarySection, type GlossarySections
 import type { DisplayConfig, Project, ProjectSession } from '../types';
 
 // Bounded wait for a summary before giving up and showing the "AI summary
-// failed" state — keeps a stuck call from spinning forever.
-const REPORT_WAIT_TIMEOUT_MS = 20000;
+// failed" state. A two-hour transcript is summarised chunk by chunk on the
+// server, so this must stay comfortably above the server's own job budget
+// (SUMMARIZE_TIMEOUT_MS, 150s) or the client abandons work about to succeed.
+const REPORT_WAIT_TIMEOUT_MS = 180000;
 
 // There is no sign-in yet; the header shows a placeholder until accounts and
 // the profile page land, and everything reads this one constant.
@@ -111,6 +113,9 @@ export default function Admin() {
   // itself is read from the live project record, so a summary that arrives
   // while the popup is open fills itself in.
   const [summarySessionId, setSummarySessionId] = useState<string | null>(null);
+  // Epoch ms when the current summarize request started, null when idle — lets
+  // the popup show elapsed time instead of a static spinner.
+  const [summarizingSince, setSummarizingSince] = useState<number | null>(null);
   const [showAllHistory, setShowAllHistory] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
   const [finishedProject, setFinishedProject] = useState<Project | null>(null);
@@ -218,6 +223,7 @@ export default function Admin() {
     if (projects.summarizingIds.has(session.asrSessionId)) return;
 
     setSummarySessionId(session.id);
+    setSummarizingSince(Date.now());
     projects.markSessionSummarizing(session.asrSessionId);
     const items = transcripts.map((c) => ({ source_text: c.sourceText, target_text: c.targetText }));
     try {
@@ -233,6 +239,8 @@ export default function Admin() {
       // An AI failure never loses the transcript — the session keeps it, and
       // the operator can ask again.
       projects.saveSessionSummary(session.asrSessionId, '', items.length);
+    } finally {
+      setSummarizingSince(null);
     }
   };
 
@@ -400,6 +408,7 @@ export default function Admin() {
           project={projects.currentProject}
           session={summarySession}
           isSummarizing={projects.summarizingIds.has(summarySession.asrSessionId)}
+          summarizingSince={summarizingSince}
           onSummarize={summarizeSession}
           onClose={() => setSummarySessionId(null)}
         />

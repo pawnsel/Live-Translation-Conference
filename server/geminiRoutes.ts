@@ -10,10 +10,13 @@ export interface GeminiRouteDeps {
 // Deadlines so a hung Gemini SDK call can't hold a request open indefinitely
 // — a hang (not an error) would otherwise stall the caller forever with no
 // visible failure.
-const SUMMARIZE_TIMEOUT_MS = 20000;
+// The whole map-reduce job, not one model call — each individual call has its
+// own SUMMARY_CALL_TIMEOUT_MS inside summarizeTranscript.
+const SUMMARIZE_TIMEOUT_MS = 150000;
 
 // Caps the summarize payload so one request can't build an unbounded prompt.
-const MAX_SUMMARIZE_ITEMS = 2000;
+// Sized for a ~3 hour meeting; the prompt itself is bounded by chunking.
+const MAX_SUMMARIZE_ITEMS = 6000;
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([

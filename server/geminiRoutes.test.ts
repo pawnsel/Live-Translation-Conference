@@ -7,10 +7,11 @@ import type { GenerateContentClient } from './gemini';
 
 async function withServer(
   deps: { client: GenerateContentClient; summaryModel: string },
-  run: (baseUrl: string) => Promise<void>
+  run: (baseUrl: string) => Promise<void>,
+  bodyLimit = '100kb'
 ) {
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ limit: bodyLimit }));
   registerGeminiRoutes(app, deps);
   const server = createServer(app);
   await new Promise<void>((resolve) => server.listen(0, resolve));
@@ -64,5 +65,26 @@ describe('POST /api/gemini/summarize', () => {
       expect(body.summary).toBe('');
       expect(body.items).toBe(2);
     });
+  });
+
+  it('accepts a transcript far larger than the old two-thousand item cap', async () => {
+    const client = fakeClient('ok');
+    const items = Array.from({ length: 5000 }, (_, i) => ({ source_text: `s${i}`, target_text: `t${i}` }));
+    await withServer(
+      { client, summaryModel: 'm' },
+      async (baseUrl) => {
+        const res = await fetch(`${baseUrl}/api/gemini/summarize`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items })
+        });
+        const body = await res.json();
+        expect(res.status).toBe(200);
+        expect(body.items).toBe(5000);
+      },
+      // Production mounts express.json({ limit: "5mb" }) in server.ts, so this
+      // only lifts the test harness to match — no production change is needed.
+      '5mb'
+    );
   });
 });

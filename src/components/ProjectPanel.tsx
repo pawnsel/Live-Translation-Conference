@@ -552,18 +552,31 @@ export function SessionSummaryModal({
   project,
   session,
   isSummarizing,
+  summarizingSince,
   onSummarize,
   onClose
 }: {
   project: Project;
   session: ProjectSession;
   isSummarizing: boolean;
+  summarizingSince?: number | null;
   onSummarize: (session: ProjectSession) => void;
   onClose: () => void;
 }) {
   const hasSummary = Boolean(session.summary);
   const summaryAttempted = session.summary !== undefined;
   const itemCount = session.transcripts?.length ?? session.reportItemCount ?? 0;
+
+  // A one-to-two minute wait with a static spinner reads as a hang. No
+  // progress protocol exists — elapsed time is the honest thing to show.
+  const [elapsedSec, setElapsedSec] = useState(0);
+  useEffect(() => {
+    if (!isSummarizing || !summarizingSince) return;
+    const tick = () => setElapsedSec(Math.floor((Date.now() - summarizingSince) / 1000));
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [isSummarizing, summarizingSince]);
 
   const download = () => {
     if (!session.summary) return;
@@ -609,7 +622,10 @@ export function SessionSummaryModal({
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#DE5C8E] opacity-75" />
                 <span className="relative inline-flex rounded-full h-2 w-2 bg-[#DE5C8E]" />
               </span>
-              <span>กำลังสรุปผลการประชุมด้วย AI… หน้าต่างนี้จะแสดงผลเมื่อเสร็จ</span>
+              <span>
+                กำลังสรุปผลการประชุมด้วย AI… ({elapsedSec} วินาที) — การประชุมยาวอาจใช้เวลาถึง 2-3 นาที
+                หน้าต่างนี้จะแสดงผลเมื่อเสร็จ
+              </span>
             </p>
           ) : !summaryAttempted ? (
             <p className="text-xs text-slate-400 leading-relaxed">
