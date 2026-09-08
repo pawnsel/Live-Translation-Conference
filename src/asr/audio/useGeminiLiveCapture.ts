@@ -114,6 +114,12 @@ export function useGeminiLiveCapture(opts: {
     let targetBuf = '';
     let startedAt = 0;
     let flushing = false;
+    // Defense in depth: the proxy is supposed to relay setupComplete only
+    // once per bridge lifetime (server/geminiLiveBridge.ts), but this flag
+    // means a stray duplicate can never build a second mic/AudioContext
+    // pipeline on top of one already running — startAudio() has no way to
+    // tell "already have a pipeline" from "starting fresh" on its own.
+    let audioPipelineActive = false;
 
     // The en_th_corrections glossary maps English terms onto Thai ones, so
     // it only makes sense on Thai output — applied while translating INTO
@@ -140,6 +146,7 @@ export function useGeminiLiveCapture(opts: {
       stream = null;
       void ctx?.close().catch(() => {});
       ctx = null;
+      audioPipelineActive = false;
       if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) ws.close();
       ws = null;
     };
@@ -195,9 +202,18 @@ export function useGeminiLiveCapture(opts: {
       }
       if (data.setupComplete) {
         // A session that got this far is healthy, so the next unexpected
-        // drop gets a full retry budget again.
+        // drop gets a full retry budget again. This reset is unconditional —
+        // it is about connection health, not about the audio pipeline below.
         retriesRef.current = 0;
-        void startAudio();
+        // Guard only the pipeline build: a socket that has already started
+        // audio must not start a second mic/AudioContext on a repeat
+        // setupComplete (the proxy is supposed to send only one per bridge
+        // lifetime, but this is what makes that a suppressed no-op here
+        // rather than a duplicated pipeline if it ever slips through).
+        if (!audioPipelineActive) {
+          audioPipelineActive = true;
+          void startAudio();
+        }
         return;
       }
       const source = data.serverContent?.inputTranscription?.text;

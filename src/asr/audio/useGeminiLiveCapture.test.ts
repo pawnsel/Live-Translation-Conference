@@ -188,8 +188,37 @@ describe('useGeminiLiveCapture reconnect loop', () => {
       await settle();
     }
 
-    // Every generation but the one currently listening must be torn down.
-    expect(tracks.filter((t) => !t.stopped).length).toBeLessThanOrEqual(1);
-    expect(contexts.filter((c) => !c.closed).length).toBeLessThanOrEqual(1);
+    // The loop's final iteration also drops, so a correct hook leaves nothing
+    // running — not "at most one".
+    expect(tracks.filter((t) => !t.stopped).length).toBe(0);
+    expect(contexts.filter((c) => !c.closed).length).toBe(0);
+  });
+
+  it('does not build a second pipeline for a repeat setupComplete on the same socket', async () => {
+    // The proxy swaps its own Gemini upstream in place (server/geminiLiveBridge.ts)
+    // without dropping the browser socket — no drop() here, unlike every other
+    // test in this file — so this is the one case that actually exercises the
+    // browser receiving setupComplete twice on a socket that never closed.
+    renderCapture();
+    await settle();
+
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => {
+      socket.setupComplete();
+    });
+    await settle();
+
+    expect(tracks.length).toBe(1);
+    expect(contexts.length).toBe(1);
+
+    await act(async () => {
+      socket.setupComplete();
+    });
+    await settle();
+
+    expect(tracks.length).toBe(1);
+    expect(contexts.length).toBe(1);
+    expect(tracks.filter((t) => !t.stopped).length).toBe(1);
+    expect(contexts.filter((c) => !c.closed).length).toBe(1);
   });
 });

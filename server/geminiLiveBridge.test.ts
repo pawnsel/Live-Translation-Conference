@@ -208,6 +208,24 @@ describe('upstream swap', () => {
     expect(client.closed).not.toBeNull();
   });
 
+  it('relays setupComplete to the client only once across a goAway-driven swap', () => {
+    // The browser has no notion of an upstream swap (§3.2 of the design):
+    // relaying a second setupComplete would tell it to rebuild its whole
+    // mic/AudioContext pipeline while the first one is still running.
+    const { client, upstreams } = makeBridge();
+    completeSetup(upstreams[0]);
+    const setupCompleteFramesAfterFirst = client
+      .jsonSent()
+      .filter((f) => f.setupComplete !== undefined).length;
+    expect(setupCompleteFramesAfterFirst).toBe(1);
+
+    upstreams[0].emit('message', Buffer.from(JSON.stringify({ goAway: { timeLeft: '60s' } })), false);
+    completeSetup(upstreams[1]);
+
+    const setupCompleteFramesTotal = client.jsonSent().filter((f) => f.setupComplete !== undefined).length;
+    expect(setupCompleteFramesTotal).toBe(1);
+  });
+
   it('resets the swap budget after a replacement completes setup', () => {
     const { client, upstreams } = makeBridge();
     completeSetup(upstreams[0]);

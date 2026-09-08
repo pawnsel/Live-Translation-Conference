@@ -87,4 +87,40 @@ describe('POST /api/gemini/summarize', () => {
       '5mb'
     );
   });
+
+  it('accepts exactly the 6000-item cap', async () => {
+    const client = fakeClient('ok');
+    const items = Array.from({ length: 6000 }, (_, i) => ({ source_text: `s${i}`, target_text: `t${i}` }));
+    await withServer(
+      { client, summaryModel: 'm' },
+      async (baseUrl) => {
+        const res = await fetch(`${baseUrl}/api/gemini/summarize`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items })
+        });
+        const body = await res.json();
+        expect(res.status).toBe(200);
+        expect(body.items).toBe(6000);
+      },
+      '5mb'
+    );
+  });
+
+  it('rejects one item past the cap', async () => {
+    const client = fakeClient('ok');
+    const items = Array.from({ length: 6001 }, (_, i) => ({ source_text: `s${i}`, target_text: `t${i}` }));
+    await withServer(
+      { client, summaryModel: 'm' },
+      async (baseUrl) => {
+        const res = await fetch(`${baseUrl}/api/gemini/summarize`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items })
+        });
+        expect(res.status).toBe(400);
+      },
+      '5mb'
+    );
+  });
 });

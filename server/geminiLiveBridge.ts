@@ -109,6 +109,14 @@ export function createLiveBridge(client: SocketLike, opts: BridgeOptions): void 
   let resumeHandle: string | null = null;
   let swapsSinceSetup = 0;
   let clientGone = false;
+  // The browser's own pipeline treats setupComplete as "start recording now";
+  // it has no notion of an upstream swap, since the whole point of the swap
+  // (§3.2 of the design) is that the browser is never touched. upstreamReady
+  // must still flip false on every swap — that is what routes audio into
+  // `pending` during the gap — but the client must hear about setup only the
+  // first time, or it would rebuild its mic/AudioContext pipeline on every
+  // swap while the previous one keeps running underneath it.
+  let setupCompleteRelayedToClient = false;
   const pending: Buffer[] = [];
 
   const closeBoth = (code?: number, reason?: string) => {
@@ -189,6 +197,14 @@ export function createLiveBridge(client: SocketLike, opts: BridgeOptions): void 
         upstreamReady = true;
         swapsSinceSetup = 0;
         for (const queued of pending.splice(0)) upstream.send(queued);
+        // Only the bridge's very first setupComplete is the browser's
+        // business — every one after a swap is relayed nowhere, the same
+        // treatment sessionResumptionUpdate and goAway get below.
+        if (!setupCompleteRelayedToClient) {
+          setupCompleteRelayedToClient = true;
+          if (client.readyState === OPEN) client.send(data, { binary: isBinary });
+        }
+        return;
       }
 
       // Both are the proxy's business, not the browser's: relaying goAway would
