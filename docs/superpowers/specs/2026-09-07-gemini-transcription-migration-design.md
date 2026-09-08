@@ -1,9 +1,8 @@
 # Gemini-only transcription/translation/summarization migration — design
 
 > Status: approved by user, 2026-09-07. Supersedes the `thai-realtime-asr-mt`
-> backend integration described in
-> [`2026-09-03-asr-backend-integration-design.md`](2026-09-03-asr-backend-integration-design.md)
-> and [`SYSTEM_OVERVIEW.md`](../../../SYSTEM_OVERVIEW.md) §1–§2.2/§2.7.
+> backend integration, whose design and plan documents were removed once
+> that backend was gone (they remain in git history before this commit).
 
 ## 1. Goal
 
