@@ -6,6 +6,7 @@ import {
   glossaryToVocabulary,
   type GlossarySections
 } from '../../glossary';
+import { reconnectDelayMs } from './reconnectPolicy';
 
 /** One finished utterance: what was said, and its translation. */
 export interface CaptionResult {
@@ -41,12 +42,11 @@ const MAX_CAPTION_CHARS = 600;
 // silence recovers it, an explicit audioStreamEnd does not.
 const FLUSH_SILENCE_MS = 1500;
 const FLUSH_TAIL_WAIT_MS = 2500;
-// A live session does not last forever — Gemini ends it on its own (hence
-// the sessionResumptionUpdate frames it sends), and a conference outlives
-// that easily. Dropping the operator into an error state mid-meeting is not
-// an option, so an unexpected close reconnects instead.
-const RECONNECT_DELAY_MS = 800;
-const MAX_RECONNECTS = 5;
+// A live session does not last forever — Gemini ends it on its own, and a
+// conference outlives that easily. The proxy now swaps its own upstream
+// (server/geminiLiveBridge.ts), so reaching this path means something else
+// broke: the network, or the proxy itself. It retries for as long as the
+// session is active, with backoff — see reconnectPolicy.ts.
 
 const BCP47: Record<string, string> = { th: 'th-TH', en: 'en-US' };
 
@@ -326,14 +326,10 @@ export function useGeminiLiveCapture(opts: {
       // Whatever was mid-sentence still belongs to the transcript — commit
       // it before the reconnect wipes this session's buffers.
       emit();
-      if (retriesRef.current >= MAX_RECONNECTS) {
-        fail('เชื่อมต่อบริการแปลภาษาไม่ได้ — กรุณาเริ่ม Session ใหม่ (live translation connection lost)');
-        return;
-      }
       retriesRef.current += 1;
       teardown();
       setState({ status: 'starting', error: null });
-      reconnectTimer = setTimeout(() => setReconnectNonce((n) => n + 1), RECONNECT_DELAY_MS);
+      reconnectTimer = setTimeout(() => setReconnectNonce((n) => n + 1), reconnectDelayMs(retriesRef.current));
     };
 
     flushImplRef.current = async () => {
