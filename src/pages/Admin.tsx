@@ -751,7 +751,7 @@ export default function Admin() {
                     value={editDraft}
                     onChange={(e) => setEditDraft(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && saveEdit()}
-                    className="w-full p-3 text-lg font-bold text-slate-900 text-center border border-slate-300 rounded-lg outline-none focus:border-[#DE5C8E]"
+                    className="w-full p-3 text-lg font-bold text-black text-center border border-slate-300 rounded-lg outline-none focus:border-[#DE5C8E]"
                   />
                   <div className="flex items-center justify-center gap-2 pt-1">
                     <button
@@ -784,9 +784,7 @@ export default function Admin() {
                     <SubtitleText
                       text={boxTargetText}
                       maxLines={2}
-                      className={`${boxTextSizeClass(config.fontSize)} font-bold leading-snug tracking-tight transition-colors ${
-                        hasPartial ? 'text-slate-400' : 'text-slate-900'
-                      }`}
+                      className={`${boxTextSizeClass(config.fontSize)} font-bold leading-snug tracking-tight text-black`}
                     />
                   ) : (
                     <p className={`${boxTextSizeClass(config.fontSize)} font-normal text-slate-300`}>กำลังแปล…</p>
@@ -974,7 +972,7 @@ export default function Admin() {
                         {/* A div rather than a p: an open editor is a block
                             element and cannot legally nest inside a paragraph. */}
                         <div
-                          className={`${textSizeClass(config.fontSize)} font-bold text-slate-900 leading-relaxed tracking-tight`}
+                          className={`${textSizeClass(config.fontSize)} font-bold text-black leading-relaxed tracking-tight`}
                         >
                           {paragraph.items.map((item) => {
                             // Editing the latest caption happens in the box
@@ -1004,7 +1002,7 @@ export default function Admin() {
                                       value={editDraft}
                                       onChange={(e) => setEditDraft(e.target.value)}
                                       onKeyDown={(e) => e.key === 'Enter' && saveEdit()}
-                                      className="w-full p-2.5 text-xs bg-white border border-slate-300 rounded-lg font-bold text-slate-900 outline-none focus:border-[#DE5C8E]"
+                                      className="w-full p-2.5 text-xs bg-white border border-slate-300 rounded-lg font-bold text-black outline-none focus:border-[#DE5C8E]"
                                     />
                                   </div>
                                   <div className="flex items-center justify-end gap-2 pt-1">
