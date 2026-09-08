@@ -1,9 +1,12 @@
 # Long-session resilience — design
 
-> Status: approved by user, 2026-09-08. Target: a single session must survive
-> a half-day conference (~2 hours of continuous speech, with headroom to ~3)
-> without losing audio, without losing its summary, and without losing
-> recorded transcripts silently.
+> Status: approved by user, 2026-09-08. Target: a single session must **keep
+> recording** through a half-day conference (~2 hours of continuous speech,
+> with headroom to ~3) without an operator having to restart it, must still
+> produce a summary at the end, and must never lose recorded transcripts
+> silently. A gap of a few seconds where the session is handed over is
+> explicitly acceptable; continuity of the *recording*, not of the *audio*,
+> is what this document is about.
 >
 > Note: §2 of `2026-09-07-gemini-transcription-migration-design.md` chose
 > chunked `generateContent` calls over the Live API. The implementation went
@@ -16,7 +19,8 @@
 All three were found by reading the shipped code, not by measurement in a
 real 2-hour meeting. Each cites the file that establishes it.
 
-**P1 — every Gemini session drop costs 1.5–2.5 seconds of speech.**
+**P1 — a session can end permanently, mid-conference, after ~5 seconds of
+trouble; and every routine seam costs 1.5–2.5 seconds of speech.**
 Gemini's Live API caps a connection at 10 minutes by default and sends
 `goAway` 60 seconds before it closes it. `sendSetup()`
 (`server/geminiLiveProxy.ts`) sends neither `sessionResumption` nor
@@ -29,9 +33,12 @@ new socket, waiting for Gemini's `setupComplete`, and only then re-running
 `audioWorklet.addModule`. Nothing is recording during any of that. At a
 10-minute cadence a 2-hour meeting takes this hit roughly 12 times.
 
-The reconnect *count* is not itself a limit: `MAX_RECONNECTS` is 5, but
-`retriesRef.current = 0` on every `setupComplete`, so 5 means "5 consecutive
-failures", not 5 per session. That part already works and is not changed here.
+Across an untroubled meeting the reconnect *count* is not a limit:
+`MAX_RECONNECTS` is 5, but `retriesRef.current = 0` on every `setupComplete`,
+so 5 means "5 consecutive failures", not 5 per session. The danger is how
+quickly those five are spent — `RECONNECT_DELAY_MS` is a flat 800 ms, so a
+Gemini blip of roughly five seconds exhausts the budget and ends the session
+for good, requiring the operator to notice and press start again. See §3.1.
 
 **P2 — a 2-hour transcript cannot be summarised.**
 `SUMMARIZE_TIMEOUT_MS` (server) and `REPORT_WAIT_TIMEOUT_MS` (client) are both
@@ -62,37 +69,64 @@ the localStorage adapter behind it is throwaway.
 - No virtualised history list. ~200–1500 captions render acceptably; if that
   proves wrong it is a separate, measurable change.
 - No multi-tab or server-side session sharing. Sessions remain per-tab.
+- No zero-gap handover. A seam of a few seconds is acceptable (§3.1), so the
+  complexity that would remove the last fraction of a second is not bought.
 
 ## 3. Session continuity
 
-### 3.1 Approach
+### 3.1 What is actually being fixed
 
-Three approaches were considered.
+The requirement is **continuous recording for ~2 hours**, not a seamless
+one. A few seconds lost at each 10-minute seam is explicitly acceptable
+(user, 2026-09-08). That rules out the obvious-looking goal — a zero-gap
+handover — as over-engineering, and moves the target to the things that can
+actually end a meeting early.
 
-**A — the proxy reconnects to Gemini behind the browser's back. Chosen.**
+Today's client-side reconnect already survives an unbounded number of seams,
+so the gap length is not the defect. Three things are:
+
+- **The retry budget is exhaustible in about five seconds.** `MAX_RECONNECTS`
+  is 5 consecutive failures and `RECONNECT_DELAY_MS` is a flat 800 ms, so a
+  Gemini blip lasting a few seconds burns the whole budget and the session
+  dies permanently, mid-conference, needing a manual restart. This is the
+  single largest threat to a 2-hour meeting.
+- **Sessions can die earlier than the 10-minute cap** if the context window
+  overflows, making seams more frequent than necessary.
+- **The reconnect loop has never been exercised more than once in a test.**
+  Reading it found no defect; that is not the same as knowing it survives a
+  dozen cycles without leaking an `AudioContext` or a microphone track.
+
+### 3.2 Approach
+
+**A — the proxy swaps its own Gemini connection, sequentially. Chosen.**
 The proxy owns the Gemini connection lifecycle. The browser↔proxy WebSocket
 stays open for the whole meeting, so the mic, `AudioContext`, worklet and
-React effect are never touched. Because `goAway` arrives 60 seconds early,
-the replacement upstream can be opened, set up and proven healthy *while the
-old one is still carrying audio* — a make-before-break handover with no gap
-at all, rather than a faster recovery from a gap.
+React effect are never touched — which is what makes a seam ~0.3 s (open a
+socket, complete setup) rather than ~2 s (all of that *plus* `getUserMedia`,
+a new `AudioContext` and a worklet reload). Frames arriving during the swap
+land in the `pending` queue the proxy already keeps for the initial
+handshake, so a swap that completes inside `MAX_PENDING_FRAMES` (150 frames,
+~3 s of audio) loses nothing at all.
 
-**B — the browser reconnects, with the proxy relaying the resumption handle.**
-Rejected. It still tears down the browser socket, and with the current hook
-that still tears down the mic, so it needs the audio effect split from the
-socket effect *as well as* a make-before-break handover in the browser — more
-work than A for a worse result. It also puts a token that can resume a billed
-session into the browser.
+**B — make-before-break: open the replacement while the old one still runs.**
+Rejected as over-engineering. `goAway`'s 60-second warning makes it possible,
+and it would close the remaining ~0.3 s gap, but it costs two concurrent
+upstreams, a drain window, and the only path in the system where two sessions
+emit text at once — real complexity, running against a preview model whose
+`goAway` timing is not guaranteed, to buy something the requirement says is
+not needed.
 
-**C — enable `contextWindowCompression` and nothing else.**
-Rejected as insufficient. The 10-minute cap is a connection limit; the
-documented way past it is reconnecting with session resumption. Compression
-addresses context overflow, which is a different (and additional) failure.
+**C — leave reconnection in the browser and only add backoff.**
+Rejected, though it is close. It is the least work and fixes the largest
+threat, but it keeps tearing the microphone down every ten minutes for two
+hours — 12 `getUserMedia` calls, 12 `AudioContext` lifecycles — which is both
+the longer gap and the larger unknown. A is not much more work, since the
+proxy must be touched for `sessionResumption` regardless.
 
-Compression is still enabled alongside A, since a session that overflows its
-context would otherwise die early, before `goAway` is even due.
+`contextWindowCompression` is enabled under any of these; it is a few lines
+and prevents seams from arriving more often than the connection cap requires.
 
-### 3.2 Protocol fields
+### 3.3 Protocol fields
 
 Verified against the Live API WebSockets reference
 (<https://ai.google.dev/api/live>) and the session-management guide
@@ -106,70 +140,80 @@ Verified against the Live API WebSockets reference
 | ← server | `goAway` | `{ timeLeft: Duration }` |
 
 Handles remain valid for 2 hours after the session they came from ends, which
-comfortably covers a 60-second handover.
+comfortably covers any swap this design performs.
 
 `contextWindowCompression` is sent as `{ slidingWindow: {} }` — the API's own
 defaults, rather than invented token counts. Tuning it is a follow-up with a
 real measurement behind it, not part of this work.
 
-### 3.3 Proxy state model
+### 3.4 Proxy connection swap
 
-`registerGeminiLiveProxy` currently holds one `upstream` per client. It
-becomes: one **active** upstream, plus zero-or-one **warming** upstream
-during a handover.
+`registerGeminiLiveProxy` keeps exactly one upstream per client, as it does
+today. What changes is that the upstream can be *replaced* without the client
+socket closing.
 
-Per client connection:
+Per client connection, added state:
 
-- `active: WebSocket | null` — receives audio, its output is relayed.
-- `warming: WebSocket | null` — set up but not yet carrying audio.
-- `resumeHandle: string | null` — latest `newHandle` seen.
-- `draining: WebSocket | null` — the former active, still relayed, not fed.
+- `resumeHandle: string | null` — the latest `newHandle` seen.
+- `swapping: boolean` — a replacement is being opened.
 
-Transitions:
+Behaviour:
 
-1. **Steady state.** Client audio → `active`. `active` output → client.
-   Every `sessionResumptionUpdate` stores `newHandle`; `resumable: false`
-   clears `resumeHandle` to null, because a handle that the server has
-   declared unusable must not be offered back to it.
-2. **`goAway` received on `active`.** Open `warming` and send it the same
-   setup as `active` had — same model, language pair, vocabulary and glossary
-   instruction — plus `sessionResumption: { handle: resumeHandle }` when a
-   handle exists. Audio keeps flowing to `active` unchanged.
-3. **`warming` reaches `setupComplete`.** Promote: `draining = active`,
-   `active = warming`, `warming = null`. Audio now flows to the new upstream.
-4. **Drain.** `draining` is no longer fed but its output is still relayed for
-   `UPSTREAM_DRAIN_MS` (2000 ms), then it is closed. This lets the old
-   session finish transcribing the last audio it was given.
-5. **`warming` fails or `active` closes first.** Close both and fall through
-   to today's behaviour: the client socket closes and the browser reconnects
-   on its own. This is strictly no worse than the current code.
+1. **Steady state.** Client audio → upstream. Upstream output → client. Every
+   `sessionResumptionUpdate` stores `newHandle`; `resumable: false` clears
+   `resumeHandle` to null, because a handle the server has declared unusable
+   must not be offered back to it.
+2. **`goAway` arrives.** Set `swapping`, close the current upstream, and open
+   a replacement with `sessionResumption: { handle: resumeHandle }` when a
+   handle exists. Closing first rather than last is what keeps this simple:
+   there is never more than one upstream, so there is no window in which two
+   sessions could emit text for the same audio.
+3. **During the swap.** `upstreamReady` is false, so client audio takes the
+   path that already exists for the initial handshake: it queues in `pending`
+   (bounded by `MAX_PENDING_FRAMES`, ~3 s of audio, oldest dropped first) and
+   is flushed when the replacement reports `setupComplete`. A swap that
+   completes inside that window therefore loses no audio at all.
+4. **Unexpected upstream close (no `goAway`).** Treated the same way — one
+   replacement attempt with the handle. Gemini does not always get to send
+   `goAway`, and a silent drop should not be worse than an announced one.
+5. **The replacement fails to open or set up.** Fall through to today's
+   behaviour: `closeBoth()`, the client socket closes, and the browser
+   reconnects on its own with the backoff from §3.5. Strictly no worse than
+   what ships now.
+
+To avoid an infinite loop against a persistently failing upstream, the proxy
+attempts at most `MAX_UPSTREAM_SWAPS_IN_A_ROW` (3) replacements without an
+intervening `setupComplete`, then gives up to the client. A successful
+`setupComplete` resets that counter — the same shape as the client's existing
+retry accounting.
 
 `goAway` and `sessionResumptionUpdate` are consumed by the proxy and **not**
-relayed — the browser has no use for either, and relaying `goAway` would
-invite the client to react to something the proxy is already handling.
+relayed: the browser has no use for either, and relaying `goAway` would invite
+the client to react to something the proxy is already handling.
 
-No duplicate captions can arise: a given stretch of audio is sent to exactly
-one upstream, so exactly one upstream transcribes it. The drain window
-overlaps two upstreams' *output* but never their *input*.
+The setup payload must be built once and reused rather than rebuilt from the
+client's config frame, which is long gone by the time a swap happens. Extract
+the body of `sendSetup()` into a `buildSetup({ resumeHandle })` helper that
+both the first connection and every swap call.
 
-The setup payload must therefore be built once and reused, not rebuilt from
-the client's config frame — extract the body of `sendSetup()` into a
-`buildSetup({ resumeHandle })` helper that both the first connection and
-every handover call.
+### 3.5 Client changes
 
-### 3.4 Client changes
+The hook keeps its reconnect path as the fallback for genuine network loss
+and proxy restarts; the proxy swap simply means it is no longer the normal
+case. One real defect there is fixed:
 
-Deliberately minimal. The hook keeps its existing reconnect path as the
-fallback for genuine network loss; it simply stops being the normal case.
-The one change worth making is honesty in the status line: `capture.status
-=== 'starting'` currently renders "กำลังเริ่ม…" whether this is the first
-start or a mid-meeting recovery. Since recoveries should now be rare and mean
-something has actually gone wrong, `GeminiCaptureState['status']` gains a
-`'reconnecting'` case, set by the `ws.onclose` recovery path instead of
-`'starting'`. `Admin` renders it as "กำลังเชื่อมต่อใหม่…", and every existing
-comparison against `'starting'` — including the Session button's `disabled`
-condition — must be reviewed to decide whether it means "not yet running" (add
-`'reconnecting'`) or "first start only" (leave alone).
+`MAX_RECONNECTS` (5) counts consecutive failures and `RECONNECT_DELAY_MS` is
+a flat 800 ms, so roughly five seconds of upstream trouble ends the session
+permanently. Since the operator decides when a session is over, the client
+retries **for as long as the session is active**, with exponential backoff —
+800 ms doubling to a ceiling of 10 s — instead of a hard cap. The existing
+reset on `setupComplete` stays: a healthy session returns the delay to
+800 ms.
+
+The failure mode this removes (a permanent error banner mid-conference) is
+replaced by one that is recoverable without operator action. The status line
+is unchanged: it already shows "กำลังเริ่ม…" while a reconnect is in flight,
+which remains accurate.
 
 ## 4. Summarising long transcripts
 
@@ -270,17 +314,26 @@ Following the repo's existing vitest setup; no new test infrastructure.
 the module must take its upstream factory as an injectable option, defaulting
 to the real `WebSocket`. Cases:
 
-- `goAway` opens a second upstream and audio keeps going to the first until
-  the second reports `setupComplete`.
-- After promotion, audio goes only to the new upstream, and the old one's
-  output is still relayed until the drain window closes.
-- `sessionResumptionUpdate` stores `newHandle`; a later handover sends it in
+- `goAway` closes the upstream and opens a replacement, while the client
+  socket stays open throughout.
+- Audio sent during the swap is queued and flushed to the replacement once it
+  reports `setupComplete` — nothing is dropped inside the buffer's capacity.
+- `sessionResumptionUpdate` stores `newHandle`; the next swap sends it as
   `sessionResumption.handle`.
-- `resumable: false` clears the handle, and the next handover opens a fresh
-  session instead of offering a rejected one.
-- A warming upstream that errors leaves the active one untouched.
-- The active upstream closing with no handover in flight still closes the
-  client, as today.
+- `resumable: false` clears the handle, and the next swap opens a fresh
+  session rather than offering a handle the server rejected.
+- An unexpected upstream close with no `goAway` also triggers one replacement.
+- After `MAX_UPSTREAM_SWAPS_IN_A_ROW` failures with no `setupComplete`
+  between them, the client socket is closed; one success in between resets
+  the counter.
+
+**Capture hook (`src/asr/audio/useGeminiLiveCapture.test.ts`, new).** The
+reconnect loop has never been exercised repeatedly. With a fake WebSocket and
+stubbed media APIs: consecutive drops back off 800 ms → 1.6 s → 3.2 s up to
+the 10 s ceiling and never stop while the session is active; a `setupComplete`
+returns the delay to 800 ms; twelve drop/recover cycles leave no microphone
+track running and no `AudioContext` unclosed, and caption `seq` keeps
+increasing across all of them.
 
 **Summary (`server/gemini.test.ts`, extended).** Chunking splits on the
 character budget and never mid-line; a caption larger than the budget becomes
@@ -297,13 +350,22 @@ throws yields `'unavailable'`; a successful write yields `{ ok: true }`.
 
 ## 7. Risks
 
-- **The handover is the riskiest change.** It runs rarely (once per 10
+- **The proxy swap is the riskiest change.** It runs rarely (once per ten
   minutes), in production, against a preview model
   (`gemini-3.5-live-translate-preview`) whose `goAway` timing is not
-  guaranteed. Every failure path is specified to fall back to today's
-  client-side reconnect, so the worst case is the behaviour that ships now.
-- **`goAway` may not arrive** before some closes. That path is unchanged from
-  today and still works.
+  guaranteed. Every failure path falls back to today's client-side reconnect,
+  so the worst case is the behaviour that ships now.
+- **Unbounded client retries trade one failure mode for another.** A session
+  that can no longer reach Gemini at all now retries quietly every 10 s
+  instead of showing a permanent error. The status line says "กำลังเริ่ม…"
+  throughout, which does not distinguish "reconnecting" from "wedged". If
+  operators find that confusing in practice, surfacing the retry count is the
+  follow-up — it was cut from this round deliberately.
+- **Resumption carries context that a translator does not need.** Resuming
+  keeps the model's accumulated history rather than starting clean; that is
+  what `contextWindowCompression` bounds. If resumed sessions ever behave
+  worse than fresh ones, dropping the handle is a one-line change, since every
+  swap already handles the no-handle case.
 - **Map-reduce changes summary character**, not just its reliability: a
   summary of summaries reads differently from a summary of a transcript. This
   is accepted; the alternative was no summary at all.
