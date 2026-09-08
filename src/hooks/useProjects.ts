@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Project, ProjectBill, ProjectSession, TranscriptItem } from '../types';
-
-const STORAGE_KEY = 'ai_translate_projects';
-const SELECTED_KEY = 'ai_translate_selected_project';
+import {
+  localStorageProjectStore,
+  type PersistFailureReason,
+  type ProjectStore
+} from '../storage/projectStore';
 
 // Placeholder rate until real usage-based billing lands (see SYSTEM_OVERVIEW.md §4).
 const ESTIMATED_COST_PER_WORD = 0.002;
@@ -17,26 +19,6 @@ export function projectExpiresAt(project: Project): number {
 
 export function projectDaysLeft(project: Project): number {
   return Math.max(0, Math.ceil((projectExpiresAt(project) - Date.now()) / (24 * 60 * 60 * 1000)));
-}
-
-function loadProjects(): Project[] {
-  try {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    const parsed: Project[] = stored ? JSON.parse(stored) : [];
-    // Projects saved before per-project transcripts or ASR sessions existed
-    // have neither field yet.
-    return parsed.map((p) => ({ ...p, transcripts: p.transcripts || [], asrSessionId: p.asrSessionId ?? null }));
-  } catch {
-    return [];
-  }
-}
-
-function loadSelectedId(): string | null {
-  try {
-    return localStorage.getItem(SELECTED_KEY);
-  } catch {
-    return null;
-  }
 }
 
 function countWords(transcripts: TranscriptItem[]): number {
@@ -59,27 +41,31 @@ function buildBill(project: Project, transcripts: TranscriptItem[], now: number)
   return { closedSessions, bill };
 }
 
-export function useProjects() {
-  const [projects, setProjects] = useState<Project[]>(() => loadProjects());
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(() => loadSelectedId());
+export function useProjects(store: ProjectStore = localStorageProjectStore) {
+  const [projects, setProjects] = useState<Project[]>(() => store.loadProjects());
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(() => store.loadSelectedId());
   const [summarizingIds, setSummarizingIds] = useState<Set<string>>(() => new Set());
+  // A write that fails is the operator's problem, not something to hide: with
+  // no signal here a full quota looks exactly like a working recording.
+  const [persistError, setPersistError] = useState<{
+    reason: PersistFailureReason;
+    message: string;
+    at: number;
+  } | null>(null);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(projects));
-    } catch {
-      // ignore quota errors
-    }
-  }, [projects]);
+    const result = store.saveProjects(projects);
+    // Narrows on `'reason' in result` rather than `result.ok`: this repo's
+    // tsconfig has no strictNullChecks, and without it TS won't narrow a
+    // discriminated union across a boolean literal tag, only a property
+    // presence check.
+    setPersistError('reason' in result ? { reason: result.reason, message: result.message, at: Date.now() } : null);
+  }, [projects, store]);
 
   useEffect(() => {
-    try {
-      if (selectedProjectId) localStorage.setItem(SELECTED_KEY, selectedProjectId);
-      else localStorage.removeItem(SELECTED_KEY);
-    } catch {
-      // ignore quota errors
-    }
-  }, [selectedProjectId]);
+    const result = store.saveSelectedId(selectedProjectId);
+    if ('reason' in result) setPersistError({ reason: result.reason, message: result.message, at: Date.now() });
+  }, [selectedProjectId, store]);
 
   // A project must be finished within 7 days; past that the system closes it
   // and bills it from whatever it recorded, rather than letting it run forever.
@@ -290,6 +276,7 @@ export function useProjects() {
     saveSessionSummary,
     markSessionSummarizing,
     summarizingIds,
+    persistError,
     finishProject
   };
 }

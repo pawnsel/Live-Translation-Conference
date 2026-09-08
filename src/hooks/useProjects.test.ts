@@ -260,3 +260,50 @@ describe('useProjects — localStorage migration', () => {
     expect(loaded!.asrSessionId).toBeNull();
   });
 });
+
+describe('persistence failures', () => {
+  function failingStore(fail: { value: boolean }) {
+    return {
+      loadProjects: () => [],
+      saveProjects: () =>
+        fail.value ? ({ ok: false, reason: 'quota', message: 'full' } as const) : ({ ok: true } as const),
+      loadSelectedId: () => null,
+      saveSelectedId: () => ({ ok: true } as const)
+    };
+  }
+
+  it('exposes a failed write instead of swallowing it', () => {
+    const fail = { value: true };
+    // Hoisted so the store keeps one identity across re-renders. The store
+    // is in the persistence effects' deps (as it must be — it's used inside
+    // them); constructing a new store literal inside the renderHook callback
+    // would give it a fresh identity every re-render, retriggering the write
+    // on every render regardless of whether `projects` changed, which loops
+    // forever while the write keeps failing.
+    const store = failingStore(fail);
+    const { result } = renderHook(() => useProjects(store));
+
+    act(() => {
+      result.current.createProject('งานประชุม');
+    });
+
+    expect(result.current.persistError).toMatchObject({ reason: 'quota' });
+  });
+
+  it('clears the error once a write succeeds again', () => {
+    const fail = { value: true };
+    const store = failingStore(fail);
+    const { result } = renderHook(() => useProjects(store));
+
+    act(() => {
+      result.current.createProject('งานประชุม');
+    });
+    expect(result.current.persistError).not.toBeNull();
+
+    fail.value = false;
+    act(() => {
+      result.current.createProject('อีกงาน');
+    });
+    expect(result.current.persistError).toBeNull();
+  });
+});
