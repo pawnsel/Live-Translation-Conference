@@ -36,6 +36,26 @@ export function loadGlossary(): GlossarySections {
   }
 }
 
+// Terms to bias the live API's speech recogniser toward
+// (AudioTranscriptionConfig.customVocabulary). Only the SOURCE-language
+// side of each entry is useful here: the recogniser is listening to Thai,
+// so it needs the Thai term, not its translation. For thai_corrections
+// that means the value (the corrected form), since the key is the
+// mis-hearing we want to stop getting.
+export function glossaryToVocabulary(sections: GlossarySections): string[] {
+  const terms = [
+    ...Object.keys(sections.protected_terms ?? {}),
+    ...Object.keys(sections.person_names ?? {}),
+    ...Object.values(sections.thai_corrections ?? {})
+  ];
+  const seen = new Set<string>();
+  for (const term of terms) {
+    const trimmed = term.trim();
+    if (trimmed) seen.add(trimmed);
+  }
+  return [...seen];
+}
+
 export function saveGlossary(sections: GlossarySections): void {
   try {
     localStorage.setItem(GLOSSARY_STORAGE_KEY, JSON.stringify(sections));

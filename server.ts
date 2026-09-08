@@ -6,6 +6,7 @@ import { createServer } from "http";
 import { GoogleGenAI } from "@google/genai";
 import { registerGeminiRoutes } from "./server/geminiRoutes";
 import type { GenerateContentClient } from "./server/gemini";
+import { registerGeminiLiveProxy } from "./server/geminiLiveProxy";
 
 async function startServer() {
   const app = express();
@@ -26,8 +27,18 @@ async function startServer() {
     };
     registerGeminiRoutes(app, {
       client,
-      model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
-      summaryModel: process.env.GEMINI_SUMMARY_MODEL || process.env.GEMINI_MODEL || "gemini-2.5-flash",
+      summaryModel: process.env.GEMINI_SUMMARY_MODEL || process.env.GEMINI_MODEL || "gemini-3.6-flash",
+    });
+    // Live captions for the console — see server/geminiLiveProxy.ts.
+    registerGeminiLiveProxy(httpServer, {
+      apiKey,
+      // gemini-3.5-transcribe-live only transcribes and ignores any
+      // instruction to translate; this model does both, returning the
+      // translation as outputTranscription and the source speech as
+      // inputTranscription.
+      model: process.env.GEMINI_LIVE_MODEL || "gemini-3.5-live-translate-preview",
+      targetLanguageCode: process.env.GEMINI_LIVE_TARGET_LANG || "en",
+      sourceLanguageCodes: (process.env.GEMINI_LIVE_SOURCE_LANGS || "th-TH").split(","),
     });
   } else {
     // No key configured — fail loudly and specifically rather than letting
@@ -35,7 +46,6 @@ async function startServer() {
     const unconfigured = (_req: express.Request, res: express.Response) => {
       res.status(503).json({ error: "GEMINI_API_KEY is not configured on the server" });
     };
-    app.post("/api/gemini/transcribe", unconfigured);
     app.post("/api/gemini/summarize", unconfigured);
   }
 

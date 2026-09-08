@@ -62,6 +62,7 @@ function buildBill(project: Project, transcripts: TranscriptItem[], now: number)
 export function useProjects() {
   const [projects, setProjects] = useState<Project[]>(() => loadProjects());
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(() => loadSelectedId());
+  const [summarizingIds, setSummarizingIds] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
     try {
@@ -206,6 +207,12 @@ export function useProjects() {
   // No P2 database exists yet, so this is the "mock" persistence: the same
   // localStorage record every other project field already rides on.
   const saveSessionSummary = useCallback((asrSessionId: string, summary: string, reportItemCount: number) => {
+    setSummarizingIds((prev) => {
+      if (!prev.has(asrSessionId)) return prev;
+      const next = new Set(prev);
+      next.delete(asrSessionId);
+      return next;
+    });
     setProjects((prev) =>
       prev.map((p) => {
         const idx = p.sessions.findIndex((s) => s.asrSessionId === asrSessionId);
@@ -215,6 +222,15 @@ export function useProjects() {
         return { ...p, sessions };
       })
     );
+  }, []);
+
+  // Summarising runs in the background after a session ends, so the history
+  // view needs to tell "still working on it" apart from "no summary".
+  // Deliberately NOT persisted: a reload kills the in-flight request, and a
+  // flag stored in localStorage would leave that session showing a spinner
+  // forever.
+  const markSessionSummarizing = useCallback((asrSessionId: string) => {
+    setSummarizingIds((prev) => new Set(prev).add(asrSessionId));
   }, []);
 
   const finishProject = (transcripts: TranscriptItem[]): Project | undefined => {
@@ -252,6 +268,8 @@ export function useProjects() {
     endSession,
     saveTranscripts,
     saveSessionSummary,
+    markSessionSummarizing,
+    summarizingIds,
     finishProject
   };
 }

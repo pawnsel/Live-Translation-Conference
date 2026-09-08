@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it } from 'vitest';
-import { emptyGlossary, GLOSSARY_STORAGE_KEY, loadGlossary, saveGlossary } from './glossary';
+import {
+  emptyGlossary,
+  GLOSSARY_STORAGE_KEY,
+  glossaryToVocabulary,
+  loadGlossary,
+  saveGlossary
+} from './glossary';
 
 class FakeStorage implements Storage {
   private store = new Map<string, string>();
@@ -74,5 +80,31 @@ describe('loadGlossary', () => {
       })
     );
     expect(loadGlossary()).toEqual(emptyGlossary());
+  });
+});
+
+describe('glossaryToVocabulary', () => {
+  it('takes the source-language side of every section', () => {
+    const vocab = glossaryToVocabulary({
+      protected_terms: { 'ธรรมาภิบาล': 'governance' },
+      person_names: { 'สมชาย': 'Somchai' },
+      // The key is the mis-hearing to avoid; the value is the correct Thai
+      // form the recogniser should be biased toward.
+      thai_corrections: { 'ครับผม': 'ครับ' }
+    });
+    expect(vocab).toEqual(['ธรรมาภิบาล', 'สมชาย', 'ครับ']);
+  });
+
+  it('drops blanks and duplicates', () => {
+    const vocab = glossaryToVocabulary({
+      protected_terms: { 'ประชุม': 'meeting', '   ': 'blank' },
+      person_names: { ' ประชุม ': 'dupe after trim' },
+      thai_corrections: {}
+    });
+    expect(vocab).toEqual(['ประชุม']);
+  });
+
+  it('returns nothing for an empty glossary', () => {
+    expect(glossaryToVocabulary(emptyGlossary())).toEqual([]);
   });
 });

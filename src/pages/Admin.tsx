@@ -12,7 +12,6 @@ import {
   Zap,
   Activity,
   Edit2,
-  Radio,
   Menu,
   ShieldAlert,
   FileText,
@@ -29,7 +28,7 @@ import {
 import { BillModal, HistoryPanel, ProjectHeaderBar, ProjectPicker, SessionHistoryModal } from '../components/ProjectPanel';
 import DictionaryManager from '../components/DictionaryManager';
 import { captionsReducer, initialCaptionState, selectCaptions, type Caption } from '../asr/captions';
-import { useGeminiCapture, type CaptionResult } from '../asr/audio/useGeminiCapture';
+import { useGeminiLiveCapture, type CaptionResult } from '../asr/audio/useGeminiLiveCapture';
 import { useProjects } from '../hooks/useProjects';
 import { loadGlossary, saveGlossary, type GlossarySection, type GlossarySections } from '../glossary';
 import type { DisplayConfig, Project } from '../types';
@@ -48,6 +47,8 @@ const other = (lang: string) => (lang === 'th' ? 'en' : 'th');
 interface ReportResult {
   summary: string;
   items: number;
+  /** Gemini is still working on it — the session has already ended. */
+  pending?: boolean;
 }
 
 function formatSrtTime(ms: number): string {
@@ -98,6 +99,7 @@ export default function Admin() {
   const [paused, setPaused] = useState(false);
   const [glossary, setGlossary] = useState<GlossarySections>(() => loadGlossary());
   const [report, setReport] = useState<ReportResult | null>(null);
+  const reportOwnerRef = useRef<string | null>(null);
   const [pingMs, setPingMs] = useState<number | null>(null);
 
   const [config, setConfig] = useState<DisplayConfig>({ fontSize: 'large', showOriginal: false, showLatency: false });
@@ -137,24 +139,12 @@ export default function Admin() {
     });
   }, []);
 
-  // Last 1-2 captions, handed to each new chunk as coherence context so a
-  // chunk boundary landing mid-sentence doesn't translate in a vacuum.
-  const contextText = useMemo(
-    () =>
-      allCaptions
-        .slice(-2)
-        .map((c) => `${c.sourceText} => ${c.targetText}`)
-        .join(' / '),
-    [allCaptions]
-  );
-
-  const capture = useGeminiCapture({
+  const capture = useGeminiLiveCapture({
     active: micActive,
     paused,
     sourceLang,
     targetLang,
     glossary,
-    context: contextText,
     onResult: handleCaptureResult
   });
 
@@ -198,42 +188,60 @@ export default function Admin() {
     dispatchCaption({ kind: 'reset' });
     setHiddenSeqs(new Set());
     setReport(null);
+    // The previous session's summary may still be in flight; it no longer
+    // owns this panel.
+    reportOwnerRef.current = null;
     projects.attachAsrSession(id, sourceLang, targetLang);
     setMicActive(true);
   };
 
-  // Ending the session flushes whatever audio is still buffered (so the
-  // last few words of a sentence aren't lost), then asks Gemini for a
-  // summary of the whole transcript before letting go of the session id.
+  // Ending the session flushes whatever audio is still buffered (so the last
+  // few words of a sentence aren't lost), then hands the transcript to Gemini
+  // for a summary — in the background. The operator gets the console back
+  // immediately; the summary lands in the report panel and the session
+  // history when it is ready.
+  const summarizeInBackground = async (asrSessionId: string, items: { source_text: string; target_text: string }[]) => {
+    // The panel belongs to whichever session ended most recently. A summary
+    // that resolves after the operator has already started the next session
+    // must still be SAVED, but must not pop up over the new session's panel.
+    const showIfStillOwner = (result: ReportResult) => {
+      if (reportOwnerRef.current === asrSessionId) setReport(result);
+    };
+    try {
+      const res = await fetch('/api/gemini/summarize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items }),
+        signal: AbortSignal.timeout(REPORT_WAIT_TIMEOUT_MS)
+      });
+      const data = (await res.json()) as { summary?: string; items?: number };
+      const summary = data.summary ?? '';
+      const itemCount = data.items ?? items.length;
+      showIfStillOwner({ summary, items: itemCount });
+      projects.saveSessionSummary(asrSessionId, summary, itemCount);
+    } catch {
+      // An AI failure never loses the transcript, it just ships without a
+      // summary.
+      showIfStillOwner({ summary: '', items: items.length });
+      projects.saveSessionSummary(asrSessionId, '', items.length);
+    }
+  };
+
   const stopSessionAndMic = async (): Promise<CaptionResult | null> => {
-    // Disable the "End Session" button immediately, before the await below
-    // — otherwise it stays clickable for the ~1-2s the final chunk's Gemini
-    // call takes, and a second click fires a duplicate summarize POST and a
-    // duplicate saveSessionSummary.
+    // Disable the "End Session" button immediately, before the await below —
+    // otherwise a second click fires a duplicate flush and summarize.
     setEndingSession(true);
     const flushed = await capture.flush();
     setMicActive(false);
     if (sessionId) {
       const items = allCaptions.map((c) => ({ source_text: c.sourceText, target_text: c.targetText }));
       if (flushed) items.push({ source_text: flushed.sourceText, target_text: flushed.targetText });
-      try {
-        const res = await fetch('/api/gemini/summarize', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ items }),
-          signal: AbortSignal.timeout(REPORT_WAIT_TIMEOUT_MS)
-        });
-        const data = (await res.json()) as { summary?: string; items?: number };
-        const summary = data.summary ?? '';
-        const itemCount = data.items ?? items.length;
-        setReport({ summary, items: itemCount });
-        projects.saveSessionSummary(sessionId, summary, itemCount);
-      } catch {
-        // Same fallback contract as the old backend: an AI failure never
-        // loses the transcript, it just ships without a summary.
-        setReport({ summary: '', items: items.length });
-        projects.saveSessionSummary(sessionId, '', items.length);
-      }
+      reportOwnerRef.current = sessionId;
+      setReport({ summary: '', items: items.length, pending: true });
+      projects.markSessionSummarizing(sessionId);
+      // Deliberately not awaited — this is what keeps ending a session
+      // instant instead of blocking on a call that can take 20 seconds.
+      void summarizeInBackground(sessionId, items);
     }
     setEndingSession(false);
     setSessionId(null);
@@ -376,8 +384,12 @@ export default function Admin() {
   // like a YouTube subtitle, so an operator can crop just this box in OBS
   // for streaming.
   const latestCaption = captions.length > 0 ? captions[captions.length - 1] : null;
-  const boxSourceText = latestCaption?.sourceText || '';
-  const boxTargetText = latestCaption?.targetText ?? '';
+  // While a sentence is still being spoken the model is already streaming
+  // its translation, so the box shows that in-progress text (faded) and
+  // swaps to the committed caption once the sentence closes.
+  const hasPartial = !!(capture.partialSource || capture.partialTarget);
+  const boxSourceText = capture.partialSource || latestCaption?.sourceText || '';
+  const boxTargetText = capture.partialTarget || latestCaption?.targetText || '';
   const isEditingBox = editingSeq !== null && editingSeq === latestCaption?.seq;
 
   // ── No project selected: the picker is the whole screen, as it always was ──
@@ -402,7 +414,11 @@ export default function Admin() {
       {showHistory && <HistoryPanel projects={projects.endedProjects} onClose={() => setShowHistory(false)} />}
       {finishedProject && <BillModal project={finishedProject} onClose={() => setFinishedProject(null)} />}
       {showSessionHistory && (
-        <SessionHistoryModal project={projects.currentProject} onClose={() => setShowSessionHistory(false)} />
+        <SessionHistoryModal
+          project={projects.currentProject}
+          summarizingIds={projects.summarizingIds}
+          onClose={() => setShowSessionHistory(false)}
+        />
       )}
 
       {/* ─────────────────────────────────────────────────────────────
@@ -473,12 +489,10 @@ export default function Admin() {
             )}
           </div>
 
+          {/* Latency lives in the subtitle box (config.showLatency); only
+              Ping is unique to this bar. */}
           <div className="hidden md:flex items-center gap-2 bg-slate-100 px-3 py-1.5 rounded-full text-[11px] font-mono border border-slate-200">
-            <Zap className={`w-3.5 h-3.5 ${isSessionActive ? 'text-amber-500' : 'text-slate-400'}`} />
-            <span className="text-slate-500">Latency:</span>
-            <span className="font-semibold text-slate-800">{captions.at(-1)?.latencyMs ? `${captions.at(-1)!.latencyMs}ms` : '--'}</span>
-            <span className="text-slate-300">|</span>
-            <Activity className="w-3.5 h-3.5 text-emerald-600" />
+            <Activity className={`w-3.5 h-3.5 ${isSessionActive ? 'text-emerald-600' : 'text-slate-400'}`} />
             <span className="text-slate-500">Ping:</span>
             <span className="font-semibold text-slate-800">{pingMs !== null ? `${pingMs}ms` : '--'}</span>
           </div>
@@ -505,7 +519,7 @@ export default function Admin() {
               {capture.status === 'starting'
                 ? 'กำลังเริ่ม…'
                 : endingSession
-                ? 'กำลังสรุปผลการประชุม…'
+                ? 'กำลังปิด Session…'
                 : isSessionActive
                 ? 'จบ Session'
                 : 'เริ่ม Session'}
@@ -531,13 +545,6 @@ export default function Admin() {
           <ClipboardList className="w-4 h-4" />
         </button>
       </div>
-
-      {capture.lastChunkError && (
-        <div className="px-4 py-2 bg-amber-50 border-b border-amber-200 text-amber-800 text-xs flex items-center gap-2 shrink-0">
-          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-          <span>{capture.lastChunkError}</span>
-        </div>
-      )}
 
       {/* ─────────────────────────────────────────────────────────────
           MAIN WORKSPACE LAYOUT
@@ -672,24 +679,7 @@ export default function Admin() {
         ────────────────────────────────────────────────────────────── */}
         <main className="flex-1 flex flex-col bg-slate-50 min-w-0">
           <div className="px-4 py-2.5 bg-white border-b border-slate-200 flex items-center justify-between gap-3 shrink-0">
-            <div className="flex items-center gap-2 text-xs text-slate-600">
-              <Radio className={`w-4 h-4 ${isListening ? 'text-emerald-500 animate-pulse' : 'text-slate-400'}`} />
-              <div className="flex items-center gap-1.5 bg-slate-100 px-2.5 py-1 rounded-lg border border-slate-200">
-                <span className="font-bold text-slate-800">
-                  {LANGS[sourceLang]} ➔ {LANGS[targetLang]}
-                </span>
-                <button
-                  onClick={handleSwapLanguages}
-                  className="p-1 hover:bg-white rounded-md text-slate-500 hover:text-[#DE5C8E] transition-all"
-                  title="สลับภาษาผู้พูดและภาษาแปล"
-                >
-                  <ArrowLeftRight className="w-3.5 h-3.5" />
-                </button>
-              </div>
-              <span className="text-slate-400 font-medium hidden sm:inline">({captions.length} รายการ)</span>
-            </div>
-
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 ml-auto">
               <button
                 onClick={() => exportTranscript('txt')}
                 disabled={captions.length === 0}
@@ -749,7 +739,11 @@ export default function Admin() {
                   <span className="font-bold text-emerald-800 shrink-0">กำลังฟัง:</span>
                 </div>
                 <div className="flex-1 truncate font-mono text-xs text-emerald-800 font-medium">
-                  <span className="text-emerald-600/80 italic">กำลังรอเสียงพูด... (พูดใส่ไมโครโฟนได้ทันที)</span>
+                  {capture.partialSource ? (
+                    <span>{capture.partialSource}</span>
+                  ) : (
+                    <span className="text-emerald-600/80 italic">กำลังรอเสียงพูด... (พูดใส่ไมโครโฟนได้ทันที)</span>
+                  )}
                 </div>
               </div>
             </div>
@@ -760,7 +754,7 @@ export default function Admin() {
           ────────────────────────────────────────────────────────────── */}
           <div className="flex-1 flex flex-col items-center justify-center p-4 sm:p-8 min-h-0">
             <div className="relative w-full max-w-4xl bg-white rounded-2xl border border-slate-200 shadow-sm px-6 py-10 sm:px-12 sm:py-14 text-center">
-              {latestCaption && !isEditingBox && (
+              {latestCaption && !isEditingBox && !hasPartial && (
                 <div className="absolute top-3 right-3 flex items-center gap-1">
                   <button
                     onClick={() => handleCopyItem(latestCaption)}
@@ -779,7 +773,7 @@ export default function Admin() {
                 </div>
               )}
 
-              {!latestCaption ? (
+              {!latestCaption && !hasPartial ? (
                 <div className="flex flex-col items-center gap-3 text-slate-400">
                   <div className="w-14 h-14 rounded-2xl bg-slate-50 border border-slate-200 flex items-center justify-center text-[#DE5C8E]">
                     <Mic className="w-7 h-7" />
@@ -822,11 +816,17 @@ export default function Admin() {
                 </div>
               ) : (
                 <>
-                  {config.showOriginal && boxSourceText && <p className="text-slate-400 text-base sm:text-lg mb-3">{boxSourceText}</p>}
-                  <p className={`${boxTextSizeClass(config.fontSize)} font-bold text-slate-900 leading-snug tracking-tight`}>
+                  {config.showOriginal && boxSourceText && (
+                    <p className={`text-base sm:text-lg mb-3 ${hasPartial ? 'text-slate-300' : 'text-slate-400'}`}>{boxSourceText}</p>
+                  )}
+                  <p
+                    className={`${boxTextSizeClass(config.fontSize)} font-bold leading-snug tracking-tight transition-colors ${
+                      hasPartial ? 'text-slate-400' : 'text-slate-900'
+                    }`}
+                  >
                     {boxTargetText || <span className="text-slate-300 font-normal text-2xl sm:text-3xl">กำลังแปล…</span>}
                   </p>
-                  {config.showLatency && latestCaption?.latencyMs ? (
+                  {config.showLatency && !hasPartial && latestCaption?.latencyMs ? (
                     <span className="mt-3 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 font-mono text-[10px] text-slate-500 border border-slate-200">
                       <Zap className="w-3 h-3 text-amber-500" />
                       <span>{latestCaption.latencyMs}ms</span>
@@ -972,7 +972,15 @@ export default function Admin() {
                 <ClipboardList className="w-3.5 h-3.5 text-[#DE5C8E]" />
                 <span>สรุปช่วงการประชุม</span>
               </h2>
-              {report.summary ? (
+              {report.pending ? (
+                <p className="text-xs text-slate-500 flex items-center gap-1.5">
+                  <span className="relative flex h-2 w-2">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#DE5C8E] opacity-75" />
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-[#DE5C8E]" />
+                  </span>
+                  <span>กำลังสรุปผลการประชุม… ({report.items} ข้อความ) — ใช้งานต่อได้เลย ไม่ต้องรอ</span>
+                </p>
+              ) : report.summary ? (
                 <p className="text-xs text-slate-600 whitespace-pre-wrap leading-relaxed">{report.summary}</p>
               ) : (
                 // The transcript is preserved even when the summarize call

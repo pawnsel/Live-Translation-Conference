@@ -409,7 +409,17 @@ export function HistoryPanel({ projects, onClose }: { projects: Project[]; onClo
 //    this reads straight off the same localStorage record everything else
 //    in `Project` already lives in, which is the "mock" the feature asked
 //    for; the shape carries over unchanged once a real backend lands. ──────
-export function SessionHistoryModal({ project, onClose }: { project: Project; onClose: () => void }) {
+export function SessionHistoryModal({
+  project,
+  summarizingIds,
+  onClose
+}: {
+  project: Project;
+  // ASR session ids whose summary is still being generated in the
+  // background (see useProjects.markSessionSummarizing).
+  summarizingIds: Set<string>;
+  onClose: () => void;
+}) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   // Most recent recording first — that's the one an operator just finished
   // and is most likely to be looking for.
@@ -438,6 +448,7 @@ export function SessionHistoryModal({ project, onClose }: { project: Project; on
               const isOpen = expandedId === s.id;
               const isLive = !s.endedAt;
               const duration = s.endedAt ? formatDuration(s.endedAt - s.startedAt) : null;
+              const isSummarizing = summarizingIds.has(s.asrSessionId);
               const hasSummary = Boolean(s.summary);
               // `summary === undefined` (no report.done ever arrived — the
               // session predates this feature, or ended before one came in)
@@ -460,16 +471,22 @@ export function SessionHistoryModal({ project, onClose }: { project: Project; on
                             กำลังดำเนินการ
                           </span>
                         )}
-                        {reportAttempted && (
-                          <span
-                            className={`px-1.5 py-0.5 rounded-md text-[10px] font-semibold border ${
-                              hasSummary
-                                ? 'bg-slate-100 text-slate-600 border-slate-200'
-                                : 'bg-amber-50 text-amber-700 border-amber-200'
-                            }`}
-                          >
-                            {hasSummary ? 'มีสรุป' : 'สรุป AI ไม่สำเร็จ'}
+                        {isSummarizing ? (
+                          <span className="px-1.5 py-0.5 rounded-md text-[10px] font-semibold border bg-pink-50 text-[#DE5C8E] border-pink-200">
+                            กำลังสรุป…
                           </span>
+                        ) : (
+                          reportAttempted && (
+                            <span
+                              className={`px-1.5 py-0.5 rounded-md text-[10px] font-semibold border ${
+                                hasSummary
+                                  ? 'bg-slate-100 text-slate-600 border-slate-200'
+                                  : 'bg-amber-50 text-amber-700 border-amber-200'
+                              }`}
+                            >
+                              {hasSummary ? 'มีสรุป' : 'สรุป AI ไม่สำเร็จ'}
+                            </span>
+                          )
                         )}
                       </div>
                       <div className="text-[11px] text-slate-400">
@@ -486,7 +503,15 @@ export function SessionHistoryModal({ project, onClose }: { project: Project; on
 
                   {isOpen && (
                     <div className="p-3 border-t border-slate-200 space-y-2">
-                      {!reportAttempted ? (
+                      {isSummarizing ? (
+                        <p className="text-xs text-slate-500 flex items-center gap-1.5">
+                          <span className="relative flex h-2 w-2 shrink-0">
+                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#DE5C8E] opacity-75" />
+                            <span className="relative inline-flex rounded-full h-2 w-2 bg-[#DE5C8E]" />
+                          </span>
+                          <span>กำลังสรุปผลการประชุมด้วย AI… เปิดดูใหม่อีกครั้งเมื่อเสร็จแล้ว</span>
+                        </p>
+                      ) : !reportAttempted ? (
                         <p className="text-xs text-slate-400">
                           ยังไม่มีรายงานสำหรับ session นี้ — อาจยังไม่จบ หรือไม่มีคำพูดถูกบันทึกไว้ระหว่างนั้น
                         </p>
