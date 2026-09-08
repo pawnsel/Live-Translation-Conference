@@ -5,9 +5,8 @@ import {
   type PersistFailureReason,
   type ProjectStore
 } from '../storage/projectStore';
-
-// Placeholder rate until real usage-based billing lands (see SYSTEM_OVERVIEW.md §4).
-const ESTIMATED_COST_PER_WORD = 0.002;
+import { ceilCents } from '../billing/geminiCost';
+import { projectCost, projectTranscripts, type LiveBuffer } from '../billing/projectCost';
 
 export const MAX_ACTIVE_PROJECTS = 3;
 export const PROJECT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -21,24 +20,40 @@ export function projectDaysLeft(project: Project): number {
   return Math.max(0, Math.ceil((projectExpiresAt(project) - Date.now()) / (24 * 60 * 60 * 1000)));
 }
 
-function countWords(transcripts: TranscriptItem[]): number {
+/** Words are no longer what a project is priced on — Gemini bills audio
+ *  minutes and tokens — but the bill still reports a word count, and the
+ *  meaning of "word" has to stay the same wherever it is shown. */
+export function countWords(transcripts: TranscriptItem[]): number {
   return transcripts.reduce((total, t) => {
     const text = `${t.sourceText} ${t.targetText}`.trim();
     return total + (text ? text.split(/\s+/).length : 0);
   }, 0);
 }
 
-function buildBill(project: Project, transcripts: TranscriptItem[], now: number) {
+/** Closes the books on a project. `live` describes the session still holding
+ *  its captions in memory, if any — the caller names it explicitly rather
+ *  than letting this read a project record that may not have been written
+ *  yet (see finishProject). */
+function buildBill(project: Project, live: LiveBuffer) {
+  const now = live.now;
   const closedSessions = project.sessions.map((s) => (s.endedAt ? s : { ...s, endedAt: now }));
   const durationMs = closedSessions.reduce((sum, s) => sum + (s.endedAt! - s.startedAt), 0);
-  const wordCount = countWords(transcripts);
+  const transcripts = projectTranscripts(project, live);
+  const cost = projectCost(project, live);
   const bill: ProjectBill = {
     sessionCount: closedSessions.length,
     durationMs,
-    wordCount,
-    estimatedCost: Math.round(wordCount * ESTIMATED_COST_PER_WORD * 100) / 100
+    wordCount: countWords(transcripts),
+    estimatedCost: ceilCents(cost.total),
+    costBreakdown: {
+      liveMinutes: cost.liveMinutes,
+      liveAudioCost: cost.liveAudioCost,
+      liveTextCost: cost.liveTextCost,
+      summaryCost: cost.summaryCost,
+      summaryRuns: cost.summaryRuns
+    }
   };
-  return { closedSessions, bill };
+  return { closedSessions, bill, transcripts };
 }
 
 export function useProjects(store: ProjectStore = localStorageProjectStore) {
@@ -76,7 +91,9 @@ export function useProjects(store: ProjectStore = localStorageProjectStore) {
       const swept = prev.map((p) => {
         if (p.status !== 'active' || now < projectExpiresAt(p)) return p;
         changed = true;
-        const { closedSessions, bill } = buildBill(p, p.transcripts, now);
+        // Nothing is holding a live buffer here — a sweep runs on a timer,
+        // not off the console — so every session bills from its own record.
+        const { closedSessions, bill } = buildBill(p, { transcripts: [], asrSessionId: null, now });
         return { ...p, status: 'ended' as const, sessions: closedSessions, endedAt: now, bill, autoFinished: true };
       });
       return changed ? swept : prev;
@@ -232,12 +249,33 @@ export function useProjects(store: ProjectStore = localStorageProjectStore) {
   // forever.
   const markSessionSummarizing = useCallback((asrSessionId: string) => {
     setSummarizingIds((prev) => new Set(prev).add(asrSessionId));
+    // The run counter, unlike the spinner, IS persisted: every attempt spends
+    // tokens whether or not it comes back with a summary, and the cost
+    // estimate would understate the bill if a retry cost nothing.
+    setProjects((prev) =>
+      prev.map((p) => {
+        const idx = p.sessions.findIndex((s) => s.asrSessionId === asrSessionId);
+        if (idx === -1) return p;
+        const sessions = p.sessions.slice();
+        sessions[idx] = { ...sessions[idx], summarizeRuns: (sessions[idx].summarizeRuns ?? 0) + 1 };
+        return { ...p, sessions };
+      })
+    );
   }, []);
 
-  const finishProject = (transcripts: TranscriptItem[]): Project | undefined => {
+  /** `liveTranscripts` are the captions of the session that was just stopped,
+   *  and `liveAsrSessionId` names which session they belong to. Naming it
+   *  matters: the bill is priced per session now, and whether that session's
+   *  own transcript has been written to the record yet is a race this must
+   *  not depend on. */
+  const finishProject = (
+    liveTranscripts: TranscriptItem[],
+    liveAsrSessionId: string | null
+  ): Project | undefined => {
     if (!currentProject) return undefined;
 
     const now = Date.now();
+    const live: LiveBuffer = { transcripts: liveTranscripts, asrSessionId: liveAsrSessionId, now };
 
     setProjects((prev) =>
       prev.map((p: Project) => {
@@ -245,16 +283,16 @@ export function useProjects(store: ProjectStore = localStorageProjectStore) {
         // Built from the freshest record rather than the render-time copy:
         // finishing a project stops the live session first, and that write
         // (the session's own transcript) must survive this one.
-        const { closedSessions, bill } = buildBill(p, transcripts, now);
+        const { closedSessions, bill, transcripts } = buildBill(p, live);
         return { ...p, status: 'ended' as const, sessions: closedSessions, transcripts, endedAt: now, bill };
       })
     );
     setSelectedProjectId(null);
 
-    // What the bill modal shows. The numbers are identical to the record
-    // written above — a bill is computed from session timings and word
-    // counts, neither of which the newer write touches.
-    const { closedSessions, bill } = buildBill(currentProject, transcripts, now);
+    // What the bill modal shows. The numbers match the record written above:
+    // both price the same sessions from the same live buffer, and the only
+    // thing the newer write adds is that buffer, which `live` supplies here.
+    const { closedSessions, bill, transcripts } = buildBill(currentProject, live);
     return { ...currentProject, status: 'ended', sessions: closedSessions, transcripts, endedAt: now, bill };
   };
 

@@ -43,13 +43,30 @@ export interface ProjectSession {
   /** Items sent to the summariser, so an empty `summary` (the AI call
    *  failed) can still say "N ข้อความถูกบันทึกไว้" instead of nothing. */
   reportItemCount?: number;
+  /** How many times a summary has been ASKED for on this session, counted
+   *  when the request starts. A re-summarise and a failed summarise both
+   *  spend tokens, so the cost estimate needs the attempt count, not
+   *  whether `summary` ended up filled in. Undefined on sessions recorded
+   *  before costs were estimated. */
+  summarizeRuns?: number;
 }
 
 export interface ProjectBill {
   sessionCount: number;
   durationMs: number;
   wordCount: number;
+  /** Upper bound on the Gemini spend for this project, in USD — see
+   *  src/billing/geminiCost.ts. Real spend lands at or below it. */
   estimatedCost: number;
+  /** Where that figure came from, so a bill can be read rather than
+   *  trusted. Absent on projects billed before the breakdown existed. */
+  costBreakdown?: {
+    liveMinutes: number;
+    liveAudioCost: number;
+    liveTextCost: number;
+    summaryCost: number;
+    summaryRuns: number;
+  };
 }
 
 export interface Project {

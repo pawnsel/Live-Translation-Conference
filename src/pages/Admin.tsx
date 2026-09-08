@@ -27,6 +27,7 @@ import {
 import {
   BillModal,
   HistoryPanel,
+  LiveCostBadge,
   ProjectHeaderBar,
   ProjectPicker,
   SessionHistoryModal,
@@ -38,6 +39,7 @@ import { groupCaptionsIntoParagraphs } from '../asr/historyParagraphs';
 import { useGeminiLiveCapture, type CaptionResult } from '../asr/audio/useGeminiLiveCapture';
 import SubtitleText from '../components/SubtitleText';
 import { useProjects } from '../hooks/useProjects';
+import { useLiveProjectCost } from '../hooks/useLiveProjectCost';
 import { loadGlossary, saveGlossary, type GlossarySection, type GlossarySections } from '../glossary';
 import type { DisplayConfig, Project, ProjectSession } from '../types';
 
@@ -215,6 +217,12 @@ export default function Admin() {
 
   const isSessionActive = !!sessionId && micActive;
 
+  // Running total for the header badge: finished sessions come off the project
+  // record, the session recording right now comes out of the live caption
+  // buffer. Sampled on a timer, so a long meeting isn't recounting every word
+  // on every caption.
+  const liveCost = useLiveProjectCost(projects.currentProject, allCaptions, sessionId);
+
   // On-demand summary for one recorded session, from the transcript kept with
   // it. Opens the popup straight away so the operator watches it fill in.
   const summarizeSession = async (session: ProjectSession) => {
@@ -245,8 +253,11 @@ export default function Admin() {
   };
 
   const handleRequestFinishProject = async () => {
+    // Captured before the stop clears it: the bill prices per session, so it
+    // has to be told which session the returned captions belong to.
+    const lastAsrSessionId = sessionId;
     const captionsForProject = await stopSessionAndMic();
-    const finished = projects.finishProject(captionsForProject);
+    const finished = projects.finishProject(captionsForProject, lastAsrSessionId);
     dispatchCaption({ kind: 'reset' });
     setHiddenSeqs(new Set());
     if (finished) setFinishedProject(finished);
@@ -469,6 +480,7 @@ export default function Admin() {
             >
               <ClipboardList className="w-4 h-4" />
             </button>
+            <LiveCostBadge cost={liveCost} isRecording={isSessionActive} />
           </div>
         </div>
 
@@ -533,6 +545,7 @@ export default function Admin() {
         >
           <ClipboardList className="w-4 h-4" />
         </button>
+        <LiveCostBadge cost={liveCost} isRecording={isSessionActive} />
       </div>
 
       {/* ─────────────────────────────────────────────────────────────

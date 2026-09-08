@@ -12,10 +12,12 @@ import {
   AlarmClock,
   ClipboardList,
   Sparkles,
-  AlertTriangle
+  AlertTriangle,
+  CircleDollarSign
 } from 'lucide-react';
 import { Project, ProjectBill, ProjectSession } from '../types';
 import { MAX_ACTIVE_PROJECTS, projectDaysLeft } from '../hooks/useProjects';
+import type { LiveProjectCost } from '../hooks/useLiveProjectCost';
 
 function formatDuration(ms: number): string {
   const totalSeconds = Math.max(0, Math.round(ms / 1000));
@@ -35,10 +37,17 @@ function billFileContent(project: Project, bill: ProjectBill): string {
     `Sessions: ${bill.sessionCount}`,
     `Total duration: ${formatDuration(bill.durationMs)}`,
     `Words translated: ${bill.wordCount}`,
-    `Estimated cost: $${bill.estimatedCost.toFixed(2)} (placeholder rate, not final billing)`,
-    '',
-    '--- Session breakdown ---'
+    `Estimated cost: $${bill.estimatedCost.toFixed(2)} (upper bound on Gemini API spend)`
   ];
+  if (bill.costBreakdown) {
+    const b = bill.costBreakdown;
+    lines.push(
+      `  Live audio (${b.liveMinutes.toFixed(1)} min): $${b.liveAudioCost.toFixed(4)}`,
+      `  Translation text:            $${b.liveTextCost.toFixed(4)}`,
+      `  Meeting summaries (${b.summaryRuns} run${b.summaryRuns === 1 ? '' : 's'}): $${b.summaryCost.toFixed(4)}`
+    );
+  }
+  lines.push('', '--- Session breakdown ---');
   project.sessions.forEach((s, i) => {
     const duration = s.endedAt ? formatDuration(s.endedAt - s.startedAt) : '-';
     lines.push(`[${i + 1}] ${s.sourceLang} -> ${s.targetLang} · ${duration}`);
@@ -284,6 +293,52 @@ export function ProjectHeaderBar({
   );
 }
 
+// ── Running cost of the open project, shown in the header ──────────────────
+//    The same arithmetic the closing bill uses, applied to what has been
+//    recorded so far — so an operator can watch the number they will be
+//    charged instead of finding it out at "จบโปรเจกต์".
+export function LiveCostBadge({
+  cost,
+  isRecording = false,
+  className = ''
+}: {
+  cost: LiveProjectCost;
+  isRecording?: boolean;
+  className?: string;
+}) {
+  // "≤" rather than "~": the figure is built to sit at or above the real
+  // Gemini bill, and saying so is the whole point of showing it mid-meeting.
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 pl-2 pr-2.5 py-1 rounded-full border text-[11px] font-bold whitespace-nowrap shrink-0 transition-colors ${
+        isRecording
+          ? 'bg-pink-50 border-pink-200 text-[#DE5C8E]'
+          : 'bg-slate-100 border-slate-200 text-slate-600'
+      } ${className}`}
+      title={[
+        'ประมาณการค่าใช้จ่าย Gemini ของโปรเจกต์นี้ — คิดแบบเผื่อไว้ ค่าจริงจะไม่เกินตัวเลขนี้',
+        `เสียง ${cost.liveMinutes.toFixed(1)} นาที: $${cost.liveAudioCost.toFixed(4)}`,
+        `ข้อความคำแปล: $${cost.liveTextCost.toFixed(4)}`,
+        `สรุปการประชุม ${cost.summaryRuns} ครั้ง: $${cost.summaryCost.toFixed(4)}`,
+        isRecording ? 'อัปเดตทุก ๆ ไม่กี่วินาทีระหว่างบันทึก' : ''
+      ]
+        .filter(Boolean)
+        .join('\n')}
+      aria-label={`ค่าใช้จ่ายประมาณการ ไม่เกิน ${cost.displayCost.toFixed(2)} ดอลลาร์`}
+    >
+      {isRecording ? (
+        <span className="relative flex h-2 w-2 shrink-0">
+          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#DE5C8E] opacity-75" />
+          <span className="relative inline-flex rounded-full h-2 w-2 bg-[#DE5C8E]" />
+        </span>
+      ) : (
+        <CircleDollarSign className="w-3.5 h-3.5 shrink-0" />
+      )}
+      <span>≤ ${cost.displayCost.toFixed(2)}</span>
+    </span>
+  );
+}
+
 // ── Bill summary modal, shown right after a project is finished ─────────────
 export function BillModal({ project, onClose }: { project: Project; onClose: () => void }) {
   if (!project.bill) return null;
@@ -322,11 +377,30 @@ export function BillModal({ project, onClose }: { project: Project; onClose: () 
           </div>
           <div className="p-3 bg-pink-50 rounded-lg border border-pink-200">
             <div className="text-[#DE5C8E]">Estimated cost</div>
-            <div className="font-bold text-[#DE5C8E] text-base">${bill.estimatedCost.toFixed(2)}</div>
+            <div className="font-bold text-[#DE5C8E] text-base">≤ ${bill.estimatedCost.toFixed(2)}</div>
           </div>
         </div>
+
+        {bill.costBreakdown && (
+          <div className="space-y-1 text-[11px] text-slate-500">
+            <div className="flex justify-between gap-2">
+              <span>เสียง Live ({bill.costBreakdown.liveMinutes.toFixed(1)} นาที)</span>
+              <span className="font-mono">${bill.costBreakdown.liveAudioCost.toFixed(4)}</span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span>ข้อความคำแปล</span>
+              <span className="font-mono">${bill.costBreakdown.liveTextCost.toFixed(4)}</span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span>สรุปการประชุม ({bill.costBreakdown.summaryRuns} ครั้ง)</span>
+              <span className="font-mono">${bill.costBreakdown.summaryCost.toFixed(4)}</span>
+            </div>
+          </div>
+        )}
+
         <p className="text-[11px] text-slate-400">
-          ยอดประมาณการจากอัตราชั่วคราว ยังไม่ใช่ระบบเรียกเก็บเงินจริง
+          ประมาณการจากอัตราค่าบริการ Gemini API แบบเผื่อไว้ (คิดเสียงเต็มช่วงเวลาที่บันทึก) — ค่าใช้จ่ายจริงจะไม่เกินยอดนี้
+          และยังไม่ใช่ระบบเรียกเก็บเงิน
         </p>
 
         <div className="flex gap-2">
