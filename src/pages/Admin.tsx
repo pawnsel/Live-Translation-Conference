@@ -354,6 +354,23 @@ export default function Admin() {
     URL.revokeObjectURL(url);
   };
 
+  // The escape hatch when storage is refusing writes: whatever is still in
+  // memory leaves the browser as a file the operator controls.
+  const downloadProjectBackup = () => {
+    const payload = JSON.stringify(
+      { exportedAt: new Date().toISOString(), projects: [...projects.activeProjects, ...projects.endedProjects] },
+      null,
+      2
+    );
+    const blob = new Blob([payload], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `backup-projects-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const isListening = capture.status === 'listening';
   const micPermissionError = capture.status === 'error';
 
@@ -650,6 +667,29 @@ export default function Admin() {
             MAIN TRANSLATION FEED
         ────────────────────────────────────────────────────────────── */}
         <main className="flex-1 flex flex-col bg-slate-50 min-w-0">
+          {projects.persistError && (
+            <div className="shrink-0 flex items-start gap-2.5 m-3 p-3 bg-rose-50 border border-rose-300 rounded-xl text-rose-800 text-xs leading-relaxed">
+              <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" />
+              <div className="flex-1 min-w-0">
+                <p className="font-bold">บันทึกข้อมูลไม่สำเร็จ — การประชุมนี้อาจไม่ถูกเก็บไว้</p>
+                <p className="mt-0.5">
+                  {projects.persistError.reason === 'quota'
+                    ? 'พื้นที่จัดเก็บในเบราว์เซอร์เต็ม กรุณาดาวน์โหลดสำรองไว้ แล้วจบโปรเจกต์เก่าที่ไม่ใช้แล้ว'
+                    : projects.persistError.reason === 'unavailable'
+                    ? 'เบราว์เซอร์นี้ปิดการจัดเก็บข้อมูลไว้ กรุณาดาวน์โหลดสำรองก่อนปิดหน้านี้'
+                    : 'เกิดข้อผิดพลาดที่ไม่รู้จัก กรุณาดาวน์โหลดสำรองก่อนปิดหน้านี้'}
+                </p>
+              </div>
+              <button
+                onClick={downloadProjectBackup}
+                className="shrink-0 px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-lg font-semibold flex items-center gap-1.5"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>ดาวน์โหลดสำรอง</span>
+              </button>
+            </div>
+          )}
+
           {micPermissionError && (
             <div className="p-3 bg-rose-50 border-b border-rose-200 text-rose-800 text-xs flex items-center justify-between gap-2">
               <div className="flex items-center gap-2 min-w-0">
