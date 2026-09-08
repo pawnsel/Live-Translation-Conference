@@ -209,7 +209,7 @@ describe('useProjects — per-session transcripts', () => {
     act(() => {
       result.current.saveSessionTranscript('asr_1', items);
       result.current.detachAsrSession();
-      result.current.finishProject(items);
+      result.current.finishProject(items, 'asr_1');
     });
 
     const ended = result.current.endedProjects[0];
