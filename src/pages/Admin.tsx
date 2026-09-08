@@ -22,13 +22,15 @@ import {
   RefreshCw,
   AlertTriangle,
   ChevronDown,
-  ChevronUp
+  ChevronUp,
+  User
 } from 'lucide-react';
 // ProjectPanel.tsx has NO default export — it exports five named components.
 import { BillModal, HistoryPanel, ProjectHeaderBar, ProjectPicker, SessionHistoryModal } from '../components/ProjectPanel';
 import DictionaryManager from '../components/DictionaryManager';
 import { captionsReducer, initialCaptionState, selectCaptions, type Caption } from '../asr/captions';
 import { useGeminiLiveCapture, type CaptionResult } from '../asr/audio/useGeminiLiveCapture';
+import SubtitleText from '../components/SubtitleText';
 import { useProjects } from '../hooks/useProjects';
 import { loadGlossary, saveGlossary, type GlossarySection, type GlossarySections } from '../glossary';
 import type { DisplayConfig, Project } from '../types';
@@ -108,6 +110,7 @@ export default function Admin() {
   const [showHistory, setShowHistory] = useState(false);
   const [showSessionHistory, setShowSessionHistory] = useState(false);
   const [showAllHistory, setShowAllHistory] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
   const [finishedProject, setFinishedProject] = useState<Project | null>(null);
 
   // Captions have no "delete" concept anymore (there is no server to delete
@@ -497,34 +500,43 @@ export default function Admin() {
             <span className="font-semibold text-slate-800">{pingMs !== null ? `${pingMs}ms` : '--'}</span>
           </div>
 
-          {sessionId && (
+          {/* The record control itself now lives in the middle of the screen;
+              this corner is reserved for the operator's own account. */}
+          <div className="relative">
             <button
-              onClick={() => setPaused((p) => !p)}
-              title={paused ? 'เล่นต่อ' : 'พักการถอดความ'}
-              className="p-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600"
+              type="button"
+              onClick={() => setProfileOpen((v) => !v)}
+              className={`w-9 h-9 rounded-full border flex items-center justify-center transition-all ${
+                profileOpen
+                  ? 'bg-pink-50 border-pink-200 text-[#DE5C8E]'
+                  : 'bg-slate-100 border-slate-200 text-slate-500 hover:text-[#DE5C8E] hover:bg-slate-200'
+              }`}
+              title="โปรไฟล์ผู้ใช้"
+              aria-label="โปรไฟล์ผู้ใช้"
+              aria-expanded={profileOpen}
             >
-              {paused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
+              <User className="w-4.5 h-4.5" />
             </button>
-          )}
-
-          <button
-            onClick={isSessionActive ? stopSessionAndMic : startSessionAndMic}
-            disabled={capture.status === 'starting' || endingSession}
-            className={`px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2 transition-all shadow-xs whitespace-nowrap disabled:opacity-50 ${
-              isSessionActive ? 'bg-rose-600 hover:bg-rose-700 text-white animate-pulse' : 'bg-[#DE5C8E] hover:bg-[#c94577] text-white'
-            }`}
-          >
-            {isSessionActive ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
-            <span>
-              {capture.status === 'starting'
-                ? 'กำลังเริ่ม…'
-                : endingSession
-                ? 'กำลังปิด Session…'
-                : isSessionActive
-                ? 'จบ Session'
-                : 'เริ่ม Session'}
-            </span>
-          </button>
+            {profileOpen && (
+              <>
+                <div className="fixed inset-0 z-30" onClick={() => setProfileOpen(false)} />
+                <div className="absolute right-0 top-11 z-40 w-56 bg-white border border-slate-200 rounded-xl shadow-lg p-3.5">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-8 h-8 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-400">
+                      <User className="w-4 h-4" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold text-slate-800 truncate">ผู้ดูแลระบบ</div>
+                      <div className="text-[11px] text-slate-400 truncate">ยังไม่ได้เข้าสู่ระบบ</div>
+                    </div>
+                  </div>
+                  <p className="text-[11px] text-slate-400 leading-relaxed mt-2.5 pt-2.5 border-t border-slate-100">
+                    หน้าโปรไฟล์และการตั้งค่าบัญชีผู้ใช้จะเปิดให้ใช้งานเร็ว ๆ นี้
+                  </p>
+                </div>
+              </>
+            )}
+          </div>
         </div>
       </header>
 
@@ -678,37 +690,6 @@ export default function Admin() {
             MAIN TRANSLATION FEED
         ────────────────────────────────────────────────────────────── */}
         <main className="flex-1 flex flex-col bg-slate-50 min-w-0">
-          <div className="px-4 py-2.5 bg-white border-b border-slate-200 flex items-center justify-between gap-3 shrink-0">
-            <div className="flex items-center gap-2 ml-auto">
-              <button
-                onClick={() => exportTranscript('txt')}
-                disabled={captions.length === 0}
-                className="px-2.5 py-1.5 text-xs text-slate-700 hover:text-slate-900 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg font-semibold transition-all disabled:opacity-40 flex items-center gap-1.5 shadow-2xs"
-                title="ส่งออกข้อความ TXT"
-              >
-                <Download className="w-3.5 h-3.5 text-slate-500" />
-                <span>TXT</span>
-              </button>
-              <button
-                onClick={() => exportTranscript('srt')}
-                disabled={captions.length === 0}
-                className="px-2.5 py-1.5 text-xs text-slate-700 hover:text-slate-900 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg font-semibold transition-all disabled:opacity-40 flex items-center gap-1.5 shadow-2xs"
-                title="ส่งออกคำบรรยาย SRT"
-              >
-                <FileText className="w-3.5 h-3.5 text-slate-500" />
-                <span>SRT</span>
-              </button>
-              <button
-                onClick={clearTranscripts}
-                disabled={captions.length === 0}
-                className="p-1.5 text-slate-400 hover:text-rose-600 rounded-lg hover:bg-rose-50 transition-all disabled:opacity-30 ml-1"
-                title="ล้างประวัติข้อความทั้งหมด"
-              >
-                <Trash2 className="w-4 h-4" />
-              </button>
-            </div>
-          </div>
-
           {micPermissionError && (
             <div className="p-3 bg-rose-50 border-b border-rose-200 text-rose-800 text-xs flex items-center justify-between gap-2">
               <div className="flex items-center gap-2 min-w-0">
@@ -728,34 +709,15 @@ export default function Admin() {
             </div>
           )}
 
-          {isListening && (
-            <div className="px-4 py-2 bg-emerald-50 border-b border-emerald-200 flex items-center justify-between gap-3 text-xs text-emerald-900 transition-all shrink-0">
-              <div className="flex items-center gap-2 min-w-0 flex-1">
-                <div className="flex items-center gap-1.5 shrink-0">
-                  <span className="relative flex h-2 w-2">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
-                  </span>
-                  <span className="font-bold text-emerald-800 shrink-0">กำลังฟัง:</span>
-                </div>
-                <div className="flex-1 truncate font-mono text-xs text-emerald-800 font-medium">
-                  {capture.partialSource ? (
-                    <span>{capture.partialSource}</span>
-                  ) : (
-                    <span className="text-emerald-600/80 italic">กำลังรอเสียงพูด... (พูดใส่ไมโครโฟนได้ทันที)</span>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
-
           {/* ─────────────────────────────────────────────────────────────
-              LIVE SUBTITLE — one box, one caption at a time.
+              LIVE SUBTITLE — pinned to the top edge, at most two lines.
+              A caption that outgrows two lines starts a new block from the
+              word that no longer fitted, the way broadcast subtitles do.
           ────────────────────────────────────────────────────────────── */}
-          <div className="flex-1 flex flex-col items-center justify-center p-4 sm:p-8 min-h-0">
-            <div className="relative w-full max-w-4xl bg-white rounded-2xl border border-slate-200 shadow-sm px-6 py-10 sm:px-12 sm:py-14 text-center">
+          <div className="shrink-0 px-3 pt-3 sm:px-6 sm:pt-4">
+            <div className="relative w-full max-w-5xl mx-auto bg-white rounded-2xl border border-slate-200 shadow-sm px-6 py-5 sm:px-10 sm:py-6 text-center">
               {latestCaption && !isEditingBox && !hasPartial && (
-                <div className="absolute top-3 right-3 flex items-center gap-1">
+                <div className="absolute top-2.5 right-2.5 flex items-center gap-1">
                   <button
                     onClick={() => handleCopyItem(latestCaption)}
                     className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
@@ -774,16 +736,11 @@ export default function Admin() {
               )}
 
               {!latestCaption && !hasPartial ? (
-                <div className="flex flex-col items-center gap-3 text-slate-400">
-                  <div className="w-14 h-14 rounded-2xl bg-slate-50 border border-slate-200 flex items-center justify-center text-[#DE5C8E]">
-                    <Mic className="w-7 h-7" />
-                  </div>
-                  <div className="max-w-sm">
-                    <div className="font-bold text-slate-700 text-sm">พร้อมรับเสียงจากไมโครโฟน</div>
-                    <p className="text-xs text-slate-400 leading-relaxed mt-1">
-                      กดปุ่ม <strong>&quot;เริ่ม Session&quot;</strong> ด้านบน จากนั้นพูดใส่ไมโครโฟนเพื่อทำการแปลภาษาแบบเรียลไทม์
-                    </p>
-                  </div>
+                <div className="text-slate-400">
+                  <div className="font-bold text-slate-700 text-sm">พร้อมรับเสียงจากไมโครโฟน</div>
+                  <p className="text-xs text-slate-400 leading-relaxed mt-1">
+                    กดปุ่มไมโครโฟนวงกลมกลางจอ จากนั้นพูดใส่ไมโครโฟนเพื่อทำการแปลภาษาแบบเรียลไทม์
+                  </p>
                 </div>
               ) : isEditingBox ? (
                 <div className="space-y-3 text-left max-w-2xl mx-auto">
@@ -817,23 +774,118 @@ export default function Admin() {
               ) : (
                 <>
                   {config.showOriginal && boxSourceText && (
-                    <p className={`text-base sm:text-lg mb-3 ${hasPartial ? 'text-slate-300' : 'text-slate-400'}`}>{boxSourceText}</p>
+                    <SubtitleText
+                      text={boxSourceText}
+                      maxLines={1}
+                      className={`text-base sm:text-lg mb-2 ${hasPartial ? 'text-slate-300' : 'text-slate-400'}`}
+                    />
                   )}
-                  <p
-                    className={`${boxTextSizeClass(config.fontSize)} font-bold leading-snug tracking-tight transition-colors ${
-                      hasPartial ? 'text-slate-400' : 'text-slate-900'
-                    }`}
-                  >
-                    {boxTargetText || <span className="text-slate-300 font-normal text-2xl sm:text-3xl">กำลังแปล…</span>}
-                  </p>
+                  {boxTargetText ? (
+                    <SubtitleText
+                      text={boxTargetText}
+                      maxLines={2}
+                      className={`${boxTextSizeClass(config.fontSize)} font-bold leading-snug tracking-tight transition-colors ${
+                        hasPartial ? 'text-slate-400' : 'text-slate-900'
+                      }`}
+                    />
+                  ) : (
+                    <p className={`${boxTextSizeClass(config.fontSize)} font-normal text-slate-300`}>กำลังแปล…</p>
+                  )}
                   {config.showLatency && !hasPartial && latestCaption?.latencyMs ? (
-                    <span className="mt-3 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 font-mono text-[10px] text-slate-500 border border-slate-200">
+                    <span className="mt-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 font-mono text-[10px] text-slate-500 border border-slate-200">
                       <Zap className="w-3 h-3 text-amber-500" />
                       <span>{latestCaption.latencyMs}ms</span>
                     </span>
                   ) : null}
                 </>
               )}
+            </div>
+          </div>
+
+          {/* ─────────────────────────────────────────────────────────────
+              RECORD CONTROL — the one big target, dead centre of the screen.
+          ────────────────────────────────────────────────────────────── */}
+          <div className="flex-1 flex flex-col items-center justify-center gap-4 p-4 min-h-0">
+            <button
+              onClick={isSessionActive ? stopSessionAndMic : startSessionAndMic}
+              disabled={capture.status === 'starting' || endingSession}
+              aria-label={isSessionActive ? 'จบ Session (หยุดอัดเสียง)' : 'เริ่ม Session (อัดเสียง)'}
+              title={isSessionActive ? 'จบ Session' : 'เริ่ม Session'}
+              className={`relative w-28 h-28 sm:w-36 sm:h-36 rounded-full flex items-center justify-center transition-all shadow-lg ring-8 disabled:opacity-60 disabled:cursor-not-allowed ${
+                isSessionActive
+                  ? 'bg-rose-600 hover:bg-rose-700 text-white ring-rose-100'
+                  : 'bg-[#DE5C8E] hover:bg-[#c94577] text-white ring-pink-100'
+              }`}
+            >
+              {isListening && !paused && (
+                <span className="absolute inset-0 rounded-full bg-rose-400/40 animate-ping pointer-events-none" />
+              )}
+              {isSessionActive ? (
+                <MicOff className="relative w-12 h-12 sm:w-14 sm:h-14" />
+              ) : (
+                <Mic className="relative w-12 h-12 sm:w-14 sm:h-14" />
+              )}
+            </button>
+
+            <div className="h-5 flex items-center gap-2 text-xs font-semibold text-slate-500">
+              {capture.status === 'starting' ? (
+                <span>กำลังเริ่ม…</span>
+              ) : endingSession ? (
+                <span>กำลังปิด Session…</span>
+              ) : isSessionActive && paused ? (
+                <span className="text-amber-600">พักการถอดความ — กดปุ่มเล่นต่อด้านล่าง</span>
+              ) : isListening ? (
+                <>
+                  <span className="relative flex h-2 w-2">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+                  </span>
+                  <span className="text-emerald-700">
+                    {capture.partialSource ? 'กำลังฟัง…' : 'กำลังรอเสียงพูด — พูดใส่ไมโครโฟนได้ทันที'}
+                  </span>
+                </>
+              ) : (
+                <span>กดเพื่อเริ่มอัดเสียงและแปลสด</span>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2">
+              {sessionId && (
+                <button
+                  onClick={() => setPaused((p) => !p)}
+                  title={paused ? 'เล่นต่อ' : 'พักการถอดความ'}
+                  className="px-2.5 py-1.5 text-xs text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg font-semibold transition-all flex items-center gap-1.5 shadow-2xs"
+                >
+                  {paused ? <Play className="w-3.5 h-3.5 text-slate-500" /> : <Pause className="w-3.5 h-3.5 text-slate-500" />}
+                  <span>{paused ? 'เล่นต่อ' : 'พัก'}</span>
+                </button>
+              )}
+              <button
+                onClick={() => exportTranscript('txt')}
+                disabled={captions.length === 0}
+                className="px-2.5 py-1.5 text-xs text-slate-700 hover:text-slate-900 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg font-semibold transition-all disabled:opacity-40 flex items-center gap-1.5 shadow-2xs"
+                title="ส่งออกข้อความ TXT"
+              >
+                <Download className="w-3.5 h-3.5 text-slate-500" />
+                <span>TXT</span>
+              </button>
+              <button
+                onClick={() => exportTranscript('srt')}
+                disabled={captions.length === 0}
+                className="px-2.5 py-1.5 text-xs text-slate-700 hover:text-slate-900 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg font-semibold transition-all disabled:opacity-40 flex items-center gap-1.5 shadow-2xs"
+                title="ส่งออกคำบรรยาย SRT"
+              >
+                <FileText className="w-3.5 h-3.5 text-slate-500" />
+                <span>SRT</span>
+              </button>
+              <button
+                onClick={clearTranscripts}
+                disabled={captions.length === 0}
+                className="p-1.5 text-slate-400 hover:text-rose-600 rounded-lg hover:bg-rose-50 transition-all disabled:opacity-30"
+                title="ล้างประวัติข้อความทั้งหมด"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
             </div>
           </div>
 
