@@ -51,6 +51,13 @@ export function sanitizeLangs(value: unknown, allowed: string[]): string[] {
   return value.filter((v): v is string => typeof v === 'string' && allowed.includes(v));
 }
 
+// Gemini caps a live connection at ten minutes and warns 60s ahead via
+// goAway; swapping the upstream in place — rather than letting the client
+// socket die and rebuild the whole microphone pipeline — is what keeps a
+// long meeting recording. The budget below stops a swap loop from spinning
+// forever against an upstream that is simply down.
+export const MAX_UPSTREAM_SWAPS_IN_A_ROW = 3;
+
 // Client-supplied glossary text reaches a billed API, so it is bounded and
 // type-checked rather than trusted. Quotes and newlines are stripped so a
 // term cannot break out of the instruction template it is embedded in.
@@ -84,11 +91,14 @@ export function sanitizeVocabulary(value: unknown): string[] {
 }
 
 export function createLiveBridge(client: SocketLike, opts: BridgeOptions): void {
-  const upstream = opts.openUpstream();
+  // Definite-assignment: attachUpstream sets this before any handler that
+  // reads it can fire, but TypeScript cannot see that through the closures.
+  let upstream!: SocketLike;
 
   // Audio arriving before Gemini's setupComplete would be dropped by
   // Gemini — queue it and flush once ready, so the client never has to
-  // know about handshake timing.
+  // know about handshake timing. The same queue catches audio during an
+  // upstream swap, since upstreamReady goes false again for that window.
   let upstreamReady = false;
   let setupSent = false;
   let configReceived = false;
@@ -97,9 +107,12 @@ export function createLiveBridge(client: SocketLike, opts: BridgeOptions): void 
   let targetLanguageCode = opts.targetLanguageCode;
   let sourceLanguageCodes = opts.sourceLanguageCodes;
   let resumeHandle: string | null = null;
+  let swapsSinceSetup = 0;
+  let clientGone = false;
   const pending: Buffer[] = [];
 
   const closeBoth = (code?: number, reason?: string) => {
+    clientGone = true;
     clearTimeout(glossaryTimer);
     if (client.readyState === OPEN || client.readyState === CONNECTING) {
       client.close(code, reason);
@@ -147,51 +160,95 @@ export function createLiveBridge(client: SocketLike, opts: BridgeOptions): void 
 
   const glossaryTimer = setTimeout(sendSetup, GLOSSARY_WAIT_MS);
 
-  upstream.on('open', () => {
-    // If the client's config frame already arrived, start the session now;
-    // otherwise the timer above starts it shortly.
-    if (configReceived) sendSetup();
-  });
+  const attachUpstream = (socket: SocketLike) => {
+    upstream = socket;
+    setupSent = false;
+    upstreamReady = false;
 
-  upstream.on('message', (data: Buffer, isBinary: boolean) => {
-    // Peek without assuming JSON — an unparseable frame is still relayed
-    // below rather than silently dropped.
-    let parsed: Record<string, any> | null = null;
-    try {
-      parsed = JSON.parse(data.toString());
-    } catch {
-      parsed = null;
-    }
+    socket.on('open', () => {
+      // A swap has its config already; only the very first connection waits
+      // for the browser's glossary frame.
+      if (configReceived || swapsSinceSetup > 0) sendSetup();
+    });
 
-    if (!upstreamReady && parsed?.setupComplete) {
-      upstreamReady = true;
-      for (const queued of pending.splice(0)) upstream.send(queued);
-    }
+    socket.on('message', (data: Buffer, isBinary: boolean) => {
+      // Frames from a socket that has already been replaced are ignored:
+      // only the current upstream speaks for this client.
+      if (socket !== upstream) return;
 
-    // Both are the proxy's business, not the browser's: relaying goAway would
-    // invite the client to react to something being handled here already.
-    if (parsed?.sessionResumptionUpdate) {
-      const update = parsed.sessionResumptionUpdate;
-      // A handle the server has declared unusable must never be offered back.
-      resumeHandle = update.resumable === false ? null : (update.newHandle ?? resumeHandle);
+      // Peek without assuming JSON — an unparseable frame is still relayed
+      // below rather than silently dropped.
+      let parsed: Record<string, any> | null = null;
+      try {
+        parsed = JSON.parse(data.toString());
+      } catch {
+        parsed = null;
+      }
+
+      if (!upstreamReady && parsed?.setupComplete) {
+        upstreamReady = true;
+        swapsSinceSetup = 0;
+        for (const queued of pending.splice(0)) upstream.send(queued);
+      }
+
+      // Both are the proxy's business, not the browser's: relaying goAway would
+      // invite the client to react to something being handled here already.
+      if (parsed?.sessionResumptionUpdate) {
+        const update = parsed.sessionResumptionUpdate;
+        // A handle the server has declared unusable must never be offered back.
+        resumeHandle = update.resumable === false ? null : (update.newHandle ?? resumeHandle);
+        return;
+      }
+      // Gemini caps a connection at ten minutes and warns 60s ahead. Swapping
+      // here — rather than letting the client socket die and rebuild the
+      // whole microphone pipeline — is what keeps a long meeting recording.
+      if (parsed?.goAway) {
+        swapUpstream();
+        return;
+      }
+
+      // This model speaks its translation as well as writing it, so most
+      // frames are base64 PCM in modelTurn.parts[].inlineData — tens of KB
+      // each, useless to a text-only UI. Drop frames carrying nothing else;
+      // anything with a transcription or other field still goes through.
+      const parts = parsed?.serverContent?.modelTurn?.parts;
+      if (Array.isArray(parts) && parts.length > 0 && parts.every((p: any) => p?.inlineData && !p.text)) {
+        return;
+      }
+
+      if (client.readyState === OPEN) client.send(data, { binary: isBinary });
+    });
+
+    socket.on('close', () => {
+      if (socket !== upstream) return; // the one we deliberately replaced
+      swapUpstream();
+    });
+    socket.on('error', () => {
+      if (socket !== upstream) return;
+      swapUpstream();
+    });
+  };
+
+  // Sequential by design: close first, open second. One upstream at a time
+  // means a given stretch of audio reaches exactly one Gemini session, so no
+  // caption can ever be transcribed twice.
+  //
+  // The budget is three replacements without an intervening setupComplete —
+  // the fourth attempt gives up to the client rather than looping forever
+  // against an upstream that is simply down.
+  const swapUpstream = () => {
+    if (clientGone) return;
+    if (swapsSinceSetup >= MAX_UPSTREAM_SWAPS_IN_A_ROW) {
+      closeBoth(1011, 'upstream Gemini connection failed');
       return;
     }
-    if (parsed?.goAway) return;
+    swapsSinceSetup += 1;
+    const previous = upstream;
+    if (previous.readyState === OPEN || previous.readyState === CONNECTING) previous.close();
+    attachUpstream(opts.openUpstream());
+  };
 
-    // This model speaks its translation as well as writing it, so most
-    // frames are base64 PCM in modelTurn.parts[].inlineData — tens of KB
-    // each, useless to a text-only UI. Drop frames carrying nothing else;
-    // anything with a transcription or other field still goes through.
-    const parts = parsed?.serverContent?.modelTurn?.parts;
-    if (Array.isArray(parts) && parts.length > 0 && parts.every((p: any) => p?.inlineData && !p.text)) {
-      return;
-    }
-
-    if (client.readyState === OPEN) client.send(data, { binary: isBinary });
-  });
-
-  upstream.on('close', (code: number, reason: Buffer) => closeBoth(code, reason?.toString()));
-  upstream.on('error', () => closeBoth(1011, 'upstream Gemini connection failed'));
+  attachUpstream(opts.openUpstream());
 
   client.on('message', (data: Buffer, isBinary: boolean) => {
     // The client's opening frame carries its glossary; it is consumed
