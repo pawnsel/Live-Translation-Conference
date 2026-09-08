@@ -120,6 +120,8 @@ export function createLiveBridge(client: SocketLike, opts: BridgeOptions): void 
     const setup: Record<string, unknown> = {
       model: `models/${opts.model}`,
       generationConfig: { responseModalities: ['TEXT'], translationConfig: { targetLanguageCode } },
+      // Without this, only the translation comes back; with it the
+      // original speech arrives too, as serverContent.inputTranscription.
       inputAudioTranscription,
       // An empty object still opts into the sessionResumptionUpdate frames;
       // a handle is only present when replacing an expiring session.
@@ -129,6 +131,9 @@ export function createLiveBridge(client: SocketLike, opts: BridgeOptions): void 
       // before the connection cap, making seams more frequent than necessary.
       contextWindowCompression: { slidingWindow: {} }
     };
+    // customVocabulary only biases what the recogniser hears; pinning how
+    // a term is TRANSLATED needs this instruction (verified: the live
+    // translate model honours it, unlike the transcribe-only model).
     if (glossaryInstruction) setup.systemInstruction = { parts: [{ text: glossaryInstruction }] };
     return setup;
   };
