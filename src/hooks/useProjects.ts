@@ -23,8 +23,9 @@ function loadProjects(): Project[] {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
     const parsed: Project[] = stored ? JSON.parse(stored) : [];
-    // Projects saved before per-project transcripts existed have no array yet.
-    return parsed.map((p) => ({ ...p, transcripts: p.transcripts || [] }));
+    // Projects saved before per-project transcripts or ASR sessions existed
+    // have neither field yet.
+    return parsed.map((p) => ({ ...p, transcripts: p.transcripts || [], asrSessionId: p.asrSessionId ?? null }));
   } catch {
     return [];
   }
@@ -40,7 +41,7 @@ function loadSelectedId(): string | null {
 
 function countWords(transcripts: TranscriptItem[]): number {
   return transcripts.reduce((total, t) => {
-    const text = `${t.originalText} ${t.translatedText}`.trim();
+    const text = `${t.sourceText} ${t.targetText}`.trim();
     return total + (text ? text.split(/\s+/).length : 0);
   }, 0);
 }
@@ -61,6 +62,7 @@ function buildBill(project: Project, transcripts: TranscriptItem[], now: number)
 export function useProjects() {
   const [projects, setProjects] = useState<Project[]>(() => loadProjects());
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(() => loadSelectedId());
+  const [summarizingIds, setSummarizingIds] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
     try {
@@ -127,10 +129,11 @@ export function useProjects() {
   const selectProject = (id: string) => setSelectedProjectId(id);
   const clearSelection = () => setSelectedProjectId(null);
 
-  const startSession = (sourceLang: string, targetLang: string) => {
+  const startSession = (asrSessionId: string, sourceLang: string, targetLang: string) => {
     if (!currentProject || activeSession) return;
     const session: ProjectSession = {
       id: `sess_${Date.now()}`,
+      asrSessionId,
       startedAt: Date.now(),
       sourceLang,
       targetLang
@@ -154,10 +157,80 @@ export function useProjects() {
     );
   };
 
+  // A project outlives many ASR sessions: the Python registry is in memory,
+  // so a backend restart forces a new session id under the same project.
+  // Any session left open by the old id (e.g. the backend restarted rather
+  // than the console cleanly detaching) is closed in this same update, so
+  // this can't collide with startSession's "already have an open session"
+  // guard and silently drop the new recording.
+  const attachAsrSession = (asrSessionId: string, sourceLang: string, targetLang: string) => {
+    if (!currentProject) return;
+    const now = Date.now();
+    const session: ProjectSession = {
+      id: `sess_${now}`,
+      asrSessionId,
+      startedAt: now,
+      sourceLang,
+      targetLang
+    };
+    setProjects((prev) =>
+      prev.map((p: Project) =>
+        p.id === currentProject.id
+          ? {
+              ...p,
+              asrSessionId,
+              sessions: [...p.sessions.map((s) => (s.endedAt ? s : { ...s, endedAt: now })), session]
+            }
+          : p
+      )
+    );
+  };
+
+  const detachAsrSession = () => {
+    if (!currentProject) return;
+    endSession();
+    setProjects((prev) =>
+      prev.map((p: Project) => (p.id === currentProject.id ? { ...p, asrSessionId: null } : p))
+    );
+  };
+
   // Mirrors the live server buffer into the selected project, so each project
   // keeps its own transcript and its own bill.
   const saveTranscripts = useCallback((projectId: string, transcripts: TranscriptItem[]) => {
     setProjects((prev) => prev.map((p: Project) => (p.id === projectId ? { ...p, transcripts } : p)));
+  }, []);
+
+  // Attaches a report.done summary to whichever ProjectSession recorded that
+  // ASR session, wherever it lives — searched by `asrSessionId` inside the
+  // updater rather than gated on `currentProject`, so it stays correct even
+  // if a late-arriving report resolves after the project selection moved on.
+  // No P2 database exists yet, so this is the "mock" persistence: the same
+  // localStorage record every other project field already rides on.
+  const saveSessionSummary = useCallback((asrSessionId: string, summary: string, reportItemCount: number) => {
+    setSummarizingIds((prev) => {
+      if (!prev.has(asrSessionId)) return prev;
+      const next = new Set(prev);
+      next.delete(asrSessionId);
+      return next;
+    });
+    setProjects((prev) =>
+      prev.map((p) => {
+        const idx = p.sessions.findIndex((s) => s.asrSessionId === asrSessionId);
+        if (idx === -1) return p;
+        const sessions = p.sessions.slice();
+        sessions[idx] = { ...sessions[idx], summary, reportItemCount };
+        return { ...p, sessions };
+      })
+    );
+  }, []);
+
+  // Summarising runs in the background after a session ends, so the history
+  // view needs to tell "still working on it" apart from "no summary".
+  // Deliberately NOT persisted: a reload kills the in-flight request, and a
+  // flag stored in localStorage would leave that session showing a spinner
+  // forever.
+  const markSessionSummarizing = useCallback((asrSessionId: string) => {
+    setSummarizingIds((prev) => new Set(prev).add(asrSessionId));
   }, []);
 
   const finishProject = (transcripts: TranscriptItem[]): Project | undefined => {
@@ -190,8 +263,13 @@ export function useProjects() {
     selectProject,
     clearSelection,
     startSession,
+    attachAsrSession,
+    detachAsrSession,
     endSession,
     saveTranscripts,
+    saveSessionSummary,
+    markSessionSummarizing,
+    summarizingIds,
     finishProject
   };
 }

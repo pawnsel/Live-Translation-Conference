@@ -1,170 +1,192 @@
 # สรุปการทำงานของระบบ AI Realtime Conference Interpreter & Translator
-(System Overview & Architecture Documentation)
 
-> อัปเดตล่าสุด: 2026-09-02
-
-ระบบ **AI Realtime Conference Interpreter & Translator** คือระบบถอดความเสียงพูดสด (Speech-to-Text) และแปลภาษาแบบเรียลไทม์ (Real-time Live Translation) ที่ออกแบบมาสำหรับการประชุม สัมมนา งานแถลงข่าว และการบรรยายสองภาษา (Thai ↔ English) โดยทำงานผ่านสถาปัตยกรรม Full-Stack (React + Vite + Tailwind CSS + Node.js Express + Socket.IO + Google Gemini API)
+ระบบแปลภาษาไทย ⇄ อังกฤษ แบบเรียลไทม์สำหรับงานประชุม ทำงานบนเบราว์เซอร์
+ร่วมกับเซิร์ฟเวอร์ Node/Express ตัวเดียวในโปรเจกต์นี้ ใช้ Google Gemini
+เป็นเครื่องมือถอดเสียง แปลภาษา และสรุปการประชุม โดยไม่มี backend แยกอีกต่อไป
 
 ---
 
-## 1. แผนภาพและโครงสร้างการทำงานของระบบ (System Workflow Architecture)
+## 1. สถาปัตยกรรมระบบ (System Architecture)
+
+ทั้งระบบมีแค่ **2 process** คือเบราว์เซอร์กับเซิร์ฟเวอร์ Express ตัวเดียว
+(`server.ts`) ซึ่งทำหน้าที่ทั้งเสิร์ฟหน้าเว็บ (ผ่าน Vite middleware) และเป็น
+ตัวกลางคุยกับ Gemini
+
+### 1.1 เส้นทางคำบรรยายสด (WebSocket — เส้นทางหลัก)
 
 ```
- [เสียงพูดของผู้บรรยาย (Speaker)] 
-              │
-              ▼
- 🎙️ [Speech Recognition (ASR Engine)] 
-    - Web Speech API / Google Cloud Speech Chirp 3
-    - แปลงคลื่นเสียงสดเป็นข้อความทันที (<100ms)
-    - รองรับการสลับภาษาผู้พูด: ไทย (th-TH) ↔ อังกฤษ (en-US)
-              │
-              ▼ (WebSocket: 'new-transcription')
- ⚡ [Node.js Express + Socket.IO Server Engine]
-    - จัดเก็บประวัติและคิวข้อความการประชุม
-    - รองรับการเชื่อมต่อแบบ Real-time หลาย Client พร้อมกัน
-              │
-              ▼
- 🧠 [AI Translation & Terminology Post-Corrector (Google Gemini API)]
-    - ใช้โมเดลเรือธงความเร็วสูง: Gemini 3.7 Flash / Gemini 2.5 Flash
-    - จับคู่คำศัพท์เฉพาะทางจาก Dictionary Glossary (Terminology Enforcement)
-    - แก้ไขความผิดพลาดของเสียงวรรณยุกต์/คำพ้องเสียงจาก Speech-to-Text (ASR Error Post-Correction)
-    - แปลงบริบทภาษาธรรมชาติแบบ Fluent & Context-Aware (Thai ➔ English / English ➔ Thai)
-              │
-              ▼ (WebSocket: 'transcripts-updated')
- 🖥️ [Admin Console & Live Subtitle Display Feed]
-    - แสดงข้อความต้นฉบับ + คำแปลขนาดใหญ่ปรับขนาดได้
-    - Telemetry วัดความหน่วงแบบเรียลไทม์ (AI Latency ms & Socket Ping ms)
-    - เครื่องมือแก้ไขคำแปลสด (Inline Edit), สั่งแปลใหม่ (AI Retranslate)
-    - ส่งออกเอกสารสรุปบันทึกการประชุม (.TXT) และไฟล์คำบรรยาย (.SRT)
+ไมโครโฟน
+  → AudioWorklet แปลงเป็น PCM 16 kHz mono เฟรมละ 20 ms   (src/asr/audio/pcm.ts)
+  → base64 ส่งผ่าน WebSocket ไปยังเซิร์ฟเวอร์ของเราเอง
+      ws://<host>/ws/gemini-live-transcribe                (useGeminiLiveCapture.ts)
+  → เซิร์ฟเวอร์เปิด WebSocket ของตัวเองไปยัง Gemini        (server/geminiLiveProxy.ts)
+      โมเดล gemini-3.5-live-translate-preview
+  ← Gemini ส่งกลับเป็นชิ้นข้อความต่อเนื่องระหว่างที่ยังพูดอยู่
+      inputTranscription  = ข้อความต้นฉบับ
+      outputTranscription = คำแปล
+  → hook สะสมชิ้นส่วน แสดงผลสดในกล่อง subtitle (ตัวจาง)
+      แล้วปิดเป็น caption หนึ่งรายการเมื่อเงียบครบ 1.2 วินาที
+  → captions reducer → UI                                  (src/asr/captions.ts)
 ```
+
+**API key อยู่ฝั่งเซิร์ฟเวอร์เท่านั้น** เบราว์เซอร์ไม่เคยเห็นทั้ง
+`GEMINI_API_KEY` และชื่อโมเดล เพราะเชื่อมต่อมาที่เซิร์ฟเวอร์ของเราเสมอ
+ไม่ได้ต่อตรงไป Google สิ่งที่ client ส่งขึ้นมาได้มีเพียงคู่ภาษาและรายการ
+คำศัพท์จาก glossary ซึ่งเซิร์ฟเวอร์ตรวจสอบ (allowlist + จำกัดจำนวน/ความยาว)
+ก่อนใช้งานทุกครั้ง
+
+### 1.2 เส้นทางสรุปการประชุม (HTTP)
+
+```
+กด "จบ Session"
+  → POST /api/gemini/summarize   (server/geminiRoutes.ts)
+  → Gemini รุ่นข้อความ (ค่าเริ่มต้น gemini-3.6-flash)
+  → บันทึกสรุปลง project ใน localStorage
+```
+
+หากเรียก Gemini ไม่สำเร็จหรือเกิน 20 วินาที เซิร์ฟเวอร์ยังตอบ HTTP 200 พร้อม
+สรุปว่าง เพื่อรับประกันว่า **transcript ดิบจะไม่หายไปไม่ว่ากรณีใด**
+
+### 1.3 ไฟล์สำคัญ
+
+| ไฟล์ | หน้าที่ |
+|---|---|
+| `server.ts` | เสิร์ฟหน้าเว็บ + ประกอบ route ทั้งหมด ผูก WebSocket proxy เข้ากับ HTTP server เดียวกัน ค่าเริ่มต้นผูกกับ 127.0.0.1 |
+| `server/geminiLiveProxy.ts` | WebSocket relay ไป Gemini, ถือ API key, ตรวจ input จาก client, ตัดเฟรมเสียงที่ไม่ใช้ทิ้ง |
+| `server/geminiRoutes.ts` | REST endpoint `/api/gemini/summarize` |
+| `server/gemini.ts` | เรียก Gemini ผ่าน SDK สำหรับงานที่เป็น HTTP (สรุปผล) |
+| `src/asr/audio/useGeminiLiveCapture.ts` | หัวใจฝั่ง client — จับเสียง, สตรีม, สะสมชิ้นข้อความ, ตัดเป็น caption |
+| `src/asr/audio/pcm.ts` | นิยามรูปแบบเสียง (16 kHz mono) และ AudioWorklet |
+| `src/asr/captions.ts` | reducer เก็บ caption ตาม `seq` รองรับการแก้ไขคำแปล |
+| `src/glossary.ts` | glossary ใน localStorage + แปลงเป็น `customVocabulary` |
+| `src/pages/Admin.tsx` | หน้าจอควบคุมทั้งหมด |
+| `src/hooks/useProjects.ts` | โปรเจกต์/ประวัติ session (localStorage) |
+
+### 1.4 ตัวแปรสภาพแวดล้อม (`.env`)
+
+| ตัวแปร | ค่าเริ่มต้น | ใช้ทำอะไร |
+|---|---|---|
+| `GEMINI_API_KEY` | — (ต้องกำหนด) | กุญแจเรียก Gemini ทุกเส้นทาง |
+| `GEMINI_LIVE_MODEL` | `gemini-3.5-live-translate-preview` | โมเดลแปลสดผ่าน WebSocket |
+| `GEMINI_MODEL` | `gemini-3.6-flash` | โมเดลข้อความสำหรับสรุปผล |
+| `GEMINI_SUMMARY_MODEL` | ใช้ `GEMINI_MODEL` | แยกโมเดลสรุปได้ถ้าต้องการ |
+| `GEMINI_LIVE_TARGET_LANG` | `en` | ภาษาปลายทางเริ่มต้น (client เลือกทับได้) |
+| `GEMINI_LIVE_SOURCE_LANGS` | `th-TH` | ภาษาต้นทางเริ่มต้น |
+| `HOST` | `127.0.0.1` | เปลี่ยนเป็น `0.0.0.0` หากต้องเข้าจากเครื่องอื่น |
 
 ---
 
 ## 2. ฟังก์ชันหลักของระบบ (Core System Features)
 
-### 2.1 การจับคู่ภาษาอัตโนมัติ (Intelligent Auto Language Pairing)
-- **เน้นคู่ภาษาหลัก 2 ภาษา (Thai ↔ English)**:
-  - **เมื่อเลือกภาษาผู้พูดเป็น "ไทย (th-TH)"** ➔ ระบบจะตั้งค่าภาษาที่ต้องการแปลเป็น **"อังกฤษ (English)"** โดยอัตโนมัติ (Auto)
-  - **เมื่อเลือกภาษาผู้พูดเป็น "อังกฤษ (en-US)"** ➔ ระบบจะตั้งค่าภาษาที่ต้องการแปลเป็น **"ไทย (Thai)"** โดยอัตโนมัติ (Auto)
-- **ปุ่มสลับภาษาด่วน (One-Click Quick Swap `↔ สลับภาษา`)**: สามารถสลับทิศทางการแปลระหว่าง `ไทย ➔ อังกฤษ` และ `อังกฤษ ➔ ไทย` ได้ทันทีทั้งจากแถบตั้งค่าและจากหัวตาราง Live Feed
+### 2.1 กล่อง Subtitle เดียว สำหรับ crop ไป OBS
+พื้นที่แสดงคำแปลหลักเป็น **กล่องเดียว** แสดงทีละข้อความ (เหมือน subtitle บน
+YouTube) ประวัติทั้งหมด (แก้ไข/คัดลอก/ซ่อน) อยู่ใน panel พับเก็บด้านล่าง
 
-### 2.2 ระบบตัดวรรคแปลสดอัตโนมัติ (Live Speech Chunking & Silence Segmentation)
-- **แก้ปัญหาเสียงพูดภาษาไทยไม่ตัดวรรค**: ปกติ Web Speech API จะไม่ตัดจบประโยคจนกว่าผู้พูดจะเงียบไปหลายวินาที ทำให้ไม่เป็น Live Translation
-- **ตรวจจับจังหวะหยุดพูดอัจฉริยะ (Acoustic Silence Debounce)**: ระบบจะตรวจจับการหยุดพักประโยคหรือจังหวะหายใจของผู้พูด และทำการตัดท่อนประโยค (Chunk) ส่งให้โมเดล AI แปลทันทีแบบสดๆ
-- **ปรับแต่งความไวในการตัดวรรคได้ 3 ระดับ**:
-  - `⚡ เร็วมาก (Fast: ~600ms)`: ตัดประโยคย่อยคำต่อคำทันทีเมื่อหยุดพูดเพียงเสี้ยววินาที
-  - `⚖️ มาตรฐาน (Balanced: ~900ms)`: ตัดตามจังหวะเว้นวรรคหายใจตามธรรมชาติ (แนะนำสำหรับการประชุม)
-  - `🧘 ผ่อนคลาย (Relaxed: ~1400ms)`: รอประโยคยาวก่อนตัดวรรค
-- **ปุ่มตัดแปลสดทันที (Manual Cut Now `✂️ ตัดแปลทันที`)**: สามารถกดปุ่มตัดท่อนที่กำลังพูดอยู่บนแถบไมโครโฟนเพื่อส่งแปลได้ทันใจทุกวินาที
+### 2.2 ข้อความไหลสดระหว่างพูด (Live Partial)
+ระหว่างที่ยังพูดไม่จบประโยค คำแปลที่ Gemini ทยอยส่งกลับมาจะแสดงในกล่อง
+subtitle ทันทีด้วย **ตัวอักษรสีจาง** และแสดงข้อความต้นฉบับสดบนแถบ "กำลังฟัง"
+เมื่อผู้พูดหยุด ระบบจะปิดประโยคนั้นเป็น caption หนึ่งรายการ ตัวอักษรเปลี่ยน
+เป็นสีเข้ม และรายการถูกบันทึกลงประวัติ (ระหว่างที่ยังเป็นตัวจาง จะยังแก้ไข
+ข้อความไม่ได้ เพราะประโยคยังไม่จบ)
 
-### 2.3 โมเดล AI แปลภาษาและการแก้ไขคำผิด (Gemini AI Translation & Post-Correction)
-- ขับเคลื่อนด้วย SDK ล่าสุด `@google/genai`
-- **รองรับโมเดล**:
-  - `gemini-3.7-flash` (แนะนำ: ความเร็วสูง ตอบสนองทันที เหมาะกับการประชุมสด)
-  - `gemini-2.5-flash` (มาตรฐานความเร็วสูง)
-  - `gemini-2.5-pro` (ความแม่นยำสูง สำหรับเนื้อหาเชิงวิชาการ/กฎหมาย)
-- **ASR Post-Correction Prompt**: ปรับแต่ง Prompt พิเศษเพื่อช่วยกู้คืนคำศัพท์ที่ Speech-to-Text อาจได้ยินผิดหรือสะกดผิดจากเสียงวรรณยุกต์หรือเสียงแทรก
-- **ระบบ Fallback สำรอง**: มีพจนานุกรมคำศัพท์และประโยคพื้นฐานในตัว ทำให้ระบบยังคงทำงานต่อเนื่องได้แม้ในสภาวะ Offline หรือกรณีโควต้า AI ขัดข้อง
+### 2.3 การจับคู่ภาษา (Thai ⇄ English เท่านั้น)
+เลือกภาษาต้นทางแล้วปลายทางสลับให้อัตโนมัติ รองรับทั้ง ไทย→อังกฤษ และ
+อังกฤษ→ไทย การสลับภาษาระหว่าง session จะเชื่อมต่อ WebSocket ใหม่ (เพราะ
+ตั้งค่าภาษาได้เฉพาะตอนเปิด session) ใช้เวลาราวหนึ่งวินาที โดยลำดับ caption
+เดิมไม่ถูกเขียนทับ
 
-### 2.3 ระบบพจนานุกรมศัพท์เฉพาะทาง (Glossary & Terminology Manager)
-- สามารถกำหนดคำเฉพาะ (Jargon), ชื่อยี่ห้อ, คำย่อ (Acronyms เช่น KPI, ROI, LLM, AGM)
-- รองรับการนำเข้าตาราง Excel แบบ Copy & Paste สองคอลัมน์ได้ทันที
-- บันทึกและสลับใช้งาน Dictionary Preset ชุดคำศัพท์แยกตามประเภทการประชุมได้
+### 2.4 พจนานุกรมศัพท์เฉพาะทาง (Glossary — 3 หมวด, เก็บในเบราว์เซอร์)
+เก็บใน localStorage ของเบราว์เซอร์ แบ่ง 3 หมวด:
+- **ศัพท์เฉพาะ** (`protected_terms`) — ไทย → อังกฤษ
+- **ชื่อบุคคล** (`person_names`) — ไทย → อังกฤษ
+- **แก้คำไทยที่ฟังผิด** (`thai_corrections`) — ไทย → ไทย
 
-### 2.4 ระบบความปลอดภัยของ API Key (Server-Side Secret Protection)
-- ไม่เปิดเผย `GEMINI_API_KEY` ไปยัง Client หรือ Browser DevTools
-- ผู้ดูแลระบบสามารถระบุ Custom API Key ผ่าน Admin Console เพื่อส่งไปบันทึกบน Server ในหน่วยความจำปลอดภัย พร้อมปุ่ม **"ทดสอบการเชื่อมต่อ API Key"** ตรวจสอบสถานะก่อนใช้งานจริง
+รองรับค้นหา เพิ่ม/ลบทีละคำ และวางสองคอลัมน์จาก Excel/Sheets
 
-### 2.5 การทดสอบและการส่งข้อความจำลอง (Instant Test Input Bar)
-- มีแถบ **"ตัวอย่างทดสอบ"** และช่องป้อนข้อความจำลองเสียงพูดด้านล่าง Feed เพื่อทดสอบการแปลของโมเดล AI ได้ทันทีโดยไม่ต้องรอเปิดไมโครโฟน
+glossary ทำงานสองทางพร้อมกัน ตอนเปิด session:
 
-### 2.6 การส่งออกผลลัพธ์ (Export Capabilities)
-- **TXT Export**: บันทึกบทสนทนาการประชุมพร้อมเวลาและคำแปลสำหรับทำรายงานการประชุม
-- **SRT Subtitle Export**: ส่งออกไฟล์ Subtitle พร้อม Timecode สำหรับนำไปประกอบวิดีโอบันทึกการประชุม
+1. **`customVocabulary`** — ส่งเฉพาะ**ฝั่งภาษาต้นทาง**ของทุกหมวด เพื่อช่วยให้
+   ระบบ**รู้จำเสียง**คำเหล่านั้นแม่นขึ้น (ตัวรู้จำเสียงฟังภาษาต้นทาง ไม่ได้ฟัง
+   คำแปล) หมวดแก้คำผิดใช้ "คำที่ถูก" ไม่ใช่คำที่ฟังผิด
+2. **`systemInstruction`** — ส่งคู่คำของหมวด**ศัพท์เฉพาะ**และ**ชื่อบุคคล**
+   เพื่อบังคับ**คำแปล**ให้ตรงตามที่กำหนด (เฉพาะสองหมวดนี้ เพราะหมวดแก้คำผิด
+   เป็นไทย→ไทย ไม่เกี่ยวกับการแปล)
+
+> **ข้อจำกัดที่ทดสอบแล้ว:** การบังคับคำแปลเป็นแบบ best-effort — จากการทดสอบ
+> ซ้ำหลายรอบ โมเดลทำตามบางคำแต่ไม่ทุกคำเสมอไป โดยเฉพาะคำที่อยู่กลางประโยค
+> การเขียนคำสั่งให้เข้มขึ้นไม่ได้ช่วย ถ้าคำไหนต้องถูกต้อง 100% ยังต้องแก้เอง
+> ในช่องแก้ไขคำแปล
+
+client ส่งขึ้นมาเป็น**คู่คำที่มีโครงสร้าง** ไม่ใช่ข้อความคำสั่ง — เซิร์ฟเวอร์
+เป็นคนประกอบคำสั่งเอง เพื่อไม่ให้เบราว์เซอร์ส่ง prompt อะไรก็ได้เข้าไปใช้
+งานบน key ที่มีค่าใช้จ่าย
+
+เนื่องจากตั้งค่าได้เฉพาะตอนเปิด session การแก้ glossary ระหว่าง session จะมี
+ผลกับ session ถัดไป
+
+### 2.5 การบันทึกและสรุปช่วงประชุมอัตโนมัติ
+ไม่มีปุ่ม "เริ่มบันทึก" — ทุกประโยคที่ปิดแล้วถูกเก็บอัตโนมัติตลอด session
+กด "จบ Session" ระบบจะส่ง transcript ทั้งหมดให้ Gemini สรุป **แบบเบื้องหลัง**
+ไม่ต้องรอ — ใช้งานต่อได้ทันที ระหว่างที่ยังสรุปไม่เสร็จ panel สรุปและหน้า
+ประวัติ session จะขึ้นสถานะ "กำลังสรุป…" ถ้าเรียกไม่สำเร็จจะยังคง transcript
+ดิบไว้ครบและขึ้นข้อความเตือนแทนสรุป AI
+
+### 2.6 ประวัติ Session ในโปรเจกต์
+กดไอคอน 📋 ข้างชื่อโปรเจกต์เพื่อดู session ทั้งหมดที่เคยบันทึก (เรียงล่าสุด
+ก่อน) คลิกเพื่อกางดูสรุป — ยังไม่มี database จริง เก็บใน localStorage
+
+### 2.7 การส่งออกผลลัพธ์ (Export)
+- **TXT**: บทสนทนาพร้อมเวลาและคำแปล
+- **SRT**: ไฟล์คำบรรยายพร้อม Timecode
+
+ทั้งสองแบบดึงจาก caption ที่มองเห็นอยู่ (ไม่รวมรายการที่ถูกซ่อน) รวมคำแปลที่
+operator แก้เอง ส่วนสรุปด้วย AI และบันทึกโปรเจกต์ถาวรจะรวมรายการที่ถูกซ่อน
+ไว้ด้วยเสมอ
 
 ---
 
 ## 3. วิธีการเริ่มใช้งาน (Quick User Guide)
 
-1. **เลือกคู่ภาษา**: ระบบจะตั้งค่าเริ่มต้นเป็น `ไทย (Thai)` ➔ `อังกฤษ (English)`
-2. **ทดสอบโมเดล AI**:
-   - สามารถคลิกชิปตัวอย่างที่แถบด้านล่าง เช่น *"สวัสดีครับ ยินดีต้อนรับสู่การประชุม"* หรือพิมพ์ข้อความแล้วกดปุ่ม **"แปลทันที"**
-   - คำแปลจาก Gemini 3.7 Flash จะปรากฏขึ้นในตาราง Feed ทันที
-3. **เริ่มการแปลสดจากไมโครโฟน**:
-   - กดปุ่ม **"เริ่มแปลสด"** สีชมพูที่มุมขวาบน
-   - อนุญาตการเข้าถึงไมโครโฟนในเบราว์เซอร์
-   - เริ่มพูดใส่ไมโครโฟน ระบบจะถอดเสียงและแปลภาษาแบบเรียลไทม์อัตโนมัติ
-4. **แก้ไขคำแปลสด**:
-   - หากต้องการแก้ไขคำแปล สามารถคลิกไอคอนดินสอ (Edit) ที่รายการนั้นๆ เพื่อแก้ไขหรือกด **"ให้ AI แปลใหม่"** ได้ทันที
+**เตรียมก่อนใช้งาน**: ตั้งค่า `GEMINI_API_KEY` ใน `.env` (ดูตัวอย่างใน
+`.env.example`)
+
+```bash
+npm install
+npm run dev      # เสิร์ฟทั้งหน้าเว็บและ API ที่ http://127.0.0.1:3000
+```
+
+1. **เลือกหรือสร้างโปรเจกต์** จากหน้าแรก
+2. **กด "เริ่ม Session"** มุมขวาบน — ระบบขอสิทธิ์ไมโครโฟน
+3. **พูดใส่ไมโครโฟน** — คำแปลจะไหลขึ้นแบบตัวจางทันทีระหว่างพูด และกลายเป็น
+   ตัวเข้มเมื่อจบประโยค
+4. **สลับภาษา / พัก-เล่นต่อ** ได้จากปุ่มในแถบหัวเรื่องหรือ sidebar
+5. **กด "จบ Session"** — ระบบเก็บท้ายประโยคสุดท้ายราว 2-3 วินาทีแล้วคืน
+   หน้าจอให้ทันที ส่วนการสรุปทำเบื้องหลัง ระหว่างนั้นจะขึ้น "กำลังสรุป…"
+6. ดูสรุปย้อนหลังได้จากไอคอน 📋 ข้างชื่อโปรเจกต์
 
 ---
 
-## 4. แผนพัฒนาต่อ: Multi-Tenant, Authentication & Billing (Roadmap — ยังไม่ได้เริ่มพัฒนา)
+## 4. ข้อจำกัดและพฤติกรรมที่ควรทราบ
 
-> เป็นผลสรุปจากการออกแบบ architecture ร่วมกัน ยังเป็นแค่แนวทาง (design) ยังไม่ได้ลงมือแก้โค้ดจริง
+- **session แยกตามแท็บ** — ไม่มี session registry กลาง แต่ละแท็บที่กด
+  "เริ่ม Session" จับเสียงของตัวเอง
+- **แก้ไขคำแปลได้เฉพาะประโยคที่ปิดแล้ว** — ระหว่างที่ยังเป็นตัวจางแก้ไม่ได้
+- **สลับภาษาต้องเชื่อมต่อใหม่** — มีช่วงสะดุดสั้นๆ ราวหนึ่งวินาที
+- **glossary มีผลตอนเปิด session** — แก้ระหว่าง session จะมีผลรอบถัดไป
+- **จบ session ต้องรอสักครู่** — ระบบป้อนความเงียบให้โมเดลราว 1.5 วินาที
+  เพื่อให้ปิดประโยคสุดท้ายได้ครบ ไม่เช่นนั้นท้ายประโยคจะขาดหาย ส่วนการสรุป
+  ทำเบื้องหลัง ไม่ต้องรอ
+- **session ที่หลุดจะต่อใหม่อัตโนมัติ** — Gemini ปิด session เองเมื่อถึงอายุ
+  ที่กำหนด ระบบจะบันทึกประโยคที่ค้างอยู่แล้วเชื่อมต่อใหม่ให้ (สูงสุด 5 ครั้ง
+  ติดกันก่อนจะแจ้งให้เริ่ม session ใหม่เอง)
+- **เซิร์ฟเวอร์ไม่มีระบบยืนยันตัวตน** — ค่าเริ่มต้นจึงผูกกับ `127.0.0.1`
+  หากเปิดให้เครื่องอื่นเข้าถึง (`HOST=0.0.0.0`) ควรมีการป้องกันเพิ่ม
 
-### 4.1 เป้าหมาย
-ปัจจุบันระบบเป็น single-tenant: มี state ส่วนกลาง (config, transcripts, API key) ตัวเดียวที่ทุก client เชื่อมต่อเข้ามาใช้ร่วมกัน ไม่มีระบบผู้ใช้ ไม่มีการแยกข้อมูลตามงาน และไม่มีการคำนวณต้นทุน เป้าหมายต่อไปคือทำให้แต่ละ **user** สามารถสร้าง **project** ของตัวเองได้หลายโปรเจกต์ (เช่น 1 project = 1 งานประชุมวิชาการ 30 นาที) โดยข้อมูลและค่าใช้จ่ายแยกกันชัดเจนเป็นรายโปรเจกต์
+---
 
-### 4.2 ขอบเขตที่ตกลงกันไว้ (Confirmed Scope)
-- **เก็บข้อมูลเฉพาะข้อความ (text-only)** — ไม่มีการอัดหรือเก็บไฟล์เสียงดิบ จึงไม่ต้องมี Object Storage (S3/GCS) เพิ่ม ใช้ Postgres ตัวเดียวพอ
-- **API Key เป็นของระบบ ไม่ใช่ของ user** — ตัดหน้า "API Key" ใน Admin console ออกทั้งหมด ระบบใช้ `GEMINI_API_KEY` ระดับ platform ตัวเดียว (จาก env) แล้วคิดต้นทุนฝั่งเราเอง ก่อนสรุปยอดส่งให้ user
-- **ไม่มีระบบ self-registration** — เป็นระบบใช้ภายในองค์กร แอดมินเป็นผู้สร้าง account ให้ user เองในช่วงแรก
-- **1 project = 1 การประชุมครั้งเดียว** — ไม่ต้องมี entity "Session" แยกจาก "Project"
-- **Billing เป็นรายงานสรุปยอดในระบบ พร้อม export เป็นไฟล์ PDF** — ไม่ต้องผูก payment gateway (Stripe/Omise/2C2P) ในเฟสนี้ ระบบคำนวณยอดแล้ว generate ใบสรุปยอด (bill) เป็นไฟล์ PDF ให้ดาวน์โหลดต่อ project เพื่อให้ทีมนำไปเรียกเก็บเงินนอกระบบ
+## 5. แผนพัฒนาต่อ (Roadmap)
 
-### 4.3 Architecture Overview
-
-```
-[Operator Browser] --HTTPS/WSS + Session-->
-        │
-   [Auth Layer]  →  ยืนยันตัวตนด้วย session, ไม่มีหน้า signup (แอดมินสร้าง user เอง)
-        │
-   [Project Service]  →  CRUD project, ผูก project กับ owner_user_id
-        │
-   [Realtime Session Manager]
-        │   Socket.IO room = projectId  (แทนที่ io.emit() แบบ global เดิม)
-        │   → io.to(projectId).emit(...) แทน io.emit(...) ทั้งหมด
-        │
-        ├──> [Translation Worker]  (performTranslation() เดิม ใช้ platform API key เดียว)
-        │        └─> อ่าน token usage จาก Gemini response.usageMetadata → บันทึกลง Usage Ledger
-        │
-        └──> [Persistence Writer]  →  Postgres: เขียน transcript ทีละ event
-        │
-   [Usage Ledger (Postgres)]  →  รวมยอดตาม project_id
-        │
-   [Billing Report]  →  คำนวณ token cost + service fee → แสดงในระบบ + generate ไฟล์ PDF ให้ดาวน์โหลด (ไม่มี payment gateway)
-```
-
-### 4.4 Data Model (Postgres)
-
-| Entity | คีย์สำคัญ | หมายเหตุ |
-|---|---|---|
-| `users` | id, email, password_hash, role (`admin`\|`member`), created_at | แอดมินสร้างให้เอง ไม่มี self-registration |
-| `projects` | id, owner_user_id, name, status (`draft`\|`active`\|`ended`), config (JSONB: ภาษา, dictionary, chunking ms — ตรงกับ `AppConfig` เดิม), created_at, ended_at | 1 project = 1 การประชุมครั้งเดียว |
-| `transcript_items` | id, project_id, original_text, translated_text, timestamp, latency_ms, is_edited, tokens_in, tokens_out | แทนที่ array `transcripts` ใน memory ของ server.ts เดิม |
-| `usage_events` | id, project_id, event_type (`gemini_call`), tokens_in, tokens_out, unit_cost, total_cost, created_at | insert ทุกครั้งที่เรียก Gemini เพื่อคำนวณต้นทุน |
-
-### 4.5 การเปลี่ยนแปลงหลักที่ต้องทำในโค้ดปัจจุบัน
-1. **Auth**: เพิ่ม session-based login และ middleware เช็ค session ทั้งฝั่ง HTTP routes และตอน Socket.IO handshake (`io.use(...)`) — มี 2 ทางเลือกสำหรับตัว auth เอง (ดูรายละเอียดเปรียบเทียบใน 4.6):
-   - **Option A**: hand-rolled (email + password, bcrypt + server-side session เก็บใน Postgres)
-   - **Option B**: ต่อกับระบบ auth ของ IT องค์กรที่มีอยู่แล้ว (SSO ผ่าน SAML/OIDC หรือ Active Directory/LDAP) แล้วเก็บแค่ mapping user ↔ role ↔ project ไว้ในตาราง `users` ของเราเอง
-2. **Realtime scoping**: เปลี่ยนทุก `io.emit(...)` ใน [server.ts](server.ts) เป็น `io.to(projectId).emit(...)` และให้ client `socket.join(projectId)` ตอนเชื่อมต่อ — ปิดช่องโหว่ transcript รั่วไปทุก client ที่เคยพบระหว่างรีวิว
-3. **ตัด API Key UI**: ลบ tab "API Key" และ logic รับ/ทดสอบ custom token ทั้งหมดออกจาก [Admin.tsx](src/pages/Admin.tsx) และ [server.ts](server.ts) เหลือใช้ `GEMINI_API_KEY` จาก env เพียงตัวเดียว
-4. **CORS**: ปิด `origin: "*"` ของ Socket.IO server เหลือแค่ domain จริงของแอป
-5. **Usage metering**: อ่าน `response.usageMetadata` จาก Gemini SDK ในทุกครั้งที่เรียก `performTranslation()` แล้วบันทึกลงตาราง `usage_events`
-6. **Persistence**: ย้าย state จาก in-memory (`currentConfig`, `transcripts`, `serverSecretApiKey`) ไปเขียน/อ่านจาก Postgres แบบ per-event (ปริมาณ event ต่องานประชุมไม่มาก ไม่จำเป็นต้องมี cache layer เพิ่ม)
-7. **PDF export**: เพิ่ม endpoint generate ใบสรุปยอด (bill) เป็น PDF ต่อ project โดยรวม token cost + service fee จาก `usage_events` — ใช้ library ฝั่ง server เช่น `pdfkit` หรือ render HTML แล้วแปลงด้วย `puppeteer`
-8. **Pause/Resume recording ภายใน 1 project**: แก้บั๊กที่พบระหว่างรีวิว — ปัจจุบัน [server.ts:236-241](server.ts#L236-L241) สั่ง `transcripts = []` (ล้างข้อมูลทิ้งหมด) ทุกครั้งที่ event `start-meeting` ถูกยิง แปลว่าถ้า operator กดหยุด-เริ่มมิคใหม่หลายครั้งระหว่างงานเดียวกัน ข้อมูลที่แปลไปแล้วจะหายทุกรอบ ต้องแก้ให้ project เดิมกดอัด/หยุดอัดได้หลายครั้งโดยไม่ล้างข้อมูล กล่าวคือ:
-   - `start-meeting` ควรแค่ตั้ง `isMeetingActive = true` และ**ต่อ**บันทึกลง `transcript_items` ของ `project_id` เดิม ไม่ clear ของเก่า
-   - `stop-meeting` เป็นแค่ pause (หยุดฟังไมค์ชั่วคราว) ไม่ใช่ end-of-project — การ "จบ project" ต้องเป็น action แยกต่างหาก (เช่นปุ่ม "จบการประชุม") ที่เปลี่ยน `projects.status` เป็น `ended` และ lock ไม่ให้แก้ transcript ต่อ
-
-### 4.6 Stack ที่แนะนำ
-- **Database**: Postgres + Prisma หรือ Drizzle ORM
-- **Auth**: มี 2 ทางเลือก ขึ้นอยู่กับว่าองค์กรมีระบบ auth กลางอยู่แล้วหรือไม่
-  - **Option A — hand-rolled** (bcrypt + server-side session): ไม่จำเป็นต้องใช้ Auth SaaS เพราะไม่มี self-registration และ scope เล็ก เหมาะถ้าอยากเริ่มเร็วโดยไม่ต้องพึ่งทีม IT
-  - **Option B — ต่อกับระบบ auth ของ IT องค์กร** (SSO/SAML/OIDC หรือ Active Directory/LDAP ที่มีอยู่แล้ว): ข้อดีคือ user ไม่ต้องจำ password แยกอีกชุด, การปิด/เปิดสิทธิ์ user จัดการที่ระบบกลางที่เดียว (ตอนคนลาออกก็ตัดสิทธิ์อัตโนมัติ), ตรงกับ requirement "ใช้ในองค์กรเท่านั้น ไม่มี self-registration" อยู่แล้ว — ข้อควรระวังคือต้องขอข้อมูล integration (client ID/secret, endpoint) จากทีม IT ก่อน และแอปเรายังต้องมีตาราง `users` ของตัวเองไว้ map ว่า user คนนี้เป็น owner ของ project ไหนบ้าง (SSO ให้แค่ identity ไม่ได้ให้ business data)
-  - แนะนำ: เริ่ม Option A ไปก่อนถ้าต้องรีบใช้งาน แล้วค่อยย้ายไป Option B ทีหลังถ้า IT มีระบบพร้อมและต้องการรวมศูนย์การจัดการสิทธิ์
-- **Hosting**: ใช้ Node server เดิมต่อได้ เพิ่มแค่ Postgres (self-host หรือ managed เช่น Neon/Supabase DB)
-
-> หมายเหตุ: ส่วนนี้เป็นผลจากการ brainstorm ยังไม่ได้เขียนเป็น spec/implementation plan อย่างเป็นทางการ เมื่อพร้อมเริ่มพัฒนาให้กลับมาทำ spec doc ก่อนลงมือแก้โค้ด
+- ย้ายข้อมูลโปรเจกต์/ประวัติ session จาก localStorage ไปเป็น database จริง
+- ระบบยืนยันตัวตนสำหรับการใช้งานข้ามเครื่อง
+- รองรับคู่ภาษาเพิ่มเติมนอกเหนือจากไทย ⇄ อังกฤษ
+- ทำให้ glossary มีผลทันทีโดยไม่ต้องเริ่ม session ใหม่

@@ -9,7 +9,11 @@ import {
   Layers,
   ArrowRight,
   Repeat,
-  AlarmClock
+  AlarmClock,
+  ClipboardList,
+  ChevronDown,
+  ChevronUp,
+  AlertTriangle
 } from 'lucide-react';
 import { Project, ProjectBill, ProjectSession } from '../types';
 import { MAX_ACTIVE_PROJECTS, projectDaysLeft } from '../hooks/useProjects';
@@ -393,6 +397,142 @@ export function HistoryPanel({ projects, onClose }: { projects: Project[]; onClo
                 </div>
               </div>
             ))
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Slide-over listing every ASR session recorded under one project, each
+//    expandable to its section-report summary. No P2 database exists yet —
+//    this reads straight off the same localStorage record everything else
+//    in `Project` already lives in, which is the "mock" the feature asked
+//    for; the shape carries over unchanged once a real backend lands. ──────
+export function SessionHistoryModal({
+  project,
+  summarizingIds,
+  onClose
+}: {
+  project: Project;
+  // ASR session ids whose summary is still being generated in the
+  // background (see useProjects.markSessionSummarizing).
+  summarizingIds: Set<string>;
+  onClose: () => void;
+}) {
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  // Most recent recording first — that's the one an operator just finished
+  // and is most likely to be looking for.
+  const sessions = [...project.sessions].sort((a, b) => b.startedAt - a.startedAt);
+
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end">
+      <div onClick={onClose} className="absolute inset-0 bg-black/30" />
+      <div className="relative w-full max-w-md bg-white h-full shadow-2xl flex flex-col font-sans">
+        <div className="p-4 border-b border-slate-200 flex items-center justify-between shrink-0">
+          <h2 className="font-bold text-slate-900 text-sm flex items-center gap-2">
+            <ClipboardList className="w-4 h-4 text-[#DE5C8E]" />
+            <span>Session ในโปรเจกต์นี้</span>
+          </h2>
+          <button onClick={onClose} className="p-1 text-slate-400 hover:text-slate-600 rounded-md hover:bg-slate-100">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+        <p className="px-4 pt-3 text-[11px] text-slate-400 leading-relaxed">{project.name}</p>
+
+        <div className="flex-1 overflow-y-auto p-4 space-y-2.5">
+          {sessions.length === 0 ? (
+            <div className="text-center text-slate-400 text-xs py-8">ยังไม่มี session ในโปรเจกต์นี้</div>
+          ) : (
+            sessions.map((s, index) => {
+              const isOpen = expandedId === s.id;
+              const isLive = !s.endedAt;
+              const duration = s.endedAt ? formatDuration(s.endedAt - s.startedAt) : null;
+              const isSummarizing = summarizingIds.has(s.asrSessionId);
+              const hasSummary = Boolean(s.summary);
+              // `summary === undefined` (no report.done ever arrived — the
+              // session predates this feature, or ended before one came in)
+              // reads differently from `summary === ""` (the backend tried
+              // and the AI call itself failed server-side).
+              const reportAttempted = s.summary !== undefined;
+
+              return (
+                <div key={s.id} className="border border-slate-200 rounded-xl overflow-hidden">
+                  <button
+                    type="button"
+                    onClick={() => setExpandedId(isOpen ? null : s.id)}
+                    className="w-full p-3 bg-slate-50 hover:bg-pink-50/60 flex items-center justify-between gap-2 text-left transition-all"
+                  >
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="font-semibold text-xs text-slate-800">Session #{sessions.length - index}</span>
+                        {isLive && (
+                          <span className="px-1.5 py-0.5 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 text-[10px] font-bold">
+                            กำลังดำเนินการ
+                          </span>
+                        )}
+                        {isSummarizing ? (
+                          <span className="px-1.5 py-0.5 rounded-md text-[10px] font-semibold border bg-pink-50 text-[#DE5C8E] border-pink-200">
+                            กำลังสรุป…
+                          </span>
+                        ) : (
+                          reportAttempted && (
+                            <span
+                              className={`px-1.5 py-0.5 rounded-md text-[10px] font-semibold border ${
+                                hasSummary
+                                  ? 'bg-slate-100 text-slate-600 border-slate-200'
+                                  : 'bg-amber-50 text-amber-700 border-amber-200'
+                              }`}
+                            >
+                              {hasSummary ? 'มีสรุป' : 'สรุป AI ไม่สำเร็จ'}
+                            </span>
+                          )
+                        )}
+                      </div>
+                      <div className="text-[11px] text-slate-400">
+                        {new Date(s.startedAt).toLocaleString()}
+                        {duration && <> · {duration}</>} · {s.sourceLang} → {s.targetLang}
+                      </div>
+                    </div>
+                    {isOpen ? (
+                      <ChevronUp className="w-4 h-4 text-slate-400 shrink-0" />
+                    ) : (
+                      <ChevronDown className="w-4 h-4 text-slate-400 shrink-0" />
+                    )}
+                  </button>
+
+                  {isOpen && (
+                    <div className="p-3 border-t border-slate-200 space-y-2">
+                      {isSummarizing ? (
+                        <p className="text-xs text-slate-500 flex items-center gap-1.5">
+                          <span className="relative flex h-2 w-2 shrink-0">
+                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#DE5C8E] opacity-75" />
+                            <span className="relative inline-flex rounded-full h-2 w-2 bg-[#DE5C8E]" />
+                          </span>
+                          <span>กำลังสรุปผลการประชุมด้วย AI… เปิดดูใหม่อีกครั้งเมื่อเสร็จแล้ว</span>
+                        </p>
+                      ) : !reportAttempted ? (
+                        <p className="text-xs text-slate-400">
+                          ยังไม่มีรายงานสำหรับ session นี้ — อาจยังไม่จบ หรือไม่มีคำพูดถูกบันทึกไว้ระหว่างนั้น
+                        </p>
+                      ) : hasSummary ? (
+                        <p className="text-xs text-slate-700 whitespace-pre-wrap leading-relaxed">{s.summary}</p>
+                      ) : (
+                        <p className="text-xs text-amber-700 flex items-start gap-1.5">
+                          <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                          <span>
+                            สรุปด้วย AI ไม่สำเร็จตอนบันทึก session นี้
+                            {typeof s.reportItemCount === 'number' && s.reportItemCount > 0 && (
+                              <> — มี {s.reportItemCount} ข้อความที่บันทึกไว้ แต่ไม่ได้เก็บ transcript แยกต่อ session ในเวอร์ชันนี้</>
+                            )}
+                          </span>
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })
           )}
         </div>
       </div>
