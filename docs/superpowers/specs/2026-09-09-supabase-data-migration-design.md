@@ -263,18 +263,22 @@ place.
 
 Today every caption of every past session is held in memory. The session
 history list only needs a *count*
-(`src/components/ProjectPanel.tsx`, `session.transcripts?.length`), so a view
+(`src/components/ProjectPanel.tsx`, `session.transcripts?.length`), so
+`project_sessions` carries a denormalised `item_count` column kept current by
+an `after insert or delete` trigger on `transcript_items`.
 
-```sql
-create view public.project_sessions_with_counts as
-  select s.*, (select count(*) from public.transcript_items t
-                where t.session_id = s.id) as item_count
-    from public.project_sessions s;
-```
+A view was the first choice and was rejected during planning: PostgREST
+cannot reliably embed a view in a nested select from `projects`, because
+views carry no foreign keys for the relationship to be detected from. The
+column keeps `listProjects` a single round trip and costs one cheap `UPDATE`
+per caption.
 
-supplies `itemCount`, and `ProjectSession.transcripts` stays `undefined`
-until something needs the text — opening a summary popup, or summarising.
-Initial load stays small however many meetings have been recorded.
+`ProjectSession.transcripts` then stays `undefined` until something needs the
+text, with one exception: **selecting a project loads that project's
+transcripts** in one query. `useLiveProjectCost` → `projectCost` prices every
+session in the current project from `session.transcripts ?? []`, so leaving
+them lazy would make the running cost badge silently undercount. Projects in
+the ended-history list stay lazy — they are read one summary at a time.
 
 `ProjectSession` gains `itemCount: number`. `reportItemCount` is kept: it
 records how many items were sent to the summariser, which is not the same
