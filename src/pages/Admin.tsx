@@ -743,7 +743,15 @@ export default function Admin() {
             )}
 
             {activeTab === 'dictionary' && (
-              <DictionaryManager sections={glossary} disabled={false} onAdd={handleGlossaryAdd} onRemove={handleGlossaryRemove} />
+              <DictionaryManager
+                sections={glossary}
+                sharedLists={glossaryState.sharedLists}
+                subscribedIds={glossaryState.subscribedIds}
+                onToggleList={(id) => void glossaryState.toggleList(id)}
+                disabled={false}
+                onAdd={handleGlossaryAdd}
+                onRemove={handleGlossaryRemove}
+              />
             )}
           </div>
 

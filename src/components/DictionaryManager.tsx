@@ -11,9 +11,10 @@ import {
   AlertCircle
 } from 'lucide-react';
 import type { GlossarySection, GlossarySections } from '../glossary';
+import type { GlossaryList } from '../data/glossaryRepo';
 
-// The glossary is persisted to localStorage per-browser via src/glossary.ts
-// — it is not shared across sessions or sent over any wire protocol. These
+// The glossary belongs to this project and is stored in the database — it
+// follows the operator to any device, not just this browser. These
 // sections are exactly what GlossarySections (src/glossary.ts) and the
 // Gemini prompt-building code understand; adding another here would not
 // correspond to anything else in the pipeline.
@@ -30,12 +31,25 @@ const SECTIONS: Array<{ key: GlossarySection; label: string; hint: string }> = [
 
 export interface DictionaryManagerProps {
   sections: GlossarySections | null;
+  /** Reusable lists maintained by an admin. Selecting one merges its terms
+   *  into this project; its contents cannot be edited here. */
+  sharedLists: GlossaryList[];
+  subscribedIds: Set<string>;
+  onToggleList: (listId: string) => void;
   onAdd: (section: GlossarySection, abbr: string, full: string) => void;
   onRemove: (section: GlossarySection, abbr: string) => void;
   disabled: boolean;
 }
 
-export default function DictionaryManager({ sections, onAdd, onRemove, disabled }: DictionaryManagerProps) {
+export default function DictionaryManager({
+  sections,
+  sharedLists,
+  subscribedIds,
+  onToggleList,
+  onAdd,
+  onRemove,
+  disabled
+}: DictionaryManagerProps) {
   const [activeSection, setActiveSection] = useState<GlossarySection>('protected_terms');
   const [searchQuery, setSearchQuery] = useState('');
   const [newTerm, setNewTerm] = useState('');
@@ -99,12 +113,44 @@ export default function DictionaryManager({ sections, onAdd, onRemove, disabled 
 
   return (
     <div className="space-y-3.5">
-      {/* The glossary is stored locally in this browser and shared by every
-          session started from it — there is no server file anymore. */}
+      {/* The glossary belongs to this project, is stored in the database,
+          and follows the operator to any device. */}
       <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-800 text-xs leading-relaxed">
         <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-        <span>พจนานุกรมนี้บันทึกไว้ในเบราว์เซอร์นี้ และใช้ร่วมกันทุก session ที่เริ่มจากเบราว์เซอร์นี้</span>
+        <span>พจนานุกรมนี้ผูกกับโปรเจกต์นี้ บันทึกในฐานข้อมูล และใช้งานได้จากทุกอุปกรณ์</span>
       </div>
+
+      {sharedLists.length > 0 && (
+        <div className="mb-3 pb-3 border-b border-slate-200">
+          <p className="text-[11px] font-semibold text-slate-500 mb-1.5">คลังคำศัพท์ที่ใช้ร่วมกัน</p>
+          <div className="flex flex-col gap-1">
+            {sharedLists.map((list) => (
+              <label
+                key={list.id}
+                className="flex items-start gap-2 text-xs text-slate-700 cursor-pointer"
+              >
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={subscribedIds.has(list.id)}
+                  disabled={disabled}
+                  onChange={() => onToggleList(list.id)}
+                />
+                <span className="min-w-0">
+                  <span className="font-medium">{list.name}</span>
+                  {list.description && (
+                    <span className="block text-[11px] text-slate-500">{list.description}</span>
+                  )}
+                </span>
+              </label>
+            ))}
+          </div>
+          <p className="mt-1.5 text-[11px] text-slate-400">
+            แก้ไขคลังที่ใช้ร่วมกันได้จากผู้ดูแลระบบเท่านั้น — คำที่เพิ่มด้านล่างจะอยู่กับโปรเจกต์นี้
+            และจะทับคำในคลังที่ชื่อซ้ำกัน
+          </p>
+        </div>
+      )}
 
       {/* Section tabs */}
       <div className="grid grid-cols-2 gap-1 p-1 bg-slate-50 border border-slate-200 rounded-lg text-[11px]">
