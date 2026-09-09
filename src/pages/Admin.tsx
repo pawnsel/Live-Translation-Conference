@@ -44,8 +44,9 @@ import { useGeminiLiveCapture, type CaptionResult } from '../asr/audio/useGemini
 import SubtitleText from '../components/SubtitleText';
 import { useProjects } from '../hooks/useProjects';
 import { useLiveProjectCost } from '../hooks/useLiveProjectCost';
-import { loadGlossary, saveGlossary, type GlossarySection, type GlossarySections } from '../glossary';
-import type { DisplayConfig, Project, ProjectSession } from '../types';
+import { emptyGlossary, type GlossarySection, type GlossarySections } from '../glossary';
+import { useGlossary } from '../hooks/useGlossary';
+import type { DisplayConfig, Project, ProjectSession, TranscriptItem } from '../types';
 
 // Bounded wait for a summary before giving up and showing the "AI summary
 // failed" state. A two-hour transcript is summarised chunk by chunk on the
@@ -101,14 +102,21 @@ function boxTextSizeClass(size: DisplayConfig['fontSize']): string {
 }
 
 export default function Admin() {
-  const projects = useProjects();
+  // Session + approval state. Both are needed before any project loads:
+  // an unapproved account must hold nothing, so a shared machine never shows
+  // the previous operator's meetings.
+  const { user, session, status, signOut } = useAuth();
+  const navigate = useNavigate();
+
+  const projects = useProjects({ userId: status === 'approved' ? user?.id ?? null : null });
+  const glossaryState = useGlossary({ projectId: projects.currentProject?.id ?? null });
+  const glossary: GlossarySections | null = glossaryState.sections;
 
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [micActive, setMicActive] = useState(false);
   const [sourceLang, setSourceLangState] = useState<'th' | 'en'>('th');
   const [targetLang, setTargetLangState] = useState<'th' | 'en'>('en');
   const [paused, setPaused] = useState(false);
-  const [glossary, setGlossary] = useState<GlossarySections>(() => loadGlossary());
 
   const [config, setConfig] = useState<DisplayConfig>({ fontSize: 'medium', showOriginal: false, showLatency: false });
   const [activeTab, setActiveTab] = useState<'languages' | 'dictionary'>('languages');
@@ -129,8 +137,6 @@ export default function Admin() {
   // The signed-in operator (Supabase — see src/auth/AuthProvider.tsx). The
   // header identifies the account by its email address, which is what the user
   // actually recognises; the Google display name is secondary.
-  const { user, session, signOut } = useAuth();
-  const navigate = useNavigate();
   const userEmail = user?.email || ANONYMOUS_USER_NAME;
   const userPicture = user?.picture;
   const userFullName = [user?.firstName, user?.lastName].filter(Boolean).join(' ') || user?.name || '';
@@ -164,24 +170,44 @@ export default function Admin() {
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
 
   // ── Gemini capture result → captions ─────────────────────────────────────
-  const handleCaptureResult = useCallback((result: CaptionResult) => {
-    dispatchCaption({
-      kind: 'add',
-      seq: result.seq,
-      sourceText: result.sourceText,
-      targetText: result.targetText,
-      sourceLang: result.sourceLang,
-      targetLang: result.targetLang,
-      latencyMs: result.latencyMs
-    });
-  }, []);
+  const handleCaptureResult = useCallback(
+    (result: CaptionResult) => {
+      const item: TranscriptItem = {
+        seq: result.seq,
+        sourceText: result.sourceText,
+        targetText: result.targetText,
+        sourceLang: result.sourceLang,
+        targetLang: result.targetLang,
+        ts: Date.now() / 1000,
+        latencyMs: result.latencyMs,
+        isEdited: false
+      };
+      // Spelled out rather than spread: CaptionAction's 'add' has no `ts` or
+      // `isEdited` — the reducer stamps its own timestamp — so spreading the
+      // item would not typecheck.
+      dispatchCaption({
+        kind: 'add',
+        seq: item.seq,
+        sourceText: item.sourceText,
+        targetText: item.targetText,
+        sourceLang: item.sourceLang,
+        targetLang: item.targetLang,
+        latencyMs: item.latencyMs
+      });
+      // Written as it closes rather than at the end of the session: a crashed
+      // tab now loses the sentence in flight, not the whole meeting. Not
+      // awaited — the subtitle must never wait on a round trip.
+      if (sessionId) void projects.appendCaption(sessionId, item);
+    },
+    [sessionId, projects]
+  );
 
   const capture = useGeminiLiveCapture({
     active: micActive,
     paused,
     sourceLang,
     targetLang,
-    glossary,
+    glossary: glossary ?? emptyGlossary(),
     onResult: handleCaptureResult,
     accessToken: session?.access_token ?? null
   });
@@ -189,14 +215,25 @@ export default function Admin() {
   // ── Session + mic as one combined "Session" toggle, matching the original
   //    single Start/Stop button ─────────────────────────────────────────────
   const [endingSession, setEndingSession] = useState(false);
+  const [startingSession, setStartingSession] = useState(false);
 
-  const startSessionAndMic = () => {
-    if (micActive) return;
+  const startSessionAndMic = async () => {
+    // Guard set synchronously, before the await below — otherwise a rapid
+    // double-click re-enters this function while attachAsrSession is still
+    // in flight, generating a second sessionId and a second concurrent
+    // attach call. Mirrors the endingSession guard on the stop path.
+    if (micActive || startingSession) return;
+    setStartingSession(true);
     const id = `local_${Date.now()}`;
     setSessionId(id);
     dispatchCaption({ kind: 'reset' });
     setHiddenSeqs(new Set());
-    projects.attachAsrSession(id, sourceLang, targetLang);
+    const ok = await projects.attachAsrSession(id, sourceLang, targetLang);
+    setStartingSession(false);
+    if (!ok) {
+      setSessionId(null);
+      return;
+    }
     setMicActive(true);
   };
 
@@ -227,11 +264,13 @@ export default function Admin() {
           }
         ]
       : allCaptions;
-    if (sessionId) projects.saveSessionTranscript(sessionId, sessionCaptions);
     setEndingSession(false);
     setSessionId(null);
     setPaused(false);
-    projects.detachAsrSession();
+    // The last sentences must be on the record before the operator moves on —
+    // finishing a project prices what the database holds.
+    await projects.flushCaptions();
+    await projects.detachAsrSession();
     return sessionCaptions;
   };
 
@@ -246,13 +285,16 @@ export default function Admin() {
   // On-demand summary for one recorded session, from the transcript kept with
   // it. Opens the popup straight away so the operator watches it fill in.
   const summarizeSession = async (session: ProjectSession) => {
-    const transcripts = session.transcripts ?? [];
-    if (transcripts.length === 0 || !session.endedAt) return;
+    if (!session.endedAt) return;
     if (projects.summarizingIds.has(session.asrSessionId)) return;
+    // Captions for an ended session are fetched on demand — the history list
+    // holds only counts, so a project with fifty meetings still opens fast.
+    const transcripts = await projects.loadSessionTranscript(session.asrSessionId);
+    if (transcripts.length === 0) return;
 
     setSummarySessionId(session.id);
     setSummarizingSince(Date.now());
-    projects.markSessionSummarizing(session.asrSessionId);
+    await projects.markSessionSummarizing(session.asrSessionId);
     const items = transcripts.map((c) => ({ source_text: c.sourceText, target_text: c.targetText }));
     try {
       // The server checks this against the approval table before spending a
@@ -268,11 +310,11 @@ export default function Admin() {
         signal: AbortSignal.timeout(REPORT_WAIT_TIMEOUT_MS)
       });
       const data = (await res.json()) as { summary?: string; items?: number };
-      projects.saveSessionSummary(session.asrSessionId, data.summary ?? '', data.items ?? items.length);
+      await projects.saveSessionSummary(session.asrSessionId, data.summary ?? '', data.items ?? items.length);
     } catch {
       // An AI failure never loses the transcript — the session keeps it, and
       // the operator can ask again.
-      projects.saveSessionSummary(session.asrSessionId, '', items.length);
+      await projects.saveSessionSummary(session.asrSessionId, '', items.length);
     } finally {
       setSummarizingSince(null);
     }
@@ -283,7 +325,7 @@ export default function Admin() {
     // has to be told which session the returned captions belong to.
     const lastAsrSessionId = sessionId;
     const captionsForProject = await stopSessionAndMic();
-    const finished = projects.finishProject(captionsForProject, lastAsrSessionId);
+    const finished = await projects.finishProject(captionsForProject, lastAsrSessionId);
     dispatchCaption({ kind: 'reset' });
     setHiddenSeqs(new Set());
     if (finished) setFinishedProject(finished);
@@ -303,19 +345,14 @@ export default function Admin() {
   const handleSwapLanguages = () => setLanguage(targetLang);
 
   // ── Glossary ──────────────────────────────────────────────────────────────
-  const persistGlossary = (next: GlossarySections) => {
-    setGlossary(next);
-    saveGlossary(next);
-  };
-
+  // Terms go into the project's own list; shared lists are read-only here and
+  // are maintained from the Supabase dashboard.
   const handleGlossaryAdd = (section: GlossarySection, term: string, equivalent: string) => {
-    persistGlossary({ ...glossary, [section]: { ...glossary[section], [term]: equivalent } });
+    void glossaryState.addTerm(section, term, equivalent);
   };
 
   const handleGlossaryRemove = (section: GlossarySection, term: string) => {
-    const next = { ...glossary[section] };
-    delete next[term];
-    persistGlossary({ ...glossary, [section]: next });
+    void glossaryState.removeTerm(section, term);
   };
 
   // ── Caption item actions ─────────────────────────────────────────────────
@@ -332,7 +369,9 @@ export default function Admin() {
 
   const saveEdit = () => {
     if (editingSeq === null) return;
-    dispatchCaption({ kind: 'edit', seq: editingSeq, targetText: editDraft.trim() });
+    const nextText = editDraft.trim();
+    dispatchCaption({ kind: 'edit', seq: editingSeq, targetText: nextText });
+    if (sessionId) void projects.editCaption(sessionId, editingSeq, nextText);
     setEditingSeq(null);
   };
 
@@ -427,6 +466,14 @@ export default function Admin() {
   // the summary lands, rather than holding a stale copy of the session.
   const summarySession = projects.currentProject?.sessions.find((s) => s.id === summarySessionId) ?? null;
 
+  if (projects.loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-500 text-sm">
+        กำลังโหลดโปรเจกต์…
+      </div>
+    );
+  }
+
   // ── No project selected: the picker is the whole screen, as it always was ──
   if (!projects.currentProject) {
     return (
@@ -434,8 +481,8 @@ export default function Admin() {
         <ProjectPicker
           activeProjects={projects.activeProjects}
           canCreateProject={projects.canCreateProject}
-          onSelect={projects.selectProject}
-          onCreate={projects.createProject}
+          onSelect={(id) => void projects.selectProject(id)}
+          onCreate={(name) => void projects.createProject(name)}
           onOpenHistory={() => setShowHistory(true)}
         />
         {showHistory && <HistoryPanel projects={projects.endedProjects} onClose={() => setShowHistory(false)} />}
@@ -465,6 +512,7 @@ export default function Admin() {
           summarizingSince={summarizingSince}
           onSummarize={summarizeSession}
           onClose={() => setSummarySessionId(null)}
+          onOpen={(s) => void projects.loadSessionTranscript(s.asrSessionId)}
         />
       )}
 
@@ -699,7 +747,16 @@ export default function Admin() {
             )}
 
             {activeTab === 'dictionary' && (
-              <DictionaryManager sections={glossary} disabled={false} onAdd={handleGlossaryAdd} onRemove={handleGlossaryRemove} />
+              <DictionaryManager
+                sections={glossary}
+                sharedLists={glossaryState.sharedLists}
+                subscribedIds={glossaryState.subscribedIds}
+                onToggleList={(id) => void glossaryState.toggleList(id)}
+                disabled={false}
+                onAdd={handleGlossaryAdd}
+                onRemove={handleGlossaryRemove}
+                isOwnTerm={glossaryState.isOwnTerm}
+              />
             )}
           </div>
 
@@ -727,8 +784,12 @@ export default function Admin() {
               <div className="flex-1 min-w-0">
                 <p className="font-bold">บันทึกข้อมูลไม่สำเร็จ — การประชุมนี้อาจไม่ถูกเก็บไว้</p>
                 <p className="mt-0.5">
-                  {projects.persistError.reason === 'quota'
-                    ? 'พื้นที่จัดเก็บในเบราว์เซอร์เต็ม กรุณาดาวน์โหลดสำรองไว้ แล้วจบโปรเจกต์เก่าที่ไม่ใช้แล้ว'
+                  {projects.persistError.reason === 'auth'
+                    ? 'เซสชันหมดอายุหรือไม่มีสิทธิ์บันทึก กรุณาเข้าสู่ระบบอีกครั้ง'
+                    : projects.persistError.reason === 'network'
+                    ? 'เชื่อมต่อฐานข้อมูลไม่ได้ กรุณาตรวจสอบอินเทอร์เน็ต แล้วดาวน์โหลดสำรองไว้ก่อน'
+                    : projects.persistError.reason === 'quota'
+                    ? 'พื้นที่จัดเก็บในเบราว์เซอร์เต็ม กรุณาดาวน์โหลดสำรองไว้'
                     : projects.persistError.reason === 'unavailable'
                     ? 'เบราว์เซอร์นี้ปิดการจัดเก็บข้อมูลไว้ กรุณาดาวน์โหลดสำรองก่อนปิดหน้านี้'
                     : 'เกิดข้อผิดพลาดที่ไม่รู้จัก กรุณาดาวน์โหลดสำรองก่อนปิดหน้านี้'}
@@ -860,7 +921,7 @@ export default function Admin() {
           <div className="flex-1 flex flex-col items-center justify-center gap-4 p-4 min-h-0">
             <button
               onClick={isSessionActive ? stopSessionAndMic : startSessionAndMic}
-              disabled={capture.status === 'starting' || endingSession}
+              disabled={capture.status === 'starting' || endingSession || startingSession}
               aria-label={isSessionActive ? 'จบ Session (หยุดอัดเสียง)' : 'เริ่ม Session (อัดเสียง)'}
               title={isSessionActive ? 'จบ Session' : 'เริ่ม Session'}
               className={`relative w-28 h-28 sm:w-36 sm:h-36 rounded-full flex items-center justify-center transition-all shadow-lg ring-8 disabled:opacity-60 disabled:cursor-not-allowed ${

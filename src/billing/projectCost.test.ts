@@ -16,6 +16,7 @@ function session(over: Partial<ProjectSession> & { asrSessionId: string }): Proj
     endedAt: NOW,
     sourceLang: 'th',
     targetLang: 'en',
+    itemCount: 0,
     ...over
   };
 }

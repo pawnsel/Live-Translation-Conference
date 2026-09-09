@@ -1,309 +1,478 @@
 // @vitest-environment jsdom
-import { act, renderHook } from '@testing-library/react';
+import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { useProjects } from './useProjects';
+import { PROJECT_TTL_MS, useProjects } from './useProjects';
+import { PersistError } from '../data/persistError';
+import type { ProjectsRepo } from '../data/projectsRepo';
+import type { Project, ProjectSession, TranscriptItem } from '../types';
 
-const STORAGE_KEY = 'ai_translate_projects';
+const USER = 'user-1';
 
-// Node's own experimental global `localStorage` (present in the Node version
-// running this suite) shadows jsdom's and is left unconfigured by it, so
-// touching it throws/warns instead of behaving like browser storage. Stub a
-// minimal in-memory Storage so the hook's direct `localStorage.*` calls have
-// something real — and per-test-isolated — to read and write.
-class FakeStorage implements Storage {
-  private store = new Map<string, string>();
-  get length() {
-    return this.store.size;
-  }
-  clear() {
-    this.store.clear();
-  }
-  getItem(key: string) {
-    return this.store.has(key) ? this.store.get(key)! : null;
-  }
-  key(index: number) {
-    return Array.from(this.store.keys())[index] ?? null;
-  }
-  removeItem(key: string) {
-    this.store.delete(key);
-  }
-  setItem(key: string, value: string) {
-    this.store.set(key, String(value));
-  }
+function session(overrides: Partial<ProjectSession> = {}): ProjectSession {
+  return {
+    id: 'sess-1',
+    asrSessionId: 'local_1',
+    startedAt: Date.parse('2026-01-01T00:00:00.000Z'),
+    sourceLang: 'th',
+    targetLang: 'en',
+    summarizeRuns: 0,
+    itemCount: 0,
+    ...overrides
+  };
 }
 
-// The hook stamps session ids and timestamps off Date.now(). Fake timers make
-// those deterministic and distinct across actions in the same test, and also
-// keep the hook's own TTL-sweep setInterval (EXPIRY_SWEEP_INTERVAL_MS, 60s)
-// from ever firing during a test — we only ever advance by small, explicit
-// amounts, never far enough to trip a 60s sweep or the 7-day project TTL.
+function project(overrides: Partial<Project> = {}): Project {
+  return {
+    id: 'proj-1',
+    name: 'ประชุม',
+    status: 'active',
+    sessions: [],
+    transcripts: [],
+    createdAt: Date.parse('2026-01-01T00:00:00.000Z'),
+    asrSessionId: null,
+    ...overrides
+  };
+}
+
+/** A repo whose every method is a spy, seeded with one active project. */
+function fakeRepo(overrides: Partial<ProjectsRepo> = {}): ProjectsRepo {
+  return {
+    listProjects: vi.fn().mockResolvedValue([project()]),
+    loadSessionTranscript: vi.fn().mockResolvedValue([]),
+    loadProjectTranscripts: vi.fn().mockResolvedValue({}),
+    createProject: vi.fn().mockResolvedValue(project({ id: 'proj-new', name: 'ใหม่' })),
+    attachAsrSession: vi.fn().mockResolvedValue(session({ id: 'sess-new', asrSessionId: 'local_2' })),
+    endSession: vi.fn().mockResolvedValue(undefined),
+    detachAsrSession: vi.fn().mockResolvedValue(undefined),
+    appendCaption: vi.fn().mockResolvedValue(undefined),
+    editCaption: vi.fn().mockResolvedValue(undefined),
+    markSummarizing: vi.fn().mockResolvedValue(undefined),
+    saveSummary: vi.fn().mockResolvedValue(undefined),
+    finishProject: vi.fn().mockResolvedValue(undefined),
+    ...overrides
+  };
+}
+
+async function renderLoaded(repo: ProjectsRepo) {
+  const view = renderHook(() => useProjects({ repo, userId: USER }));
+  await waitFor(() => expect(view.result.current.loading).toBe(false));
+  return view;
+}
+
 beforeEach(() => {
-  vi.stubGlobal('localStorage', new FakeStorage());
-  vi.useFakeTimers();
-  vi.setSystemTime(new Date(2026, 0, 1, 0, 0, 0, 0));
+  localStorage.clear();
 });
 
 afterEach(() => {
-  vi.useRealTimers();
-  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
-function setupWithProject() {
-  const { result } = renderHook(() => useProjects());
-  act(() => {
-    result.current.createProject('Test Project');
-  });
-  return result;
-}
+describe('useProjects — loading', () => {
+  it('starts loading and fills in from the repo', async () => {
+    const repo = fakeRepo();
+    const { result } = renderHook(() => useProjects({ repo, userId: USER }));
 
-describe('useProjects — attachAsrSession', () => {
-  it('attaches with no prior session: one record appended, asrSessionId set', () => {
-    const result = setupWithProject();
-    expect(result.current.currentProject?.sessions).toHaveLength(0);
-
-    act(() => {
-      result.current.attachAsrSession('asr_1', 'th', 'en');
-    });
-
-    const project = result.current.currentProject;
-    expect(project?.sessions).toHaveLength(1);
-    expect(project?.asrSessionId).toBe('asr_1');
-    expect(project?.sessions[0].asrSessionId).toBe('asr_1');
-    expect(project?.sessions[0].endedAt).toBeUndefined();
+    expect(result.current.loading).toBe(true);
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.activeProjects).toHaveLength(1);
   });
 
-  // Regression test for the bug found in review: attachAsrSession used to set
-  // the new asrSessionId and then call startSession, whose "already have an
-  // open session" guard silently no-oped whenever the previous ProjectSession
-  // had never been closed (the backend-restart case — the old session dies
-  // without the console detaching first). That left `sessions[]` pointing at
-  // a stale record while `asrSessionId` pointed at the new one, and never
-  // logged the new recording's start time at all.
-  //
-  // Asserting only the new id landed in `asrSessionId` would still pass
-  // against that broken version, since the broken code DID perform that part
-  // unconditionally. What the broken version gets wrong is `sessions[]`, so
-  // this test pins down sessions.length, the old record's endedAt, and that
-  // its original startedAt/asrSessionId survive untouched.
-  it('regression: attaching over a still-open session closes the old record and appends a new one', () => {
-    const result = setupWithProject();
+  // A signed-out or unapproved caller must not see the previous account's
+  // projects on a shared machine.
+  it('loads nothing and stays empty when there is no user', async () => {
+    const repo = fakeRepo();
+    const { result } = renderHook(() => useProjects({ repo, userId: null }));
 
-    act(() => {
-      result.current.attachAsrSession('asr_old', 'th', 'en');
-    });
-    const oldSession = result.current.currentProject!.sessions[0];
-    expect(oldSession.endedAt).toBeUndefined();
-
-    // Advance the clock so the second attach's timestamps are unambiguously
-    // later than the first's, then attach again WITHOUT detaching first —
-    // simulating the backend having forgotten the old session.
-    vi.advanceTimersByTime(5000);
-
-    act(() => {
-      result.current.attachAsrSession('asr_new', 'th', 'en');
-    });
-
-    const sessions = result.current.currentProject!.sessions;
-    // Exactly one record closed in place, one appended: net +1, not a
-    // replacement and not a silent no-op.
-    expect(sessions).toHaveLength(2);
-
-    const closedOld = sessions.find((s) => s.id === oldSession.id);
-    expect(closedOld).toBeDefined();
-    expect(closedOld!.endedAt).toBeDefined();
-    expect(closedOld!.endedAt).toBeGreaterThan(oldSession.startedAt);
-    // The old record's own history must survive — its elapsed time is real
-    // and still feeds the bill.
-    expect(closedOld!.startedAt).toBe(oldSession.startedAt);
-    expect(closedOld!.asrSessionId).toBe('asr_old');
-
-    const newSession = sessions.find((s) => s.id !== oldSession.id);
-    expect(newSession).toBeDefined();
-    expect(newSession!.asrSessionId).toBe('asr_new');
-    expect(newSession!.endedAt).toBeUndefined();
-
-    expect(result.current.currentProject?.asrSessionId).toBe('asr_new');
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(repo.listProjects).not.toHaveBeenCalled();
+    expect(result.current.activeProjects).toEqual([]);
   });
 
-  it('detaching after an attach closes the session, clears asrSessionId, and adds no spurious record', () => {
-    const result = setupWithProject();
+  it('clears the cache when the user signs out', async () => {
+    const repo = fakeRepo();
+    const { result, rerender } = renderHook(
+      ({ userId }) => useProjects({ repo, userId }),
+      { initialProps: { userId: USER as string | null } }
+    );
+    await waitFor(() => expect(result.current.activeProjects).toHaveLength(1));
 
-    act(() => {
-      result.current.attachAsrSession('asr_1', 'th', 'en');
-    });
-    expect(result.current.currentProject?.sessions).toHaveLength(1);
+    rerender({ userId: null });
 
-    vi.advanceTimersByTime(1000);
-
-    act(() => {
-      result.current.detachAsrSession();
-    });
-
-    const project = result.current.currentProject;
-    expect(project?.sessions).toHaveLength(1);
-    expect(project?.sessions[0].endedAt).toBeDefined();
-    expect(project?.asrSessionId).toBeNull();
+    await waitFor(() => expect(result.current.activeProjects).toEqual([]));
   });
 
-  it("startSession's own guard still no-ops for a direct caller while a session is open", () => {
-    const result = setupWithProject();
-
-    act(() => {
-      result.current.attachAsrSession('asr_1', 'th', 'en');
+  it('reports a failed load through persistError', async () => {
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockRejectedValue(new PersistError('network', 'offline'))
     });
-    expect(result.current.currentProject?.sessions).toHaveLength(1);
-
-    act(() => {
-      result.current.startSession('asr_direct', 'th', 'en');
-    });
-
-    // The direct call is a no-op: still just the one session from the
-    // attach, and it's still the original one.
-    const sessions = result.current.currentProject!.sessions;
-    expect(sessions).toHaveLength(1);
-    expect(sessions[0].asrSessionId).toBe('asr_1');
+    const { result } = await renderLoaded(repo);
+    expect(result.current.persistError).toMatchObject({ reason: 'network', message: 'offline' });
   });
 });
 
-describe('useProjects — per-session transcripts', () => {
-  const items = [
-    {
-      seq: 0,
-      sourceText: 'สวัสดีครับ',
-      targetText: 'Hello',
+describe('useProjects — createProject', () => {
+  it('adds the created project and selects it', async () => {
+    const repo = fakeRepo();
+    const { result } = await renderLoaded(repo);
+
+    await act(async () => {
+      await result.current.createProject('ใหม่');
+    });
+
+    expect(repo.createProject).toHaveBeenCalledWith('ใหม่');
+    expect(result.current.currentProject?.id).toBe('proj-new');
+    expect(localStorage.getItem('ai_translate_selected_project')).toBe('proj-new');
+  });
+
+  it('refuses past the active-project limit without calling the repo', async () => {
+    const repo = fakeRepo({
+      listProjects: vi
+        .fn()
+        .mockResolvedValue([project({ id: 'a' }), project({ id: 'b' }), project({ id: 'c' })])
+    });
+    const { result } = await renderLoaded(repo);
+
+    expect(result.current.canCreateProject).toBe(false);
+    await act(async () => {
+      await result.current.createProject('เกินโควตา');
+    });
+    expect(repo.createProject).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a refused create and leaves the list unchanged', async () => {
+    const repo = fakeRepo({
+      createProject: vi.fn().mockRejectedValue(new PersistError('auth', 'permission denied'))
+    });
+    const { result } = await renderLoaded(repo);
+
+    await act(async () => {
+      await result.current.createProject('ใหม่');
+    });
+
+    expect(result.current.persistError).toMatchObject({ reason: 'auth' });
+    expect(result.current.activeProjects.map((p) => p.id)).toEqual(['proj-1']);
+  });
+});
+
+describe('useProjects — selecting a project', () => {
+  // The running cost badge prices every session in the current project, so
+  // its captions have to be in memory or the number silently undercounts.
+  it('loads the selected project transcripts', async () => {
+    const item: TranscriptItem = {
+      seq: 1,
+      sourceText: 'ก',
+      targetText: 'A',
       sourceLang: 'th',
       targetLang: 'en',
-      ts: 1,
-      latencyMs: 120,
+      ts: 1767225600,
+      latencyMs: 10,
       isEdited: false
-    }
-  ];
-
-  it('files a transcript under the session that recorded it, so it can be summarised later', () => {
-    const result = setupWithProject();
-
-    act(() => {
-      result.current.attachAsrSession('asr_1', 'th', 'en');
+    };
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockResolvedValue([project({ sessions: [session()] })]),
+      loadProjectTranscripts: vi.fn().mockResolvedValue({ 'sess-1': [item] })
     });
-    act(() => {
-      result.current.saveSessionTranscript('asr_1', items);
+    const { result } = await renderLoaded(repo);
+
+    await act(async () => {
+      await result.current.selectProject('proj-1');
     });
 
-    expect(result.current.currentProject!.sessions[0].transcripts).toEqual(items);
+    expect(repo.loadProjectTranscripts).toHaveBeenCalledWith('proj-1');
+    await waitFor(() =>
+      expect(result.current.currentProject?.sessions[0].transcripts).toEqual([item])
+    );
   });
 
-  // Regression: finishing a project used to write a snapshot of the project
-  // taken at render time, which silently threw away the session transcript
-  // saved moments earlier when the live session was stopped — leaving that
-  // session unsummarisable forever. All three calls land in one batch here,
-  // which is exactly how "จบโปรเจกต์" runs them.
-  it('regression: finishing a project keeps a transcript saved in the same batch', () => {
-    const result = setupWithProject();
-
-    act(() => {
-      result.current.attachAsrSession('asr_1', 'th', 'en');
+  // A tab reload seeds selectedProjectId straight from localStorage, which
+  // never goes through selectProject — without a catch-up effect, the
+  // restored project's sessions keep transcripts === undefined and the cost
+  // badge (via projectCost.ts's `transcripts ?? []`) silently treats it as
+  // empty.
+  it('eagerly loads transcripts for a selection restored from localStorage', async () => {
+    const item: TranscriptItem = {
+      seq: 1,
+      sourceText: 'ก',
+      targetText: 'A',
+      sourceLang: 'th',
+      targetLang: 'en',
+      ts: 1767225600,
+      latencyMs: 10,
+      isEdited: false
+    };
+    localStorage.setItem('ai_translate_selected_project', 'proj-1');
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockResolvedValue([project({ sessions: [session({ itemCount: 1 })] })]),
+      loadProjectTranscripts: vi.fn().mockResolvedValue({ 'sess-1': [item] })
     });
+    const { result } = await renderLoaded(repo);
 
-    vi.advanceTimersByTime(1000);
-
-    act(() => {
-      result.current.saveSessionTranscript('asr_1', items);
-      result.current.detachAsrSession();
-      result.current.finishProject(items, 'asr_1');
-    });
-
-    const ended = result.current.endedProjects[0];
-    expect(ended).toBeDefined();
-    expect(ended.sessions).toHaveLength(1);
-    expect(ended.sessions[0].transcripts).toEqual(items);
+    expect(result.current.currentProject?.id).toBe('proj-1');
+    await waitFor(() => expect(repo.loadProjectTranscripts).toHaveBeenCalledWith('proj-1'));
+    await waitFor(() =>
+      expect(result.current.currentProject?.sessions[0].transcripts).toEqual([item])
+    );
   });
 
-  it('attaches a summary to the session that owns the ASR id', () => {
-    const result = setupWithProject();
-
-    act(() => {
-      result.current.attachAsrSession('asr_1', 'th', 'en');
+  // A session with itemCount 0 has nothing recorded yet, so the restore
+  // effect must not spend a round trip fetching it.
+  it('does not fetch transcripts for a restored project with no recorded items', async () => {
+    localStorage.setItem('ai_translate_selected_project', 'proj-1');
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockResolvedValue([project({ sessions: [session({ itemCount: 0 })] })])
     });
-    act(() => {
-      result.current.markSessionSummarizing('asr_1');
-    });
-    expect(result.current.summarizingIds.has('asr_1')).toBe(true);
+    const { result } = await renderLoaded(repo);
 
-    act(() => {
-      result.current.saveSessionSummary('asr_1', 'สรุปการประชุม', 1);
-    });
-
-    expect(result.current.summarizingIds.has('asr_1')).toBe(false);
-    expect(result.current.currentProject!.sessions[0].summary).toBe('สรุปการประชุม');
-    expect(result.current.currentProject!.sessions[0].reportItemCount).toBe(1);
+    expect(result.current.currentProject?.id).toBe('proj-1');
+    expect(repo.loadProjectTranscripts).not.toHaveBeenCalled();
   });
 });
 
-describe('useProjects — localStorage migration', () => {
-  it('loads a project saved before transcripts/asrSessionId existed with sane defaults', () => {
-    const legacyProject = {
-      id: 'proj_legacy',
-      name: 'Legacy',
-      status: 'active',
-      sessions: [],
-      createdAt: Date.now()
-      // Deliberately no `transcripts`, no `asrSessionId` — the shape a
-      // project persisted before those fields existed would have.
-    };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify([legacyProject]));
+describe('useProjects — attachAsrSession', () => {
+  it('appends the session the repo created and points the project at it', async () => {
+    const repo = fakeRepo();
+    const { result } = await renderLoaded(repo);
+    await act(async () => {
+      await result.current.selectProject('proj-1');
+    });
 
-    const { result } = renderHook(() => useProjects());
+    await act(async () => {
+      await result.current.attachAsrSession('local_2', 'th', 'en');
+    });
 
-    const loaded = result.current.activeProjects.find((p) => p.id === 'proj_legacy');
-    expect(loaded).toBeDefined();
-    expect(loaded!.transcripts).toEqual([]);
-    expect(loaded!.asrSessionId).toBeNull();
+    expect(repo.attachAsrSession).toHaveBeenCalledWith('proj-1', 'local_2', 'th', 'en');
+    expect(result.current.currentProject?.sessions).toHaveLength(1);
+    expect(result.current.currentProject?.asrSessionId).toBe('local_2');
+    expect(result.current.activeSession?.id).toBe('sess-new');
   });
 });
 
-describe('persistence failures', () => {
-  function failingStore(fail: { value: boolean }) {
-    return {
-      loadProjects: () => [],
-      saveProjects: () =>
-        fail.value ? ({ ok: false, reason: 'quota', message: 'full' } as const) : ({ ok: true } as const),
-      loadSelectedId: () => null,
-      saveSelectedId: () => ({ ok: true } as const)
+describe('useProjects — captions', () => {
+  it('writes one caption and folds it into the session in memory', async () => {
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockResolvedValue([project({ sessions: [session()] })])
+    });
+    const { result } = await renderLoaded(repo);
+    const item: TranscriptItem = {
+      seq: 1,
+      sourceText: 'ก',
+      targetText: 'A',
+      sourceLang: 'th',
+      targetLang: 'en',
+      ts: 1767225600,
+      latencyMs: 10,
+      isEdited: false
     };
-  }
 
-  it('exposes a failed write instead of swallowing it', () => {
-    const fail = { value: true };
-    // Hoisted so the store keeps one identity across re-renders. The store
-    // is in the persistence effects' deps (as it must be — it's used inside
-    // them); constructing a new store literal inside the renderHook callback
-    // would give it a fresh identity every re-render, retriggering the write
-    // on every render regardless of whether `projects` changed, which loops
-    // forever while the write keeps failing.
-    const store = failingStore(fail);
-    const { result } = renderHook(() => useProjects(store));
-
-    act(() => {
-      result.current.createProject('งานประชุม');
+    await act(async () => {
+      await result.current.appendCaption('local_1', item);
     });
 
-    expect(result.current.persistError).toMatchObject({ reason: 'quota' });
+    expect(repo.appendCaption).toHaveBeenCalledWith('sess-1', item);
   });
 
-  it('clears the error once a write succeeds again', () => {
-    const fail = { value: true };
-    const store = failingStore(fail);
-    const { result } = renderHook(() => useProjects(store));
-
-    act(() => {
-      result.current.createProject('งานประชุม');
+  it('reports a caption that never lands, after the retries are exhausted', async () => {
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockResolvedValue([project({ sessions: [session()] })]),
+      appendCaption: vi.fn().mockRejectedValue(new PersistError('network', 'offline'))
     });
+    const { result } = await renderLoaded(repo);
+
+    await act(async () => {
+      await result.current.appendCaption('local_1', {
+        seq: 1,
+        sourceText: 'ก',
+        targetText: 'A',
+        sourceLang: 'th',
+        targetLang: 'en',
+        ts: 1,
+        latencyMs: 1,
+        isEdited: false
+      });
+      await result.current.flushCaptions();
+    });
+
+    await waitFor(() => expect(result.current.persistError).toMatchObject({ reason: 'network' }));
+  }, 20000);
+
+  it('reports, rather than silently drops, a caption whose session is not on the record', async () => {
+    const repo = fakeRepo();
+    const { result } = await renderLoaded(repo);
+
+    await act(async () => {
+      await result.current.appendCaption('local_missing', {
+        seq: 1,
+        sourceText: 'ก',
+        targetText: 'A',
+        sourceLang: 'th',
+        targetLang: 'en',
+        ts: 1,
+        latencyMs: 1,
+        isEdited: false
+      });
+    });
+
+    expect(repo.appendCaption).not.toHaveBeenCalled();
     expect(result.current.persistError).not.toBeNull();
+  });
 
-    fail.value = false;
-    act(() => {
-      result.current.createProject('อีกงาน');
+  it('counts itemCount from the actual transcript length, not the (0-based, cross-session) seq', async () => {
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockResolvedValue([project({ sessions: [session()] })])
     });
-    expect(result.current.persistError).toBeNull();
+    const { result } = await renderLoaded(repo);
+    await act(async () => {
+      await result.current.selectProject('proj-1');
+    });
+
+    // seqRef in useGeminiLiveCapture is 0-based and never resets per session,
+    // so a session's very first caption can easily arrive with seq === 0.
+    await act(async () => {
+      await result.current.appendCaption('local_1', {
+        seq: 0,
+        sourceText: 'ก',
+        targetText: 'A',
+        sourceLang: 'th',
+        targetLang: 'en',
+        ts: 1,
+        latencyMs: 1,
+        isEdited: false
+      });
+    });
+
+    expect(result.current.currentProject?.sessions[0].itemCount).toBe(1);
+  });
+});
+
+describe('useProjects — summaries', () => {
+  it('counts every attempt, including one that fails', async () => {
+    const repo = fakeRepo({
+      listProjects: vi
+        .fn()
+        .mockResolvedValue([project({ sessions: [session({ summarizeRuns: 2 })] })])
+    });
+    const { result } = await renderLoaded(repo);
+
+    await act(async () => {
+      await result.current.markSessionSummarizing('local_1');
+    });
+
+    expect(repo.markSummarizing).toHaveBeenCalledWith('sess-1', 3);
+    expect(result.current.summarizingIds.has('local_1')).toBe(true);
+  });
+
+  it('stores a failed summary as an empty string and clears the spinner', async () => {
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockResolvedValue([project({ sessions: [session()] })])
+    });
+    const { result } = await renderLoaded(repo);
+    await act(async () => {
+      await result.current.markSessionSummarizing('local_1');
+    });
+
+    await act(async () => {
+      await result.current.saveSessionSummary('local_1', '', 12);
+    });
+
+    expect(repo.saveSummary).toHaveBeenCalledWith('sess-1', '', 12);
+    expect(result.current.summarizingIds.has('local_1')).toBe(false);
+    const stored = result.current.activeProjects[0].sessions[0];
+    expect(stored.summary).toBe('');
+    expect(stored.reportItemCount).toBe(12);
+  });
+});
+
+describe('useProjects — finishProject', () => {
+  it('closes open sessions, bills the project and clears the selection', async () => {
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockResolvedValue([project({ sessions: [session()] })])
+    });
+    const { result } = await renderLoaded(repo);
+    await act(async () => {
+      await result.current.selectProject('proj-1');
+    });
+
+    let finished: Project | undefined;
+    await act(async () => {
+      finished = await result.current.finishProject([], 'local_1');
+    });
+
+    expect(repo.finishProject).toHaveBeenCalledWith(
+      'proj-1',
+      expect.objectContaining({ sessionCount: 1 }),
+      expect.any(Number),
+      ['sess-1']
+    );
+    expect(finished?.status).toBe('ended');
+    expect(finished?.bill?.sessionCount).toBe(1);
+    expect(result.current.currentProject).toBeUndefined();
+  });
+
+  it('returns undefined and writes nothing when no project is selected', async () => {
+    const repo = fakeRepo();
+    const { result } = await renderLoaded(repo);
+
+    let finished: Project | undefined = project();
+    await act(async () => {
+      finished = await result.current.finishProject([], null);
+    });
+
+    expect(finished).toBeUndefined();
+    expect(repo.finishProject).not.toHaveBeenCalled();
+  });
+});
+
+describe('useProjects — auto-finish retry', () => {
+  // EXPIRY_SWEEP_INTERVAL_MS is internal to the hook, not exported — the
+  // sweep timer's period is a private implementation detail. 60s, matching
+  // the hook's own constant.
+  const SWEEP_INTERVAL_MS = 60 * 1000;
+
+  // Regression for a bug the reviewer found in the auto-finish sync effect: it
+  // used to mark a project's id "synced" in the same tick it *started* the
+  // finishProject write, not once the write actually landed. A write that
+  // failed (server never recorded the finish) triggers run()'s resync, which
+  // reverts the project back to 'active' from the server's still-active copy
+  // — and the next sweep tick re-detects it as expired and flips it to
+  // 'ended' locally again, but the sync effect silently skipped it forever
+  // because the id was already marked. The project could sit ended in the UI
+  // with the server still holding it open, with no retry, ever.
+  it('retries a failed auto-finish write on the next sweep instead of skipping it forever', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const expired = project({ createdAt: Date.now() - PROJECT_TTL_MS - 1000 });
+      const repo = fakeRepo({
+        listProjects: vi.fn().mockResolvedValue([expired]),
+        finishProject: vi
+          .fn()
+          .mockRejectedValueOnce(new PersistError('network', 'offline'))
+          .mockResolvedValueOnce(undefined)
+      });
+
+      const { result } = await renderLoaded(repo);
+      expect(repo.finishProject).not.toHaveBeenCalled();
+
+      // First sweep tick: detects the already-expired project, auto-finishes
+      // it locally, and fires the write — which fails. run() resyncs from
+      // the (unchanged) server copy, reverting the project back to 'active'.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(SWEEP_INTERVAL_MS);
+      });
+      expect(repo.finishProject).toHaveBeenCalledTimes(1);
+      expect(result.current.activeProjects.map((p) => p.id)).toEqual(['proj-1']);
+      expect(result.current.endedProjects).toHaveLength(0);
+
+      // Second sweep tick: the project (still expired by createdAt) is
+      // auto-finished again. This is the retry — it must actually happen,
+      // not be skipped because the first attempt already marked it synced.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(SWEEP_INTERVAL_MS);
+      });
+      expect(repo.finishProject).toHaveBeenCalledTimes(2);
+      expect(result.current.activeProjects).toHaveLength(0);
+      expect(result.current.endedProjects.map((p) => p.id)).toEqual(['proj-1']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

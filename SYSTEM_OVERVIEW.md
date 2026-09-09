@@ -46,7 +46,7 @@
 กด "จบ Session"
   → POST /api/gemini/summarize   (server/geminiRoutes.ts)
   → Gemini รุ่นข้อความ (ค่าเริ่มต้น gemini-3.6-flash)
-  → บันทึกสรุปลง project ใน localStorage
+  → บันทึกสรุปลง project_sessions.summary ใน Postgres (Supabase)
 ```
 
 ทุก request ต้องแนบ `Authorization: Bearer <token>` และต้องเป็นบัญชีที่
@@ -67,13 +67,17 @@
 | `src/asr/audio/useGeminiLiveCapture.ts` | หัวใจฝั่ง client — จับเสียง, สตรีม, สะสมชิ้นข้อความ, ตัดเป็น caption |
 | `src/asr/audio/pcm.ts` | นิยามรูปแบบเสียง (16 kHz mono) และ AudioWorklet |
 | `src/asr/captions.ts` | reducer เก็บ caption ตาม `seq` รองรับการแก้ไขคำแปล |
-| `src/glossary.ts` | glossary ใน localStorage + แปลงเป็น `customVocabulary` |
+| `src/glossary.ts` | นิยาม type ของ glossary + แปลงเป็น `customVocabulary` (ไม่แตะ localStorage แล้ว) |
 | `src/pages/Admin.tsx` | หน้าจอควบคุมทั้งหมด |
-| `src/hooks/useProjects.ts` | โปรเจกต์/ประวัติ session (localStorage) |
+| `src/hooks/useProjects.ts` | โปรเจกต์/ประวัติ session (Supabase) |
+| `src/data/projectsRepo.ts` | statement ทั้งหมดต่อ projects/sessions/transcripts บน Supabase |
+| `src/data/glossaryRepo.ts` | statement ทั้งหมดต่อ glossary lists/terms/subscriptions บน Supabase |
+| `src/hooks/useGlossary.ts` | ประกอบ glossary ของแต่ละโปรเจกต์จาก shared lists ที่ subscribe ไว้ + list ของตัวเอง |
 | `src/auth/AuthProvider.tsx` | session (Supabase Auth) + สถานะการอนุมัติบัญชี |
 | `src/auth/accountStatus.ts` | กฎโดเมนอีเมลที่สมัครได้ + ชนิดข้อมูลสถานะบัญชี |
 | `src/pages/Login.tsx` / `Register.tsx` / `AuthCallback.tsx` | เข้าสู่ระบบ, สมัคร (ส่งคำขอ), ปลายทาง OAuth |
 | `supabase/schema.sql` | ตาราง `access_requests` + RLS (อนุมัติได้จาก dashboard เท่านั้น) |
+| `supabase/schema-projects.sql` | ตาราง projects/project_sessions/transcript_items + glossary lists/terms + RLS ที่ผูกกับ `owner_id = auth.uid()` |
 
 รายละเอียดการติดตั้งฝั่ง Supabase อยู่ใน `docs/supabase-auth-setup.md`
 ส่วนงานที่ยังเหลือของระบบ auth อยู่ใน `docs/auth-roadmap.md`
@@ -114,8 +118,11 @@ subtitle ทันทีด้วย **ตัวอักษรสีจาง**
 ตั้งค่าภาษาได้เฉพาะตอนเปิด session) ใช้เวลาราวหนึ่งวินาที โดยลำดับ caption
 เดิมไม่ถูกเขียนทับ
 
-### 2.4 พจนานุกรมศัพท์เฉพาะทาง (Glossary — 3 หมวด, เก็บในเบราว์เซอร์)
-เก็บใน localStorage ของเบราว์เซอร์ แบ่ง 3 หมวด:
+### 2.4 พจนานุกรมศัพท์เฉพาะทาง (Glossary — 3 หมวด, ต่อโปรเจกต์)
+glossary เป็นของแต่ละโปรเจกต์ ประกอบจาก shared list ที่แอดมินดูแล ซึ่ง
+operator เลือก subscribe ได้จากหน้าโปรเจกต์ บวกกับ list ของโปรเจกต์เอง
+เก็บอยู่ในฐานข้อมูล (`src/data/glossaryRepo.ts` + `src/hooks/useGlossary.ts`)
+แบ่ง 3 หมวด:
 - **ศัพท์เฉพาะ** (`protected_terms`) — ไทย → อังกฤษ
 - **ชื่อบุคคล** (`person_names`) — ไทย → อังกฤษ
 - **แก้คำไทยที่ฟังผิด** (`thai_corrections`) — ไทย → ไทย
@@ -152,7 +159,7 @@ client ส่งขึ้นมาเป็น**คู่คำที่มี�
 
 ### 2.6 ประวัติ Session ในโปรเจกต์
 กดไอคอน 📋 ข้างชื่อโปรเจกต์เพื่อดู session ทั้งหมดที่เคยบันทึก (เรียงล่าสุด
-ก่อน) คลิกเพื่อกางดูสรุป — ยังไม่มี database จริง เก็บใน localStorage
+ก่อน) คลิกเพื่อกางดูสรุป
 
 ### 2.7 การส่งออกผลลัพธ์ (Export)
 - **TXT**: บทสนทนาพร้อมเวลาและคำแปล
@@ -199,14 +206,21 @@ npm run dev      # เสิร์ฟทั้งหน้าเว็บแล�
 - **session ที่หลุดจะต่อใหม่อัตโนมัติ** — Gemini ปิด session เองเมื่อถึงอายุ
   ที่กำหนด ระบบจะบันทึกประโยคที่ค้างอยู่แล้วเชื่อมต่อใหม่ให้ (สูงสุด 5 ครั้ง
   ติดกันก่อนจะแจ้งให้เริ่ม session ใหม่เอง)
-- **เซิร์ฟเวอร์ไม่มีระบบยืนยันตัวตน** — ค่าเริ่มต้นจึงผูกกับ `127.0.0.1`
-  หากเปิดให้เครื่องอื่นเข้าถึง (`HOST=0.0.0.0`) ควรมีการป้องกันเพิ่ม
+- **caption บันทึกลง database ทันทีที่ปิดประโยค** — ถ้าแท็บหลุดหรือ
+  ล่มกลางประชุม จะเสียอย่างมากแค่ประโยคเดียวที่ค้างอยู่ตอนนั้น (ระบบพยายาม
+  ส่งซ้ำก่อนจะยอมแพ้ ดู `src/data/captionQueue.ts`) ไม่ใช่ทั้งการประชุม
 
 ---
 
 ## 5. แผนพัฒนาต่อ (Roadmap)
 
-- ย้ายข้อมูลโปรเจกต์/ประวัติ session จาก localStorage ไปเป็น database จริง
 - ระบบยืนยันตัวตนสำหรับการใช้งานข้ามเครื่อง
 - รองรับคู่ภาษาเพิ่มเติมนอกเหนือจากไทย ⇄ อังกฤษ
 - ทำให้ glossary มีผลทันทีโดยไม่ต้องเริ่ม session ใหม่
+- ตั้ง `pg_cron` ให้กวาดล้างโปรเจกต์ที่หมดอายุ 7 วันในฐานข้อมูลเอง แทนที่จะ
+  พึ่งตัวจับเวลาฝั่ง client ซึ่งทำงานเฉพาะตอนเปิด console ค้างไว้เท่านั้น
+- หน้าจอแอดมินในแอปสำหรับแก้ไข shared glossary list (ต้องรอ role/`is_admin`
+  ตามที่ระบุไว้ใน `docs/auth-roadmap.md` §4 ก่อน)
+- บังคับกฎ "โปรเจกต์ active ได้สูงสุด 3 อัน" ในฐานข้อมูลด้วย ไม่ใช่แค่ฝั่ง
+  client
+- ซิงก์ผ่าน Realtime ระหว่างสองแท็บ/อุปกรณ์ที่ล็อกอินบัญชีเดียวกัน
