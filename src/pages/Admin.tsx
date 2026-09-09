@@ -433,6 +433,10 @@ export default function Admin() {
     void glossaryState.addTerm(section, term, equivalent);
   };
 
+  const handleGlossaryAddMany = (incoming: GlossarySections) => {
+    void glossaryState.addTerms(incoming);
+  };
+
   const handleGlossaryRemove = (section: GlossarySection, term: string) => {
     void glossaryState.removeTerm(section, term);
   };
@@ -905,6 +909,7 @@ export default function Admin() {
                 onToggleList={(id) => void glossaryState.toggleList(id)}
                 disabled={false}
                 onAdd={handleGlossaryAdd}
+                onAddMany={handleGlossaryAddMany}
                 onRemove={handleGlossaryRemove}
                 isOwnTerm={glossaryState.isOwnTerm}
               />

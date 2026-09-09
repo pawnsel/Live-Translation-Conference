@@ -76,6 +76,7 @@
 | `src/hooks/useProjects.ts` | โปรเจกต์/ประวัติ session (Supabase) |
 | `src/data/projectsRepo.ts` | statement ทั้งหมดต่อ projects/sessions/transcripts บน Supabase |
 | `src/data/glossaryRepo.ts` | statement ทั้งหมดต่อ glossary lists/terms/subscriptions บน Supabase |
+| `src/data/glossaryImport.ts` | อ่าน/เขียน glossary เป็นไฟล์ JSON (รับทั้ง flat และ sectioned) — pure ทั้งไฟล์ |
 | `src/hooks/useGlossary.ts` | ประกอบ glossary ของแต่ละโปรเจกต์จาก shared lists ที่ subscribe ไว้ + list ของตัวเอง |
 | `src/auth/AuthProvider.tsx` | session (Supabase Auth) + สถานะการอนุมัติบัญชี |
 | `src/auth/accountStatus.ts` | กฎโดเมนอีเมลที่สมัครได้ + ชนิดข้อมูลสถานะบัญชี |
@@ -132,6 +133,40 @@ operator เลือก subscribe ได้จากหน้าโปรเจ
 - **แก้คำไทยที่ฟังผิด** (`thai_corrections`) — ไทย → ไทย
 
 รองรับค้นหา เพิ่ม/ลบทีละคำ และวางสองคอลัมน์จาก Excel/Sheets
+
+**นำเข้า/ส่งออกเป็นไฟล์ `.json`** (`src/data/glossaryImport.ts`) รับสองรูปแบบ
+โดยดูจาก top-level key ว่าเป็น object หรือ string:
+
+```jsonc
+// flat — ไม่ระบุหมวด จึงลงหมวดที่เปิดอยู่ตอนนั้น (กติกาเดียวกับกล่องวางจาก Excel)
+{ "Kawin": "กวิน", "Somchai": "สมชาย" }
+
+// sectioned — ระบุหมวดมาเอง ใช้เก็บทั้ง glossary ได้ในไฟล์เดียว (ปุ่ม Export คายแบบนี้)
+{ "en_th_corrections": { "Kawin": "กวิน" },
+  "person_names": { "นพ. สมชาย": "Dr. Somchai" } }
+```
+
+- ไฟล์ที่ตั้งชื่อหมวดผิดจะถูก**ปฏิเสธพร้อมบอกชื่อหมวดที่ผิด** ไม่ใช่เงียบๆ
+  ทิ้งคำทั้งก้อนใต้หมวดนั้น
+- กดแล้วยังไม่เขียนทันที — ขึ้นหน้าสรุปว่าจะลงหมวดไหนกี่คำก่อน เพราะ
+  **คำที่ซ้ำจะถูกทับด้วยค่าจากไฟล์**
+- เตือนคำที่ยาวเกิน 100 ตัวอักษร (เท่ากับ `MAX_TERM_LENGTH` ที่
+  `server/geminiLiveBridge.ts` ตัดก่อนส่งให้ Gemini) — ยังนำเข้าให้ แต่คำนั้น
+  จะไปถึงโมเดลในรูปที่ถูกตัดสั้น
+- **นำเข้าลงคลังของโปรเจกต์นี้เสมอ** แก้ shared list ไม่ได้ (ดู §2.4.2)
+- เขียนทั้งไฟล์ด้วย statement เดียว (`glossaryRepo.addTerms`) ไม่ใช่หนึ่งคำ
+  ต่อหนึ่ง round trip — กล่องวางจาก Excel ใช้ทางเดียวกันนี้แล้วเช่นกัน
+
+### 2.4.2 การแก้คลังคำศัพท์ที่ใช้ร่วมกัน (shared list)
+shared list **แก้จากในแอปไม่ได้ และเป็นเจตนา** — `supabase/schema-projects.sql`
+ให้เฉพาะ policy `select` ไม่มี policy เขียนเลย ถ้าแอปลองเขียนจะโดน RLS
+ปฏิเสธด้วย error `42501` ไม่ใช่เขียนไม่ผ่านแบบเงียบๆ
+
+แก้ที่ **Supabase Dashboard → SQL Editor** โดยมี cheat-sheet อยู่ท้ายไฟล์
+`supabase/schema-projects.sql` แล้ว เช่น เพิ่มชื่อคนเข้าลิสต์
+`ชื่อบุคคล (อังกฤษ → ไทย)` ซึ่งเป็นลิสต์ default ที่ทุกโปรเจกต์ subscribe
+อัตโนมัติ หน้าจอแอดมินในแอปยังทำไม่ได้ เพราะต้องมี role/`is_admin` ก่อน
+(ดู `docs/auth-roadmap.md` §4)
 
 glossary ทำงานสองทางพร้อมกัน ตอนเปิด session:
 
