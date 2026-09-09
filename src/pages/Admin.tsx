@@ -508,6 +508,7 @@ export default function Admin() {
           summarizingSince={summarizingSince}
           onSummarize={summarizeSession}
           onClose={() => setSummarySessionId(null)}
+          onOpen={(s) => void projects.loadSessionTranscript(s.asrSessionId)}
         />
       )}
 

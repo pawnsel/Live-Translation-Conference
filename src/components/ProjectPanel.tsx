@@ -540,7 +540,10 @@ export function SessionHistoryModal({
               // `summary === undefined` means nobody has asked for a summary;
               // `summary === ""` means the AI call itself failed.
               const summaryAttempted = s.summary !== undefined;
-              const itemCount = s.transcripts?.length ?? 0;
+              // From the denormalised column, not the captions: the history
+              // list holds counts only, so a project with fifty meetings
+              // still opens in one query.
+              const itemCount = s.itemCount;
 
               return (
                 <div key={s.id} className="border border-slate-200 rounded-xl p-3 bg-slate-50 space-y-2">
@@ -628,7 +631,8 @@ export function SessionSummaryModal({
   isSummarizing,
   summarizingSince,
   onSummarize,
-  onClose
+  onClose,
+  onOpen
 }: {
   project: Project;
   session: ProjectSession;
@@ -636,10 +640,24 @@ export function SessionSummaryModal({
   summarizingSince?: number | null;
   onSummarize: (session: ProjectSession) => void;
   onClose: () => void;
+  /** Called once when the popup mounts, so the captions this session holds
+   *  can be fetched — the history list carries counts only. */
+  onOpen: (session: ProjectSession) => void;
 }) {
   const hasSummary = Boolean(session.summary);
   const summaryAttempted = session.summary !== undefined;
-  const itemCount = session.transcripts?.length ?? session.reportItemCount ?? 0;
+  // reportItemCount is what was SENT to the summariser and can differ from
+  // what the session holds now, so it only wins once a summary exists.
+  const itemCount = session.summary !== undefined
+    ? session.reportItemCount ?? session.itemCount
+    : session.itemCount;
+
+  useEffect(() => {
+    onOpen(session);
+    // Only on mount, and only for this session: re-running on every render
+    // would refetch the transcript continuously.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.id]);
 
   // A one-to-two minute wait with a static spinner reads as a hang. No
   // progress protocol exists — elapsed time is the honest thing to show.
