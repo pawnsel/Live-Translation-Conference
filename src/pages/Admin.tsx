@@ -63,6 +63,14 @@ const ANONYMOUS_USER_NAME = 'ผู้ใช้งาน';
 const LANGS: Record<'th' | 'en', string> = { th: 'ไทย (Thai)', en: 'อังกฤษ (English)' };
 const other = (lang: string) => (lang === 'th' ? 'en' : 'th');
 
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const h = String(Math.floor(totalSeconds / 3600)).padStart(2, '0');
+  const m = String(Math.floor(totalSeconds / 60) % 60).padStart(2, '0');
+  const s = String(totalSeconds % 60).padStart(2, '0');
+  return `${h}:${m}:${s}`;
+}
+
 function formatSrtTime(ms: number): string {
   const h = String(Math.floor(ms / 3600000)).padStart(2, '0');
   const m = String(Math.floor(ms / 60000) % 60).padStart(2, '0');
@@ -118,7 +126,18 @@ export default function Admin() {
   const [targetLang, setTargetLangState] = useState<'th' | 'en'>('en');
   const [paused, setPaused] = useState(false);
 
-  const [config, setConfig] = useState<DisplayConfig>({ fontSize: 'medium', showOriginal: false, showLatency: false });
+  // Real-time elapsed clock for the current session, hh:mm:ss — mirrors a
+  // voice-recorder timer: it runs while recording and freezes while paused,
+  // so the number always reads "how much has actually been recorded".
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const elapsedTickRef = useRef<number | null>(null);
+
+  const [config, setConfig] = useState<DisplayConfig>({
+    fontSize: 'medium',
+    showOriginal: false,
+    showLatency: false,
+    captionTheme: 'light'
+  });
   const [activeTab, setActiveTab] = useState<'languages' | 'dictionary'>('languages');
   const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
@@ -228,6 +247,7 @@ export default function Admin() {
     setSessionId(id);
     dispatchCaption({ kind: 'reset' });
     setHiddenSeqs(new Set());
+    setElapsedMs(0);
     const ok = await projects.attachAsrSession(id, sourceLang, targetLang);
     setStartingSession(false);
     if (!ok) {
@@ -275,6 +295,26 @@ export default function Admin() {
   };
 
   const isSessionActive = !!sessionId && micActive;
+
+  // Ticks the elapsed-time clock once a second while actually recording;
+  // freezes (clears the interval) the moment the session pauses or ends, so
+  // the displayed duration always matches time actually captured. The ref
+  // tracks the last tick's wall-clock time so a delta is added rather than
+  // a fixed 1000ms, keeping the clock accurate even if a tab is throttled.
+  useEffect(() => {
+    if (!isSessionActive || paused) {
+      elapsedTickRef.current = null;
+      return;
+    }
+    elapsedTickRef.current = Date.now();
+    const id = setInterval(() => {
+      const now = Date.now();
+      const last = elapsedTickRef.current ?? now;
+      elapsedTickRef.current = now;
+      setElapsedMs((prev) => prev + (now - last));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [isSessionActive, paused]);
 
   // Running total for the header badge: finished sessions come off the project
   // record, the session recording right now comes out of the live caption
@@ -461,6 +501,7 @@ export default function Admin() {
   const boxSourceText = capture.partialSource || latestCaption?.sourceText || '';
   const boxTargetText = capture.partialTarget || latestCaption?.targetText || '';
   const isEditingBox = editingSeq !== null && editingSeq === latestCaption?.seq;
+  const isDarkCaption = config.captionTheme === 'dark';
 
   // Read live off the project record so the popup fills itself in the moment
   // the summary lands, rather than holding a stale copy of the session.
@@ -723,6 +764,36 @@ export default function Admin() {
                   </select>
                 </div>
 
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1.5">ธีมคำบรรยาย (Caption Theme)</label>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setConfig((c) => ({ ...c, captionTheme: 'light' }))}
+                      className={`flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all ${
+                        (config.captionTheme ?? 'light') === 'light'
+                          ? 'border-[#DE5C8E] ring-2 ring-pink-100 bg-white text-slate-800'
+                          : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-white'
+                      }`}
+                    >
+                      <span className="w-3.5 h-3.5 rounded-full bg-white border border-slate-300 text-black flex items-center justify-center text-[8px] font-black">A</span>
+                      <span>ตัวดำพื้นขาว</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfig((c) => ({ ...c, captionTheme: 'dark' }))}
+                      className={`flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all ${
+                        config.captionTheme === 'dark'
+                          ? 'border-[#DE5C8E] ring-2 ring-pink-100 bg-white text-slate-800'
+                          : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-white'
+                      }`}
+                    >
+                      <span className="w-3.5 h-3.5 rounded-full bg-black text-white flex items-center justify-center text-[8px] font-black">A</span>
+                      <span>ตัวขาวพื้นดำ</span>
+                    </button>
+                  </div>
+                </div>
+
                 <div className="pt-3 border-t border-slate-200 space-y-2.5">
                   <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
                     <input
@@ -830,19 +901,31 @@ export default function Admin() {
               word that no longer fitted, the way broadcast subtitles do.
           ────────────────────────────────────────────────────────────── */}
           <div className="shrink-0 px-3 pt-3 sm:px-6 sm:pt-4">
-            <div className="relative w-full max-w-5xl mx-auto bg-white rounded-2xl border border-slate-200 shadow-sm px-6 py-5 sm:px-10 sm:py-6 text-center">
+            <div
+              className={`relative w-full max-w-5xl mx-auto rounded-2xl border shadow-sm px-6 py-5 sm:px-10 sm:py-6 text-center transition-colors ${
+                isDarkCaption ? 'bg-black border-slate-700' : 'bg-white border-slate-200'
+              }`}
+            >
               {latestCaption && !isEditingBox && !hasPartial && (
                 <div className="absolute top-2.5 right-2.5 flex items-center gap-1">
                   <button
                     onClick={() => handleCopyItem(latestCaption)}
-                    className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
+                    className={`p-1.5 rounded-md transition-all ${
+                      isDarkCaption
+                        ? 'text-slate-500 hover:text-white hover:bg-white/10'
+                        : 'text-slate-400 hover:text-slate-700 hover:bg-slate-100'
+                    }`}
                     title="คัดลอกข้อความ"
                   >
-                    {copiedSeq === latestCaption.seq ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                    {copiedSeq === latestCaption.seq ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
                   </button>
                   <button
                     onClick={() => startEditing(latestCaption)}
-                    className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
+                    className={`p-1.5 rounded-md transition-all ${
+                      isDarkCaption
+                        ? 'text-slate-500 hover:text-white hover:bg-white/10'
+                        : 'text-slate-400 hover:text-slate-700 hover:bg-slate-100'
+                    }`}
                     title="แก้ไขคำแปล"
                   >
                     <Edit2 className="w-3.5 h-3.5" />
@@ -851,9 +934,11 @@ export default function Admin() {
               )}
 
               {!latestCaption && !hasPartial ? (
-                <div className="text-slate-400">
-                  <div className="font-bold text-slate-700 text-sm">พร้อมรับเสียงจากไมโครโฟน</div>
-                  <p className="text-xs text-slate-400 leading-relaxed mt-1">
+                <div className={isDarkCaption ? 'text-slate-500' : 'text-slate-400'}>
+                  <div className={`font-bold text-sm ${isDarkCaption ? 'text-slate-300' : 'text-slate-700'}`}>
+                    พร้อมรับเสียงจากไมโครโฟน
+                  </div>
+                  <p className="text-xs leading-relaxed mt-1">
                     กดปุ่มไมโครโฟนวงกลมกลางจอ จากนั้นพูดใส่ไมโครโฟนเพื่อทำการแปลภาษาแบบเรียลไทม์
                   </p>
                 </div>
@@ -892,20 +977,38 @@ export default function Admin() {
                     <SubtitleText
                       text={boxSourceText}
                       maxLines={1}
-                      className={`text-base sm:text-lg mb-2 ${hasPartial ? 'text-slate-300' : 'text-slate-400'}`}
+                      className={`text-base sm:text-lg mb-2 ${
+                        isDarkCaption
+                          ? hasPartial ? 'text-slate-600' : 'text-slate-400'
+                          : hasPartial ? 'text-slate-300' : 'text-slate-400'
+                      }`}
                     />
                   )}
                   {boxTargetText ? (
                     <SubtitleText
                       text={boxTargetText}
                       maxLines={2}
-                      className={`${boxTextSizeClass(config.fontSize)} font-bold leading-snug tracking-tight text-black`}
+                      className={`${boxTextSizeClass(config.fontSize)} font-bold leading-snug tracking-tight ${
+                        isDarkCaption ? 'text-white' : 'text-black'
+                      }`}
                     />
                   ) : (
-                    <p className={`${boxTextSizeClass(config.fontSize)} font-normal text-slate-300`}>กำลังแปล…</p>
+                    <p
+                      className={`${boxTextSizeClass(config.fontSize)} font-normal ${
+                        isDarkCaption ? 'text-slate-600' : 'text-slate-300'
+                      }`}
+                    >
+                      กำลังแปล…
+                    </p>
                   )}
                   {config.showLatency && !hasPartial && latestCaption?.latencyMs ? (
-                    <span className="mt-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 font-mono text-[10px] text-slate-500 border border-slate-200">
+                    <span
+                      className={`mt-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-mono text-[10px] border ${
+                        isDarkCaption
+                          ? 'bg-white/5 text-slate-400 border-slate-700'
+                          : 'bg-slate-100 text-slate-500 border-slate-200'
+                      }`}
+                    >
                       <Zap className="w-3 h-3 text-amber-500" />
                       <span>{latestCaption.latencyMs}ms</span>
                     </span>
@@ -961,6 +1064,16 @@ export default function Admin() {
                 <span>กดเพื่อเริ่มอัดเสียงและแปลสด</span>
               )}
             </div>
+
+            {isSessionActive && (
+              <div
+                className="flex items-center gap-1.5 font-mono text-sm font-bold text-slate-700 tabular-nums"
+                title="เวลาที่บันทึกไปแล้วใน session นี้"
+              >
+                <span className={`w-2 h-2 rounded-full ${paused ? 'bg-amber-500' : 'bg-rose-500 animate-pulse'}`} />
+                <span>{formatElapsed(elapsedMs)}</span>
+              </div>
+            )}
 
             <div className="flex items-center gap-2">
               {sessionId && (

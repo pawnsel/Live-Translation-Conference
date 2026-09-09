@@ -26,6 +26,13 @@
 import type { TranscriptItem } from '../types';
 import { SUMMARY_CHUNK_CHARS } from '../../server/summaryChunks';
 
+// ── Service fee ──────────────────────────────────────────────────────────
+//
+// A flat charge on top of the raw Gemini estimate below, for when this
+// console bills a margin instead of passing through API cost 1:1. Set to 0
+// until that pricing decision is made — change only this constant.
+export const SERVICE_FEE_USD = 0;
+
 // ── Rates ──────────────────────────────────────────────────────────────────
 
 /** Audio is metered as tokens at a fixed rate, both directions. */
