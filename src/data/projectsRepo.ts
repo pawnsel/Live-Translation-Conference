@@ -102,21 +102,91 @@ export function createProjectsRepo(client: QueryClient): ProjectsRepo {
       return grouped;
     },
 
-    // Implemented in Task 5.
-    async createProject() {
-      throw new PersistError('unknown', 'not implemented');
+    async createProject(name) {
+      // owner_id is omitted deliberately: the column defaults to auth.uid(),
+      // so the database decides who owns this and the client cannot lie.
+      const row = unwrap<ProjectRow & { project_sessions?: SessionRow[] }>(
+        await client
+          .from('projects')
+          .insert({ name: name.trim(), status: 'active' })
+          .select(PROJECT_SELECT)
+          .single()
+      );
+      return toProject(row, row.project_sessions ?? []);
     },
-    async attachAsrSession() {
-      throw new PersistError('unknown', 'not implemented');
+
+    async attachAsrSession(projectId, asrSessionId, sourceLang, targetLang) {
+      const now = new Date().toISOString();
+
+      // Close anything left open first. A dropped websocket that reconnected
+      // under a new id leaves the old session running; if it is still open
+      // when the new one is inserted, the "one open session" guard upstream
+      // discards the new recording.
+      unwrap(
+        await client
+          .from('project_sessions')
+          .update({ ended_at: now })
+          .eq('project_id', projectId)
+          .is('ended_at', null)
+      );
+
+      const row = unwrap<SessionRow>(
+        await client
+          .from('project_sessions')
+          .insert({
+            project_id: projectId,
+            asr_session_id: asrSessionId,
+            source_lang: sourceLang,
+            target_lang: targetLang,
+            started_at: now
+          })
+          .select(SESSION_COLUMNS)
+          .single()
+      );
+
+      unwrap(
+        await client.from('projects').update({ asr_session_id: asrSessionId }).eq('id', projectId)
+      );
+
+      return toSession(row);
     },
-    async endSession() {
-      throw new PersistError('unknown', 'not implemented');
+
+    async endSession(sessionId) {
+      unwrap(
+        await client
+          .from('project_sessions')
+          .update({ ended_at: new Date().toISOString() })
+          .eq('id', sessionId)
+      );
     },
-    async detachAsrSession() {
-      throw new PersistError('unknown', 'not implemented');
+
+    async detachAsrSession(projectId) {
+      unwrap(await client.from('projects').update({ asr_session_id: null }).eq('id', projectId));
     },
-    async finishProject() {
-      throw new PersistError('unknown', 'not implemented');
+
+    async finishProject(projectId, bill, endedAt, openSessionIds) {
+      const stamp = new Date(endedAt).toISOString();
+
+      // Sessions first. PostgREST has no transaction across statements, so
+      // order is the only control available: a failure after this point
+      // leaves an active project whose sessions are closed, which the next
+      // finish attempt fixes. The reverse order would leave an ended project
+      // holding an open session that keeps accruing time.
+      if (openSessionIds.length > 0) {
+        unwrap(
+          await client
+            .from('project_sessions')
+            .update({ ended_at: stamp })
+            .in('id', openSessionIds)
+        );
+      }
+
+      unwrap(
+        await client
+          .from('projects')
+          .update({ status: 'ended', ended_at: stamp, bill, asr_session_id: null })
+          .eq('id', projectId)
+      );
     },
 
     // Implemented in Task 6.

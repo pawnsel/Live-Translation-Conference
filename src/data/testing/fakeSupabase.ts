@@ -7,7 +7,7 @@
  */
 
 export interface RecordedFilter {
-  kind: 'eq' | 'in' | 'order' | 'limit';
+  kind: 'eq' | 'in' | 'is' | 'order' | 'limit';
   column: string;
   value: unknown;
 }
@@ -60,6 +60,10 @@ export function createFakeSupabase(results: FakeResult[] = []) {
       },
       eq(column: string, value: unknown) {
         call.filters.push({ kind: 'eq', column, value });
+        return chain;
+      },
+      is(column: string, value: unknown) {
+        call.filters.push({ kind: 'is', column, value });
         return chain;
       },
       in(column: string, value: unknown) {

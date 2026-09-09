@@ -24,6 +24,7 @@ export interface QueryBuilder {
   delete(): QueryBuilder;
   eq(column: string, value: unknown): QueryBuilder;
   in(column: string, value: unknown): QueryBuilder;
+  is(column: string, value: unknown): QueryBuilder;
   order(column: string, options?: { ascending?: boolean }): QueryBuilder;
   limit(count: number): QueryBuilder;
   single(): QueryBuilder;
