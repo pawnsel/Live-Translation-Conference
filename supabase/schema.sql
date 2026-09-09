@@ -16,6 +16,10 @@
 --  what actually enforce this. Users may read and create only their own row;
 --  nobody can update a status through the anon key, so approval can only come
 --  from the dashboard / service role.
+--
+--  This table is also the app server's authority: server/auth.ts reads it with
+--  the CALLER's own token before letting anyone spend the Gemini key, so the
+--  SELECT policy below is what protects the expensive endpoints too.
 
 -- ---------------------------------------------------------------------------
 -- 1. Status enum
@@ -89,33 +93,15 @@ create policy "create own pending request"
 -- performed with the service role / dashboard, never by the account itself.
 
 -- ---------------------------------------------------------------------------
--- 4. Status lookup for the sign-in dialog
+-- 4. Upgrading from an earlier version of this file
 -- ---------------------------------------------------------------------------
--- The login page must tell "never registered" from "waiting for approval"
--- BEFORE a session exists (a wrong password never produces one), and RLS
--- rightly hides other people's rows. This definer function exposes exactly one
--- thing — the status of one address — and nothing else about the row.
-create or replace function public.get_account_status(p_email text)
-returns text
-language sql
-stable
-security definer
-set search_path = public
-as $$
-  select coalesce(
-    (select status::text
-       from public.access_requests
-      where lower(email) = lower(trim(p_email))
-      limit 1),
-    'none'
-  );
-$$;
-
-revoke all on function public.get_account_status(text) from public;
-grant execute on function public.get_account_status(text) to anon, authenticated;
-
-comment on function public.get_account_status(text) is
-  'Returns none | pending | approved | rejected for an email address. Used by the sign-in status dialog.';
+-- get_account_status(text) is gone. It existed so the login page could tell
+-- "never registered" from "waiting for approval" when a password sign-in
+-- failed and produced no session. Sign-in is Google-only now, so there is
+-- always a session and the SELECT policy above answers the same question —
+-- while the definer function let anyone with the anon key probe whether a
+-- given address had an account. Drop it if you ran the older schema:
+drop function if exists public.get_account_status(text);
 
 -- ===========================================================================
 --  Admin cheat-sheet — run these by hand in the SQL editor

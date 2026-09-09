@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isAllowedEmail, isValidEmail, nameFromEmail } from './accountStatus';
+import { isAllowedEmail, nameFromEmail } from './accountStatus';
 
 // The registration gate. The same rule is duplicated as a CHECK constraint in
 // supabase/schema.sql — if one of these expectations changes, that constraint
@@ -38,18 +38,6 @@ describe('isAllowedEmail', () => {
   it('honours an overridden domain', () => {
     expect(isAllowedEmail('a@example.com', 'example.com')).toBe(true);
     expect(isAllowedEmail('a@chula.ac.th', 'example.com')).toBe(false);
-  });
-});
-
-describe('isValidEmail', () => {
-  it('accepts an ordinary address', () => {
-    expect(isValidEmail('somchai.j@chula.ac.th')).toBe(true);
-  });
-
-  it('rejects addresses without a domain or a dot', () => {
-    expect(isValidEmail('somchai')).toBe(false);
-    expect(isValidEmail('somchai@chula')).toBe(false);
-    expect(isValidEmail('somchai @chula.ac.th')).toBe(false);
   });
 });
 

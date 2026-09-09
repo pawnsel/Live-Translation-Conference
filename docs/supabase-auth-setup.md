@@ -16,10 +16,12 @@
 | `public.access_status` | enum `pending` / `approved` / `rejected` |
 | `public.access_requests` | คำขอใช้งาน 1 แถวต่อ 1 คน (id = auth user id) |
 | RLS policies | อ่าน/สร้างได้เฉพาะแถวของตัวเอง และสร้างได้เฉพาะสถานะ `pending` |
-| `public.get_account_status(email)` | คืนสถานะของอีเมลหนึ่ง ใช้กับ popup ตอน login |
-
 **ไม่มี** policy สำหรับ UPDATE โดยเจตนา — ผู้ใช้จึงอนุมัติตัวเองไม่ได้ไม่ว่าจะ
 ยิง API ตรงแค่ไหน การอนุมัติทำได้จาก dashboard (service role) เท่านั้น
+
+> ถ้าเคยรัน schema เวอร์ชันก่อนหน้าไว้ ให้รันไฟล์ใหม่ทับได้เลย — มีคำสั่ง
+> `drop function ... get_account_status` อยู่ในไฟล์แล้ว ฟังก์ชันนั้นไม่ใช้แล้ว
+> เพราะเปิดให้ใครก็ตามที่มี anon key ตรวจสอบได้ว่าอีเมลไหนมีบัญชีอยู่
 
 ## 2. เปิด Google provider
 
@@ -52,7 +54,15 @@ VITE_SUPABASE_ANON_KEY="eyJhbGciOi..."
 
 > ค่าเหล่านี้ถูกฝังตอน build — เปลี่ยนแล้วต้องรีสตาร์ท dev server หรือ build ใหม่
 
-## 5. อนุมัติบัญชี (งานของแอดมิน)
+## 5. ปิด Email provider (แนะนำ)
+
+**Authentication → Sign In / Providers → Email → ปิด**
+
+ระบบเข้าสู่ระบบด้วย Google อย่างเดียว ไม่มีรหัสผ่านให้ตั้งหรือให้ลืม
+การปิด provider นี้ทำให้ไม่มีทางสร้างบัญชีนอกเส้นทาง Google ได้เลย
+(**Allow anonymous sign-ins** ก็ควรปิดด้วย)
+
+## 6. อนุมัติบัญชี (งานของแอดมิน)
 
 ดูคำขอที่รออยู่:
 
@@ -85,6 +95,34 @@ update public.access_requests
 ถ้าต้องการตัด session ที่เปิดค้างอยู่ทันที ให้ลบผู้ใช้ที่
 **Authentication → Users** ด้วย
 
+## การป้องกันฝั่ง server
+
+หน้าจอกันได้แค่ "เห็นหรือไม่เห็น" เท่านั้น ตัวที่กันของแพงจริง ๆ คือ
+`server/auth.ts` ซึ่งตรวจทุก request ที่จะใช้ Gemini key:
+
+```
+POST /api/gemini/*                → ต้องมี Authorization: Bearer <token>
+ws://…/ws/gemini-live-transcribe  → ต้องมี Sec-WebSocket-Protocol: bearer, <token>
+```
+
+วิธีตรวจคือยิง 1 request ไป Supabase ด้วย **token ของผู้เรียกเอง**:
+PostgREST ตรวจลายเซ็น JWT ให้ และ RLS กรองให้เหลือแถวของคนนั้น จึงได้คำตอบ
+ทั้ง "เป็นใคร" และ "อนุมัติหรือยัง" ในครั้งเดียว
+
+- **ไม่ใช้ service-role key** — เซิร์ฟเวอร์นี้ไม่เคยถือกุญแจที่อ่านแถวคนอื่นได้
+- ถ้าติดต่อ Supabase ไม่ได้ จะ **ปฏิเสธ** (fail closed) ไม่ใช่ปล่อยผ่าน
+- ผลการตรวจถูก cache ไว้ 60 วินาที → ถอนสิทธิ์แล้วจะมีผลกับงานใหม่ภายใน 1 นาที
+- ถ้าไม่ได้ตั้ง `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` เซิร์ฟเวอร์จะ
+  ปฏิเสธทุก request พร้อมขึ้น error ใน log ตอนเริ่มทำงาน
+
+ทดสอบได้ด้วย:
+
+```bash
+curl -i -X POST http://127.0.0.1:3000/api/gemini/summarize \
+  -H 'Content-Type: application/json' -d '{"items":[]}'
+# → HTTP 401 {"error":"missing access token"}
+```
+
 ## Flow ที่เกิดขึ้นจริง
 
 ```
@@ -93,18 +131,22 @@ update public.access_requests
         └─ ผ่าน → กรอก ชื่อ/นามสกุล/เบอร์โทร → insert แถว status='pending'
                 → หน้า "รออนุมัติ"
 
-เข้าสู่ระบบ: /login (Google หรือ อีเมล+รหัสผ่าน)
+เข้าสู่ระบบ: /login → Google → /auth/callback
         ├─ ไม่มีแถวในตาราง   → popup "อีเมลนี้ยังไม่ได้ลงทะเบียน" + sign out
         ├─ status = pending  → popup "อยู่ระหว่างการตรวจสอบสิทธิ์" + sign out
         ├─ status = rejected → popup "คำขอไม่ได้รับการอนุมัติ" + sign out
         └─ status = approved → เข้าหน้าคอนโซลได้เลย (ไม่มี popup)
 ```
 
+## งานที่ยังเหลือ
+
+สิ่งที่ระบบนี้ยังไม่มี (แจ้งเตือนแอดมิน, ถอนสิทธิ์แบบทันที, หน้าอนุมัติในแอป
+ฯลฯ) รวบรวมไว้ใน [`auth-roadmap.md`](./auth-roadmap.md)
+
 ## หมายเหตุ
 
-- **การสมัครทำผ่าน Google เท่านั้น** ช่อง "ตั้งรหัสผ่าน" ในหน้าสมัครเป็น
-  ตัวเลือกเสริม มีไว้เพื่อให้ล็อกอินด้วยอีเมล + รหัสผ่านได้ภายหลัง
-  ถ้าไม่ตั้ง ก็ต้องเข้าสู่ระบบด้วยปุ่ม Google เสมอ
+- **ทั้งสมัครและเข้าสู่ระบบใช้ Google อย่างเดียว** ไม่มีรหัสผ่านในระบบนี้
+  จึงไม่มี flow ลืมรหัสผ่าน และไม่มีรหัสผ่านให้รั่ว
 - คนที่ล็อกอิน Google ด้วยอีเมลที่ไม่เคยลงทะเบียน จะมีแถวค้างใน
   `auth.users` (Supabase สร้างให้อัตโนมัติ) แต่ **ไม่มีสิทธิ์ใด ๆ** เพราะไม่มี
   แถวใน `access_requests` ลบทิ้งได้จาก Authentication → Users

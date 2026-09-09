@@ -49,9 +49,6 @@ export interface RegistrationDetails {
   firstName: string;
   lastName: string;
   phone: string;
-  /** Optional. Registration happens through Google, so a password is only
-   *  needed by people who also want the email + password form to work. */
-  password?: string;
 }
 
 /** Where a Google redirect should return to, remembered across the round trip
@@ -89,7 +86,6 @@ interface AuthContextValue {
    *  down) — distinct from a legitimately absent request row. */
   error: string | null;
   signInWithGoogle: (intent: AuthIntent) => Promise<{ error: AuthError | null }>;
-  signInWithPassword: (email: string, password: string) => Promise<{ error: AuthError | null }>;
   submitAccessRequest: (details: RegistrationDetails) => Promise<void>;
   refresh: () => Promise<void>;
   signOut: () => Promise<void>;
@@ -187,15 +183,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return { error: oauthError };
   }, []);
 
-  const signInWithPassword = useCallback(async (email: string, password: string) => {
-    const client = requireSupabase();
-    const { error: signInError } = await client.auth.signInWithPassword({
-      email: email.trim(),
-      password,
-    });
-    return { error: signInError };
-  }, []);
-
   const submitAccessRequest = useCallback(
     async (details: RegistrationDetails) => {
       const client = requireSupabase();
@@ -217,16 +204,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           throw new Error('อีเมลนี้ส่งคำขอไว้แล้ว กรุณารอผู้ดูแลระบบตรวจสอบ');
         }
         throw new Error(insertError.message);
-      }
-
-      // Optional password, so the email + password form on the login page
-      // works for this account later. A failure here must not lose the
-      // request that was just filed, so it is reported softly.
-      if (details.password) {
-        const { error: passwordError } = await client.auth.updateUser({ password: details.password });
-        if (passwordError) {
-          console.warn('[auth] could not set password:', passwordError.message);
-        }
       }
 
       await loadStatus();
@@ -277,7 +254,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       ready,
       error,
       signInWithGoogle,
-      signInWithPassword,
       submitAccessRequest,
       refresh: loadStatus,
       signOut,
@@ -290,7 +266,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       ready,
       error,
       signInWithGoogle,
-      signInWithPassword,
       submitAccessRequest,
       loadStatus,
       signOut,

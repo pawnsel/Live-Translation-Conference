@@ -26,6 +26,7 @@ import {
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth/AuthProvider';
+import { getAccessToken } from '../lib/supabase';
 // ProjectPanel.tsx has NO default export — it exports named components only.
 import {
   BillModal,
@@ -128,7 +129,7 @@ export default function Admin() {
   // The signed-in operator (Supabase — see src/auth/AuthProvider.tsx). The
   // header identifies the account by its email address, which is what the user
   // actually recognises; the Google display name is secondary.
-  const { user, signOut } = useAuth();
+  const { user, session, signOut } = useAuth();
   const navigate = useNavigate();
   const userEmail = user?.email || ANONYMOUS_USER_NAME;
   const userPicture = user?.picture;
@@ -181,7 +182,8 @@ export default function Admin() {
     sourceLang,
     targetLang,
     glossary,
-    onResult: handleCaptureResult
+    onResult: handleCaptureResult,
+    accessToken: session?.access_token ?? null
   });
 
   // ── Session + mic as one combined "Session" toggle, matching the original
@@ -253,9 +255,15 @@ export default function Admin() {
     projects.markSessionSummarizing(session.asrSessionId);
     const items = transcripts.map((c) => ({ source_text: c.sourceText, target_text: c.targetText }));
     try {
+      // The server checks this against the approval table before spending a
+      // single token on the summary.
+      const accessToken = await getAccessToken();
       const res = await fetch('/api/gemini/summarize', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {})
+        },
         body: JSON.stringify({ items }),
         signal: AbortSignal.timeout(REPORT_WAIT_TIMEOUT_MS)
       });

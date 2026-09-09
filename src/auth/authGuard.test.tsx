@@ -3,13 +3,13 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { cleanup, render, screen } from '@testing-library/react';
 import App from '../App';
 
-// No VITE_SUPABASE_* is set under test, so the client is null: the app must
-// still boot, keep the console locked, and say what is missing rather than
-// throwing somewhere inside a query.
+// jsdom starts with empty storage, so there is no session however the local
+// .env is filled in — which is the state that matters: a visitor with no
+// session must never reach the console, and the only way forward is Google.
 describe('access guard', () => {
   afterEach(cleanup);
 
-  it('sends an unauthenticated visitor to the login page', async () => {
+  it('sends a visitor with no session to the login page', async () => {
     render(<App />);
     expect(await screen.findByRole('heading', { name: 'เข้าสู่ระบบ' })).toBeTruthy();
   });
@@ -22,8 +22,11 @@ describe('access guard', () => {
     expect(screen.queryByTitle('โปรไฟล์ผู้ใช้')).toBeNull();
   });
 
-  it('explains that Supabase is not configured', async () => {
-    render(<App />);
-    expect(await screen.findByText(/VITE_SUPABASE_URL/)).toBeTruthy();
+  it('offers Google as the only way in — no password field to attack', async () => {
+    const { container } = render(<App />);
+    await screen.findByRole('heading', { name: 'เข้าสู่ระบบ' });
+    expect(screen.getByRole('button', { name: /Google/ })).toBeTruthy();
+    expect(container.querySelector('input[type="password"]')).toBeNull();
+    expect(container.querySelector('input[type="email"]')).toBeNull();
   });
 });

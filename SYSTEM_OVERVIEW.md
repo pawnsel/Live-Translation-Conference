@@ -29,6 +29,11 @@
   → captions reducer → UI                                  (src/asr/captions.ts)
 ```
 
+ก่อนเปิด WebSocket เซิร์ฟเวอร์ตรวจ token ของผู้เรียก (ส่งมาใน
+`Sec-WebSocket-Protocol: bearer, <token>`) กับตาราง `access_requests` ก่อนเสมอ
+— ถ้าไม่ใช่บัญชีที่อนุมัติแล้ว จะตอบ HTTP 401 ตั้งแต่ตอน handshake
+โดยไม่เปิด session กับ Gemini เลย (`server/auth.ts`)
+
 **API key อยู่ฝั่งเซิร์ฟเวอร์เท่านั้น** เบราว์เซอร์ไม่เคยเห็นทั้ง
 `GEMINI_API_KEY` และชื่อโมเดล เพราะเชื่อมต่อมาที่เซิร์ฟเวอร์ของเราเสมอ
 ไม่ได้ต่อตรงไป Google สิ่งที่ client ส่งขึ้นมาได้มีเพียงคู่ภาษาและรายการ
@@ -44,6 +49,9 @@
   → บันทึกสรุปลง project ใน localStorage
 ```
 
+ทุก request ต้องแนบ `Authorization: Bearer <token>` และต้องเป็นบัญชีที่
+อนุมัติแล้ว มิฉะนั้นได้ HTTP 401/403 ก่อนถึงตัว route
+
 หากเรียก Gemini ไม่สำเร็จหรือเกิน 20 วินาที เซิร์ฟเวอร์ยังตอบ HTTP 200 พร้อม
 สรุปว่าง เพื่อรับประกันว่า **transcript ดิบจะไม่หายไปไม่ว่ากรณีใด**
 
@@ -53,6 +61,7 @@
 |---|---|
 | `server.ts` | เสิร์ฟหน้าเว็บ + ประกอบ route ทั้งหมด ผูก WebSocket proxy เข้ากับ HTTP server เดียวกัน ค่าเริ่มต้นผูกกับ 127.0.0.1 |
 | `server/geminiLiveProxy.ts` | WebSocket relay ไป Gemini, ถือ API key, ตรวจ input จาก client, ตัดเฟรมเสียงที่ไม่ใช้ทิ้ง |
+| `server/auth.ts` | ตรวจ token ของผู้เรียกกับตาราง `access_requests` ก่อนให้ใช้ Gemini (ทั้ง REST และ WebSocket) |
 | `server/geminiRoutes.ts` | REST endpoint `/api/gemini/summarize` |
 | `server/gemini.ts` | เรียก Gemini ผ่าน SDK สำหรับงานที่เป็น HTTP (สรุปผล) |
 | `src/asr/audio/useGeminiLiveCapture.ts` | หัวใจฝั่ง client — จับเสียง, สตรีม, สะสมชิ้นข้อความ, ตัดเป็น caption |
@@ -62,11 +71,12 @@
 | `src/pages/Admin.tsx` | หน้าจอควบคุมทั้งหมด |
 | `src/hooks/useProjects.ts` | โปรเจกต์/ประวัติ session (localStorage) |
 | `src/auth/AuthProvider.tsx` | session (Supabase Auth) + สถานะการอนุมัติบัญชี |
-| `src/auth/accountStatus.ts` | กฎโดเมนอีเมลที่สมัครได้ + อ่านสถานะบัญชีจาก DB |
+| `src/auth/accountStatus.ts` | กฎโดเมนอีเมลที่สมัครได้ + ชนิดข้อมูลสถานะบัญชี |
 | `src/pages/Login.tsx` / `Register.tsx` / `AuthCallback.tsx` | เข้าสู่ระบบ, สมัคร (ส่งคำขอ), ปลายทาง OAuth |
-| `supabase/schema.sql` | ตาราง `access_requests`, RLS และฟังก์ชัน `get_account_status` |
+| `supabase/schema.sql` | ตาราง `access_requests` + RLS (อนุมัติได้จาก dashboard เท่านั้น) |
 
 รายละเอียดการติดตั้งฝั่ง Supabase อยู่ใน `docs/supabase-auth-setup.md`
+ส่วนงานที่ยังเหลือของระบบ auth อยู่ใน `docs/auth-roadmap.md`
 
 ### 1.4 ตัวแปรสภาพแวดล้อม (`.env`)
 
@@ -156,8 +166,9 @@ operator แก้เอง ส่วนสรุปด้วย AI และบ
 
 ## 3. วิธีการเริ่มใช้งาน (Quick User Guide)
 
-**เตรียมก่อนใช้งาน**: ตั้งค่า `GEMINI_API_KEY` ใน `.env` (ดูตัวอย่างใน
-`.env.example`)
+**เตรียมก่อนใช้งาน**: ตั้งค่า `GEMINI_API_KEY`, `VITE_SUPABASE_URL` และ
+`VITE_SUPABASE_ANON_KEY` ใน `.env` (ดูตัวอย่างใน `.env.example`) — ถ้าไม่ตั้ง
+ค่า Supabase เซิร์ฟเวอร์จะปฏิเสธทุก request ที่ใช้ Gemini
 
 ```bash
 npm install

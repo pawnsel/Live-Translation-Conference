@@ -38,3 +38,15 @@ export function requireSupabase(): SupabaseClient {
   if (!supabase) throw new Error(SUPABASE_SETUP_MESSAGE);
   return supabase;
 }
+
+/** The current access token, refreshed if it is about to expire.
+ *
+ *  Every call to our own server carries this: the endpoints that spend the
+ *  Gemini key verify it against the approval table (server/auth.ts). Read it
+ *  at the moment of the call rather than holding on to one — tokens are
+ *  short-lived and rotate underneath us. */
+export async function getAccessToken(): Promise<string | null> {
+  if (!supabase) return null;
+  const { data } = await supabase.auth.getSession();
+  return data.session?.access_token ?? null;
+}

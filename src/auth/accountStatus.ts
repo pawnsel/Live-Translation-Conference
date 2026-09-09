@@ -3,8 +3,6 @@
  *  Kept free of React so both the provider and the tests can use it.
  */
 
-import { supabase } from '../lib/supabase';
-
 /** `none` means "no request row exists" — the person has never registered,
  *  even if Google happily signed them in. */
 export type AccountStatus = 'none' | 'pending' | 'approved' | 'rejected';
@@ -43,26 +41,8 @@ export function isAllowedEmail(email: string, domain: string = ALLOWED_EMAIL_DOM
  *  and the check stay obviously the same rule. */
 export const isChulaEmail = isAllowedEmail;
 
-export function isValidEmail(email: string): boolean {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
-}
-
 /** Best-effort display name for an address with no Google profile behind it. */
 export function nameFromEmail(email: string): string {
   const local = email.trim().split('@')[0] ?? '';
   return local.replace(/[._-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()) || email;
-}
-
-function isStatus(value: unknown): value is AccountStatus {
-  return value === 'none' || value === 'pending' || value === 'approved' || value === 'rejected';
-}
-
-/** Status of an address with no session in hand — a failed password sign-in
- *  produces no session, and RLS hides the row, so this goes through the
- *  `get_account_status` definer function (supabase/schema.sql). */
-export async function fetchStatusByEmail(email: string): Promise<AccountStatus> {
-  if (!supabase) return 'none';
-  const { data, error } = await supabase.rpc('get_account_status', { p_email: email.trim() });
-  if (error) throw error;
-  return isStatus(data) ? data : 'none';
 }

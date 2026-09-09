@@ -7,8 +7,8 @@
  *    1. google  — sign in with Google. Only an allowed university address may
  *                 pass; anything else is signed straight back out and never
  *                 reaches the form.
- *    2. form    — ชื่อจริง / นามสกุล / เบอร์โทร (+ an optional password), which
- *                 becomes one 'pending' row in public.access_requests.
+ *    2. form    — ชื่อจริง / นามสกุล / เบอร์โทร, which becomes one 'pending'
+ *                 row in public.access_requests.
  *    3. pending — the request exists and is waiting for manual approval.
  */
 
@@ -75,8 +75,6 @@ export default function Register() {
   const [firstName, setFirstName] = useState('');
   const [lastName, setLastName] = useState('');
   const [phone, setPhone] = useState('');
-  const [password, setPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   /** The address Google offered that this system will not accept. Held after
@@ -125,24 +123,10 @@ export default function Register() {
       setFormError('เบอร์โทรศัพท์ต้องมี 10 หลัก');
       return;
     }
-    if (password && password.length < 8) {
-      setFormError('รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร');
-      return;
-    }
-    if (password !== confirmPassword) {
-      setFormError('รหัสผ่านทั้งสองช่องไม่ตรงกัน');
-      return;
-    }
-
     setFormError(null);
     setSubmitting(true);
     try {
-      await submitAccessRequest({
-        firstName,
-        lastName,
-        phone,
-        password: password || undefined,
-      });
+      await submitAccessRequest({ firstName, lastName, phone });
       // status becomes 'pending', which moves the page to step 3 on its own.
     } catch (err) {
       setFormError(err instanceof Error ? err.message : String(err));
@@ -296,41 +280,6 @@ export default function Register() {
                 placeholder="081-234-5678"
                 className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm outline-hidden focus:border-[#DE5C8E] focus:ring-2 focus:ring-pink-100 transition-all"
               />
-
-              {/* Optional, because registration itself runs on Google. Set one
-                  and the email + password form on the login page also works. */}
-              <div className="mt-5 pt-5 border-t border-slate-100">
-                <p className="text-xs font-semibold text-slate-600">
-                  ตั้งรหัสผ่าน <span className="font-normal text-slate-400">(ไม่บังคับ)</span>
-                </p>
-                <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">
-                  ตั้งไว้เพื่อเข้าสู่ระบบด้วยอีเมลและรหัสผ่านได้ โดยไม่ต้องใช้ Google ทุกครั้ง
-                </p>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-3">
-                  <input
-                    type="password"
-                    autoComplete="new-password"
-                    value={password}
-                    onChange={(e) => {
-                      setPassword(e.target.value);
-                      setFormError(null);
-                    }}
-                    placeholder="รหัสผ่าน (อย่างน้อย 8 ตัว)"
-                    className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm outline-hidden focus:border-[#DE5C8E] focus:ring-2 focus:ring-pink-100 transition-all"
-                  />
-                  <input
-                    type="password"
-                    autoComplete="new-password"
-                    value={confirmPassword}
-                    onChange={(e) => {
-                      setConfirmPassword(e.target.value);
-                      setFormError(null);
-                    }}
-                    placeholder="ยืนยันรหัสผ่าน"
-                    className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm outline-hidden focus:border-[#DE5C8E] focus:ring-2 focus:ring-pink-100 transition-all"
-                  />
-                </div>
-              </div>
 
               {formError && (
                 <div className="mt-4 flex items-start gap-2 px-3 py-2.5 rounded-xl bg-red-50 border border-red-200 text-red-700">

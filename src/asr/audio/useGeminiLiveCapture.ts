@@ -58,6 +58,10 @@ export function useGeminiLiveCapture(opts: {
   glossary: GlossarySections;
   onResult: (result: CaptionResult) => void;
   deviceId?: string;
+  /** Supabase access token for the signed-in operator. The proxy refuses the
+   *  handshake without one (server/auth.ts) — live audio is billed by the
+   *  minute, so it is never opened for an unidentified caller. */
+  accessToken: string | null;
 }): GeminiCaptureState & {
   flush: () => Promise<CaptionResult | null>;
   // Text accumulated so far for the caption that has not closed yet — the
@@ -80,6 +84,10 @@ export function useGeminiLiveCapture(opts: {
   glossaryRef.current = opts.glossary;
   const onResultRef = useRef(opts.onResult);
   onResultRef.current = opts.onResult;
+  // Read at connect time rather than captured: Supabase rotates the token
+  // underneath us, and a reconnect must present the current one.
+  const accessTokenRef = useRef(opts.accessToken);
+  accessTokenRef.current = opts.accessToken;
 
   // Caption sequence must keep increasing across reconnects (a language
   // switch reopens the socket) — restarting at 0 would overwrite earlier
@@ -306,8 +314,24 @@ export function useGeminiLiveCapture(opts: {
     };
 
     setState({ status: 'starting', error: null });
+
+    // Without a token the proxy would refuse every attempt, and there is no
+    // retry budget here (reconnectPolicy.ts is deliberately unbounded) — so
+    // say so once instead of looping forever against a 401.
+    const accessToken = accessTokenRef.current;
+    if (!accessToken) {
+      fail('เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่ (no access token for the live session)');
+      return;
+    }
+
     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    ws = new WebSocket(`${proto}://${window.location.host}/ws/gemini-live-transcribe`);
+    // A browser cannot set headers on a WebSocket; the subprotocol list is the
+    // one place a token can ride as a header instead of in the URL, where it
+    // would be written to every access log on the way.
+    ws = new WebSocket(`${proto}://${window.location.host}/ws/gemini-live-transcribe`, [
+      'bearer',
+      accessToken
+    ]);
 
     ws.onopen = () => {
       // Sent before the server opens its Gemini session: translationConfig
