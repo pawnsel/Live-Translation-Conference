@@ -1,542 +1,383 @@
-import React, { useEffect, useState, useRef } from 'react';
-import { io, Socket } from 'socket.io-client';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import {
   Mic,
   MicOff,
   Languages,
   BookOpen,
-  Key,
   Copy,
   Check,
   Download,
   Trash2,
   Sparkles,
   Zap,
-  Activity,
   Edit2,
-  X,
-  RotateCcw,
-  Sliders,
-  Radio,
-  Eye,
-  EyeOff,
   Menu,
-  ShieldCheck,
-  Lock,
   ShieldAlert,
-  Cpu,
-  Volume2,
   FileText,
   ArrowLeftRight,
-  Send,
-  Scissors,
-  Timer
+  Pause,
+  Play,
+  ClipboardList,
+  RefreshCw,
+  ChevronDown,
+  ChevronUp,
+  User,
+  LogOut
 } from 'lucide-react';
-import { AppConfig, TranscriptItem } from '../types';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../auth/AuthProvider';
+import { getAccessToken } from '../lib/supabase';
+// ProjectPanel.tsx has NO default export — it exports named components only.
+import {
+  BillModal,
+  HistoryPanel,
+  LiveCostBadge,
+  ProjectHeaderBar,
+  ProjectPicker,
+  SessionHistoryModal,
+  SessionSummaryModal
+} from '../components/ProjectPanel';
 import DictionaryManager from '../components/DictionaryManager';
+import { captionsReducer, initialCaptionState, selectCaptions, type Caption } from '../asr/captions';
+import { groupCaptionsIntoParagraphs } from '../asr/historyParagraphs';
+import { useGeminiLiveCapture, type CaptionResult } from '../asr/audio/useGeminiLiveCapture';
+import SubtitleText from '../components/SubtitleText';
+import { useProjects } from '../hooks/useProjects';
+import { useLiveProjectCost } from '../hooks/useLiveProjectCost';
+import { loadGlossary, saveGlossary, type GlossarySection, type GlossarySections } from '../glossary';
+import type { DisplayConfig, Project, ProjectSession } from '../types';
+
+// Bounded wait for a summary before giving up and showing the "AI summary
+// failed" state. A two-hour transcript is summarised chunk by chunk on the
+// server, so this must stay comfortably above the server's own job budget
+// (SUMMARIZE_TIMEOUT_MS, 150s) or the client abandons work about to succeed.
+const REPORT_WAIT_TIMEOUT_MS = 180000;
+
+// Shown when the mock session somehow has no address on it — the guard in
+// App.tsx means this should not be reachable, but the header must render.
+const ANONYMOUS_USER_NAME = 'ผู้ใช้งาน';
+
+// Only the pair this console supports. Anything else is not a language
+// the model is instructed to expect.
+const LANGS: Record<'th' | 'en', string> = { th: 'ไทย (Thai)', en: 'อังกฤษ (English)' };
+const other = (lang: string) => (lang === 'th' ? 'en' : 'th');
+
+function formatSrtTime(ms: number): string {
+  const h = String(Math.floor(ms / 3600000)).padStart(2, '0');
+  const m = String(Math.floor(ms / 60000) % 60).padStart(2, '0');
+  const s = String(Math.floor(ms / 1000) % 60).padStart(2, '0');
+  const msPart = String(Math.floor(ms % 1000)).padStart(3, '0');
+  return `${h}:${m}:${s},${msPart}`;
+}
+
+function textSizeClass(size: DisplayConfig['fontSize']): string {
+  switch (size) {
+    case 'small':
+      return 'text-sm sm:text-base';
+    case 'medium':
+      return 'text-base sm:text-lg';
+    case 'xlarge':
+      return 'text-xl sm:text-2xl';
+    case 'large':
+    default:
+      return 'text-lg sm:text-xl';
+  }
+}
+
+// The live subtitle box is the thing an operator will OBS-crop for
+// streaming, so it reads a size tier larger than the history list.
+function boxTextSizeClass(size: DisplayConfig['fontSize']): string {
+  switch (size) {
+    case 'small':
+      return 'text-2xl sm:text-3xl';
+    case 'medium':
+      return 'text-3xl sm:text-4xl';
+    case 'xlarge':
+      return 'text-5xl sm:text-6xl';
+    case 'large':
+    default:
+      return 'text-4xl sm:text-5xl';
+  }
+}
 
 export default function Admin() {
-  const [socket, setSocket] = useState<Socket | null>(null);
-  const [config, setConfig] = useState<AppConfig>({
-    sourceLang: 'th-TH',
-    targetLang: 'English',
-    aiModel: 'gemini-3.7-flash',
-    speechEngine: 'google-chirp-asr',
-    fontSize: 'large',
-    fontFamily: 'sans-serif',
-    dictionaryJson: JSON.stringify(
-      {
-        ปัญญาประดิษฐ์: 'Artificial Intelligence (AI)',
-        การเรียนรู้ของเครื่อง: 'Machine Learning',
-        โมเดลภาษาขนาดใหญ่: 'Large Language Models (LLMs)',
-        การประชุมประจำปี: 'Annual General Meeting (AGM)',
-        ผลตอบแทนจากการลงทุน: 'Return on Investment (ROI)',
-        ตัวชี้วัดความสำเร็จ: 'KPI / Key Performance Indicators'
-      },
-      null,
-      2
-    ),
-    showOriginal: true,
-    showLatency: true,
-    hasCustomToken: false,
-    chunkSilenceMs: 900
-  });
+  const projects = useProjects();
 
-  const [transcripts, setTranscripts] = useState<TranscriptItem[]>([]);
-  const [isMeetingActive, setIsMeetingActive] = useState(false);
-  const [activeTab, setActiveTab] = useState<'languages' | 'dictionary' | 'token'>('languages');
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [micActive, setMicActive] = useState(false);
+  const [sourceLang, setSourceLangState] = useState<'th' | 'en'>('th');
+  const [targetLang, setTargetLangState] = useState<'th' | 'en'>('en');
+  const [paused, setPaused] = useState(false);
+  const [glossary, setGlossary] = useState<GlossarySections>(() => loadGlossary());
+
+  const [config, setConfig] = useState<DisplayConfig>({ fontSize: 'medium', showOriginal: false, showLatency: false });
+  const [activeTab, setActiveTab] = useState<'languages' | 'dictionary'>('languages');
   const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [showSessionHistory, setShowSessionHistory] = useState(false);
+  // Which session's summary popup is open, by ProjectSession id. The session
+  // itself is read from the live project record, so a summary that arrives
+  // while the popup is open fills itself in.
+  const [summarySessionId, setSummarySessionId] = useState<string | null>(null);
+  // Epoch ms when the current summarize request started, null when idle — lets
+  // the popup show elapsed time instead of a static spinner.
+  const [summarizingSince, setSummarizingSince] = useState<number | null>(null);
+  const [showAllHistory, setShowAllHistory] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [finishedProject, setFinishedProject] = useState<Project | null>(null);
 
-  // Manual / Quick Test Input
-  const [testInputText, setTestInputText] = useState('');
+  // The signed-in operator (Supabase — see src/auth/AuthProvider.tsx). The
+  // header identifies the account by its email address, which is what the user
+  // actually recognises; the Google display name is secondary.
+  const { user, session, signOut } = useAuth();
+  const navigate = useNavigate();
+  const userEmail = user?.email || ANONYMOUS_USER_NAME;
+  const userPicture = user?.picture;
+  const userFullName = [user?.firstName, user?.lastName].filter(Boolean).join(' ') || user?.name || '';
 
-  // Latency & Connection Metrics
-  const [socketPingMs, setSocketPingMs] = useState<number | null>(null);
-  const [lastAiLatencyMs, setLastAiLatencyMs] = useState<number | null>(null);
+  const handleSignOut = useCallback(async () => {
+    setProfileOpen(false);
+    await signOut();
+    navigate('/login', { replace: true });
+  }, [signOut, navigate]);
 
-  // Token management & Secret Key protection
-  const [inputToken, setInputToken] = useState('');
-  const [showToken, setShowToken] = useState(false);
-  const [testingToken, setTestingToken] = useState(false);
-  const [isSavingToken, setIsSavingToken] = useState(false);
-  const [tokenSavedSuccess, setTokenSavedSuccess] = useState(false);
-  const [tokenTestResult, setTokenTestResult] = useState<{ success?: boolean; message?: string } | null>(null);
+  // Captions have no "delete" concept anymore (there is no server to delete
+  // them from) — "delete" stays a local-only hide so an operator can tidy
+  // the visible history. Hiding removes a caption from the on-screen view
+  // and from TXT/SRT export, but it is still included in the AI summary and
+  // the permanent project record.
+  const [hiddenSeqs, setHiddenSeqs] = useState<Set<number>>(new Set());
+  const [editingSeq, setEditingSeq] = useState<number | null>(null);
+  const [editDraft, setEditDraft] = useState('');
+  const [copiedSeq, setCopiedSeq] = useState<number | null>(null);
+  // History reads as prose, so per-caption controls cannot sit inline without
+  // pushing the text around. The caption under the cursor is highlighted and
+  // its actions appear in one toolbar pinned to the top of the scroller.
+  const [hoveredSeq, setHoveredSeq] = useState<number | null>(null);
 
-  // Editing items
-  const [editingItemId, setEditingItemId] = useState<string | null>(null);
-  const [editTranslatedText, setEditTranslatedText] = useState<string>('');
-  const [editOriginalText, setEditOriginalText] = useState<string>('');
-  const [savedFeedbackId, setSavedFeedbackId] = useState<string | null>(null);
+  const [captionState, dispatchCaption] = useReducer(captionsReducer, initialCaptionState);
+  const allCaptions = useMemo(() => selectCaptions(captionState), [captionState]);
+  const captions = useMemo(() => allCaptions.filter((c) => !hiddenSeqs.has(c.seq)), [allCaptions, hiddenSeqs]);
+  const historyParagraphs = useMemo(() => groupCaptionsIntoParagraphs(captions), [captions]);
+  const hoveredItem = useMemo(() => captions.find((c) => c.seq === hoveredSeq) ?? null, [captions, hoveredSeq]);
 
-  // Copy feedback
-  const [copiedItemId, setCopiedItemId] = useState<string | null>(null);
-
-  // Speech Recognition & Realtime Chunking Refs
-  const recognitionRef = useRef<any>(null);
-  const socketRef = useRef<Socket | null>(null);
-  const configRef = useRef<AppConfig>(config);
-  const isMeetingActiveRef = useRef<boolean>(false);
-  const isListeningRef = useRef<boolean>(false);
-  const silenceTimerRef = useRef<any>(null);
-  const currentInterimRef = useRef<string>('');
-  const isRestartingRef = useRef<boolean>(false);
-
-  const [isListening, setIsListening] = useState(false);
-  const [interimSpeechText, setInterimSpeechText] = useState('');
-  const [micPermissionError, setMicPermissionError] = useState(false);
-  const [micAudioLevel, setMicAudioLevel] = useState<number>(0);
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
 
-  // Keep fresh state in refs for async callbacks & speech recognition
-  useEffect(() => {
-    socketRef.current = socket;
-  }, [socket]);
+  // ── Gemini capture result → captions ─────────────────────────────────────
+  const handleCaptureResult = useCallback((result: CaptionResult) => {
+    dispatchCaption({
+      kind: 'add',
+      seq: result.seq,
+      sourceText: result.sourceText,
+      targetText: result.targetText,
+      sourceLang: result.sourceLang,
+      targetLang: result.targetLang,
+      latencyMs: result.latencyMs
+    });
+  }, []);
 
-  useEffect(() => {
-    configRef.current = config;
-  }, [config]);
+  const capture = useGeminiLiveCapture({
+    active: micActive,
+    paused,
+    sourceLang,
+    targetLang,
+    glossary,
+    onResult: handleCaptureResult,
+    accessToken: session?.access_token ?? null
+  });
 
-  useEffect(() => {
-    isMeetingActiveRef.current = isMeetingActive;
-  }, [isMeetingActive]);
+  // ── Session + mic as one combined "Session" toggle, matching the original
+  //    single Start/Stop button ─────────────────────────────────────────────
+  const [endingSession, setEndingSession] = useState(false);
 
-  useEffect(() => {
-    isListeningRef.current = isListening;
-  }, [isListening]);
-
-  // Commit recognized speech segment/chunk for live translation
-  const commitSpeechChunk = (text: string) => {
-    const cleanText = text.trim();
-    if (!cleanText || cleanText.length < 2) return;
-
-    if (socketRef.current) {
-      socketRef.current.emit('new-transcription', cleanText);
-    }
-
-    currentInterimRef.current = '';
-    setInterimSpeechText('');
-
-    // Cleanly flush the browser's speech recognition buffer to prevent repeat words
-    if (isListeningRef.current && recognitionRef.current) {
-      try {
-        isRestartingRef.current = true;
-        recognitionRef.current.abort();
-      } catch {
-        // ignore
-      }
-    }
+  const startSessionAndMic = () => {
+    if (micActive) return;
+    const id = `local_${Date.now()}`;
+    setSessionId(id);
+    dispatchCaption({ kind: 'reset' });
+    setHiddenSeqs(new Set());
+    projects.attachAsrSession(id, sourceLang, targetLang);
+    setMicActive(true);
   };
 
-  const handleForceCommitInterim = () => {
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
-    const textToCommit = (currentInterimRef.current || interimSpeechText).trim();
-    if (textToCommit) {
-      commitSpeechChunk(textToCommit);
-    }
-  };
-
-  useEffect(() => {
-    const newSocket = io();
-    setSocket(newSocket);
-
-    newSocket.on('config-updated', (newConfig: AppConfig) => {
-      setConfig((prev) => ({ ...prev, ...newConfig }));
-    });
-
-    newSocket.on('transcripts-updated', (items: TranscriptItem[]) => {
-      setTranscripts(items);
-      // Track last translation latency
-      const latestWithLatency = [...items].reverse().find((t) => t.latencyMs !== undefined);
-      if (latestWithLatency && latestWithLatency.latencyMs) {
-        setLastAiLatencyMs(latestWithLatency.latencyMs);
-      }
-
-      // Auto scroll down smoothly
-      setTimeout(() => {
-        if (transcriptScrollRef.current && !editingItemId) {
-          transcriptScrollRef.current.scrollTo({
-            top: transcriptScrollRef.current.scrollHeight,
-            behavior: 'smooth'
-          });
-        }
-      }, 80);
-    });
-
-    newSocket.on('meeting-status', (status: boolean) => {
-      setIsMeetingActive(status);
-      if (status) {
-        startListening();
-      } else {
-        stopListening();
-      }
-    });
-
-    newSocket.on('test-token-result', (result: { success: boolean; message: string }) => {
-      setTestingToken(false);
-      setTokenTestResult(result);
-      setTimeout(() => setTokenTestResult(null), 4000);
-    });
-
-    // Pong for live socket ping calculation
-    newSocket.on('pong-check', (data: { clientTimestamp: number }) => {
-      const ping = Date.now() - data.clientTimestamp;
-      setSocketPingMs(ping);
-    });
-
-    // Start periodic heartbeat ping
-    const pingInterval = setInterval(() => {
-      if (newSocket.connected) {
-        newSocket.emit('ping-check', Date.now());
-      }
-    }, 3000);
-
-    return () => {
-      clearInterval(pingInterval);
-      newSocket.close();
-      stopListening();
-    };
-  }, [editingItemId]);
-
-  // Handle Speech Recognition setup with smart pause segmentation / chunking
-  const startListening = () => {
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-
-    if (!SpeechRecognition) {
-      alert('เบราว์เซอร์นี้ไม่รองรับ Web Speech API กรุณาเปิดด้วย Google Chrome หรือ Microsoft Edge');
-      return;
-    }
-
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {
-        // ignore
-      }
-    }
-
-    const recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = configRef.current.sourceLang || 'th-TH';
-
-    recognition.onstart = () => {
-      setIsListening(true);
-      isListeningRef.current = true;
-      setMicPermissionError(false);
-      setMicAudioLevel(35);
-    };
-
-    recognition.onerror = (event: any) => {
-      if (event.error === 'not-allowed') {
-        setMicPermissionError(true);
-      }
-      if (event.error !== 'no-speech') {
-        setIsListening(false);
-        isListeningRef.current = false;
-      }
-    };
-
-    recognition.onend = () => {
-      setMicAudioLevel(0);
-      // Auto reconnect if meeting is active or restarting after a segment chunk commit
-      if (isMeetingActiveRef.current || isRestartingRef.current) {
-        isRestartingRef.current = false;
-        try {
-          recognition.start();
-          setIsListening(true);
-          isListeningRef.current = true;
-        } catch {
-          // ignore
-        }
-      } else {
-        setIsListening(false);
-        isListeningRef.current = false;
-        setInterimSpeechText('');
-      }
-    };
-
-    recognition.onresult = (event: any) => {
-      let interim = '';
-      let finalChunk = '';
-
-      for (let i = event.resultIndex; i < event.results.length; ++i) {
-        const transcript = event.results[i][0].transcript;
-        if (event.results[i].isFinal) {
-          finalChunk += transcript + ' ';
-        } else {
-          interim += transcript;
-        }
-      }
-
-      // 1. If ASR emitted a final segment, commit it immediately
-      if (finalChunk.trim()) {
-        if (silenceTimerRef.current) {
-          clearTimeout(silenceTimerRef.current);
-          silenceTimerRef.current = null;
-        }
-        commitSpeechChunk(finalChunk);
-        return;
-      }
-
-      // 2. If interim results are arriving:
-      const trimmedInterim = interim.trim();
-      if (trimmedInterim) {
-        currentInterimRef.current = trimmedInterim;
-        setInterimSpeechText(trimmedInterim);
-        setMicAudioLevel(Math.min(95, 30 + Math.random() * 50));
-
-        // Reset silence timer on every new speech acoustic packet
-        if (silenceTimerRef.current) {
-          clearTimeout(silenceTimerRef.current);
-        }
-
-        // Get configured silence threshold (default 900ms)
-        const silenceThreshold = configRef.current.chunkSilenceMs || 900;
-
-        // Auto-commit chunk when speaker pauses for silenceThreshold ms
-        silenceTimerRef.current = setTimeout(() => {
-          if (currentInterimRef.current.trim()) {
-            commitSpeechChunk(currentInterimRef.current);
+  // Ending the session flushes whatever audio is still buffered (so the last
+  // few words of a sentence aren't lost) and files that transcript under the
+  // session. Nothing is sent to the AI here: a summary costs a model call, so
+  // it happens only when the operator asks for one from the session history.
+  const stopSessionAndMic = async (): Promise<Caption[]> => {
+    // Disable the "End Session" button immediately, before the await below —
+    // otherwise a second click fires a duplicate flush.
+    setEndingSession(true);
+    const flushed = await capture.flush();
+    setMicActive(false);
+    // The flushed caption arrives too late for the reducer to have re-rendered
+    // this component, so it is folded in by hand.
+    const sessionCaptions: Caption[] = flushed
+      ? [
+          ...allCaptions,
+          {
+            seq: flushed.seq,
+            sourceText: flushed.sourceText,
+            targetText: flushed.targetText,
+            sourceLang: flushed.sourceLang,
+            targetLang: flushed.targetLang,
+            ts: Date.now() / 1000,
+            latencyMs: flushed.latencyMs,
+            isEdited: false
           }
-        }, silenceThreshold);
-      }
-    };
+        ]
+      : allCaptions;
+    if (sessionId) projects.saveSessionTranscript(sessionId, sessionCaptions);
+    setEndingSession(false);
+    setSessionId(null);
+    setPaused(false);
+    projects.detachAsrSession();
+    return sessionCaptions;
+  };
 
+  const isSessionActive = !!sessionId && micActive;
+
+  // Running total for the header badge: finished sessions come off the project
+  // record, the session recording right now comes out of the live caption
+  // buffer. Sampled on a timer, so a long meeting isn't recounting every word
+  // on every caption.
+  const liveCost = useLiveProjectCost(projects.currentProject, allCaptions, sessionId);
+
+  // On-demand summary for one recorded session, from the transcript kept with
+  // it. Opens the popup straight away so the operator watches it fill in.
+  const summarizeSession = async (session: ProjectSession) => {
+    const transcripts = session.transcripts ?? [];
+    if (transcripts.length === 0 || !session.endedAt) return;
+    if (projects.summarizingIds.has(session.asrSessionId)) return;
+
+    setSummarySessionId(session.id);
+    setSummarizingSince(Date.now());
+    projects.markSessionSummarizing(session.asrSessionId);
+    const items = transcripts.map((c) => ({ source_text: c.sourceText, target_text: c.targetText }));
     try {
-      recognition.start();
-      recognitionRef.current = recognition;
-      setIsListening(true);
-      isListeningRef.current = true;
-    } catch (e) {
-      console.error(e);
+      // The server checks this against the approval table before spending a
+      // single token on the summary.
+      const accessToken = await getAccessToken();
+      const res = await fetch('/api/gemini/summarize', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {})
+        },
+        body: JSON.stringify({ items }),
+        signal: AbortSignal.timeout(REPORT_WAIT_TIMEOUT_MS)
+      });
+      const data = (await res.json()) as { summary?: string; items?: number };
+      projects.saveSessionSummary(session.asrSessionId, data.summary ?? '', data.items ?? items.length);
+    } catch {
+      // An AI failure never loses the transcript — the session keeps it, and
+      // the operator can ask again.
+      projects.saveSessionSummary(session.asrSessionId, '', items.length);
+    } finally {
+      setSummarizingSince(null);
     }
   };
 
-  const stopListening = () => {
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
-    currentInterimRef.current = '';
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {
-        // ignore
-      }
-      recognitionRef.current = null;
-    }
-    setIsListening(false);
-    isListeningRef.current = false;
-    setMicAudioLevel(0);
-    setInterimSpeechText('');
+  const handleRequestFinishProject = async () => {
+    // Captured before the stop clears it: the bill prices per session, so it
+    // has to be told which session the returned captions belong to.
+    const lastAsrSessionId = sessionId;
+    const captionsForProject = await stopSessionAndMic();
+    const finished = projects.finishProject(captionsForProject, lastAsrSessionId);
+    dispatchCaption({ kind: 'reset' });
+    setHiddenSeqs(new Set());
+    if (finished) setFinishedProject(finished);
   };
 
-  const toggleMeeting = () => {
-    if (!socket) return;
-    if (isMeetingActive) {
-      socket.emit('stop-meeting');
-    } else {
-      socket.emit('start-meeting');
-    }
+  const handleSwitchProject = () => {
+    if (projects.activeSession) return; // one microphone, one live buffer
+    projects.clearSelection();
   };
 
-  const handleConfigChange = (
-    e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>
-  ) => {
-    const { name, value, type } = e.target;
-    const checked = (e.target as HTMLInputElement).checked;
-    let newConfig = {
-      ...config,
-      [name]: type === 'checkbox' ? checked : value
-    };
-
-    // Auto-switch complementary language (Thai <-> English)
-    if (name === 'sourceLang') {
-      if (value === 'th-TH') {
-        newConfig.targetLang = 'English';
-      } else if (value === 'en-US') {
-        newConfig.targetLang = 'Thai';
-      }
-    } else if (name === 'targetLang') {
-      if (value === 'English') {
-        newConfig.sourceLang = 'th-TH';
-      } else if (value === 'Thai') {
-        newConfig.sourceLang = 'en-US';
-      }
-    }
-
-    setConfig(newConfig);
-    if (socket) {
-      socket.emit('update-config', newConfig);
-    }
-
-    // If source language changed while listening, restart recognition
-    if (name === 'sourceLang' && isMeetingActive) {
-      stopListening();
-      setTimeout(() => startListening(), 250);
-    }
+  // ── Language swap ────────────────────────────────────────────────────────
+  const setLanguage = (source: 'th' | 'en') => {
+    setSourceLangState(source);
+    setTargetLangState(other(source) as 'th' | 'en');
   };
 
-  const handleSwapLanguages = () => {
-    const newSource = config.sourceLang === 'th-TH' ? 'en-US' : 'th-TH';
-    const newTarget = newSource === 'th-TH' ? 'English' : 'Thai';
-    const newConfig = {
-      ...config,
-      sourceLang: newSource,
-      targetLang: newTarget
-    };
-    setConfig(newConfig);
-    if (socket) {
-      socket.emit('update-config', newConfig);
-    }
-    if (isMeetingActive) {
-      stopListening();
-      setTimeout(() => startListening(), 250);
-    }
+  const handleSwapLanguages = () => setLanguage(targetLang);
+
+  // ── Glossary ──────────────────────────────────────────────────────────────
+  const persistGlossary = (next: GlossarySections) => {
+    setGlossary(next);
+    saveGlossary(next);
   };
 
-  const handleSendTestText = (overrideText?: string) => {
-    const text = (overrideText !== undefined ? overrideText : testInputText).trim();
-    if (!text || !socket) return;
-    socket.emit('new-transcription', text);
-    if (overrideText === undefined) {
-      setTestInputText('');
-    }
+  const handleGlossaryAdd = (section: GlossarySection, term: string, equivalent: string) => {
+    persistGlossary({ ...glossary, [section]: { ...glossary[section], [term]: equivalent } });
   };
 
-  const handleSaveToken = (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    if (!inputToken.trim() || !socket) return;
-    setIsSavingToken(true);
-    socket.emit('update-config', { apiToken: inputToken.trim() });
-    setInputToken('');
-    setTokenSavedSuccess(true);
-    setTimeout(() => {
-      setIsSavingToken(false);
-      setTokenSavedSuccess(false);
-    }, 2500);
+  const handleGlossaryRemove = (section: GlossarySection, term: string) => {
+    const next = { ...glossary[section] };
+    delete next[term];
+    persistGlossary({ ...glossary, [section]: next });
   };
 
-  const handleDeleteToken = () => {
-    if (!socket) return;
-    if (window.confirm('ยืนยันลบ Custom API Key ออกจาก Server และกลับไปใช้ Default Gemini Key?')) {
-      socket.emit('update-config', { clearToken: true });
-    }
+  // ── Caption item actions ─────────────────────────────────────────────────
+  const handleCopyItem = (item: Caption) => {
+    navigator.clipboard.writeText(`${item.sourceText}\n${item.targetText}`);
+    setCopiedSeq(item.seq);
+    setTimeout(() => setCopiedSeq(null), 1500);
   };
 
-  const handleTestToken = (customCandidate?: string) => {
-    if (!socket) return;
-    setTestingToken(true);
-    setTokenTestResult(null);
-    socket.emit('test-token', customCandidate || '');
+  const startEditing = (item: Caption) => {
+    setEditingSeq(item.seq);
+    setEditDraft(item.targetText);
   };
 
-  const handleCopyItem = (item: TranscriptItem) => {
-    const fullText = `${item.originalText}\n${item.translatedText}`;
-    navigator.clipboard.writeText(fullText);
-    setCopiedItemId(item.id);
-    setTimeout(() => setCopiedItemId(null), 1500);
+  const saveEdit = () => {
+    if (editingSeq === null) return;
+    dispatchCaption({ kind: 'edit', seq: editingSeq, targetText: editDraft.trim() });
+    setEditingSeq(null);
   };
 
-  const startEditing = (item: TranscriptItem) => {
-    setEditingItemId(item.id);
-    setEditTranslatedText(item.translatedText);
-    setEditOriginalText(item.originalText);
-  };
-
-  const cancelEditing = () => {
-    setEditingItemId(null);
-    setEditTranslatedText('');
-    setEditOriginalText('');
-  };
-
-  const saveCorrection = (id: string) => {
-    if (!socket) return;
-    socket.emit('update-transcript-item', {
-      id,
-      translatedText: editTranslatedText.trim(),
-      originalText: editOriginalText.trim()
-    });
-    setSavedFeedbackId(id);
-    setTimeout(() => setSavedFeedbackId(null), 2000);
-    setEditingItemId(null);
-  };
-
-  const deleteItem = (id: string) => {
-    if (socket) {
-      socket.emit('delete-transcript-item', id);
-    }
-  };
-
-  const retranslateItem = (item: TranscriptItem) => {
-    if (!socket) return;
-    socket.emit('retranslate-item', {
-      id: item.id,
-      text: editOriginalText || item.originalText
-    });
-    setEditingItemId(null);
+  const hideItem = (seq: number) => {
+    setHiddenSeqs((prev) => new Set(prev).add(seq));
   };
 
   const clearTranscripts = () => {
-    if (socket && window.confirm('ล้างประวัติการแปลทั้งหมด?')) {
-      socket.emit('clear-transcripts');
+    if (window.confirm('ล้างประวัติการแปลทั้งหมด?')) {
+      dispatchCaption({ kind: 'reset' });
+      setHiddenSeqs(new Set());
     }
   };
 
+  // Auto-scroll the feed as new captions arrive, unless the operator is
+  // actively editing one (a scroll jump under an open editor is disorienting).
+  useEffect(() => {
+    if (editingSeq !== null) return;
+    const el = transcriptScrollRef.current;
+    if (!el) return;
+    const id = setTimeout(() => el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }), 80);
+    return () => clearTimeout(id);
+  }, [captions.length, editingSeq]);
+
+  // ── Export ───────────────────────────────────────────────────────────────
   const exportTranscript = (type: 'txt' | 'srt') => {
-    if (transcripts.length === 0) return;
-    let content = '';
+    if (captions.length === 0) return;
     const dateStr = new Date().toISOString().slice(0, 10);
+    let content = '';
 
     if (type === 'txt') {
-      content = `=== Live Translation Transcript (${dateStr}) ===\n${config.sourceLang} -> ${config.targetLang}\n\n`;
-      content += transcripts
+      content = `=== Live Translation Transcript (${dateStr}) ===\n${sourceLang} -> ${targetLang}\n\n`;
+      content += captions
         .map(
-          (t, i) =>
-            `[${i + 1}] ${new Date(t.timestamp).toLocaleTimeString()}${t.isEdited ? ' (edited)' : ''} [${t.latencyMs || '-'}ms]\nOriginal: ${t.originalText}\nTranslated: ${t.translatedText}\n`
+          (c, i) =>
+            `[${i + 1}] ${new Date(c.ts * 1000).toLocaleTimeString()}${c.isEdited ? ' (edited)' : ''} [${c.latencyMs || '-'}ms]\nOriginal: ${c.sourceText}\nTranslated: ${c.targetText}\n`
         )
         .join('\n');
     } else {
-      const formatSrtTime = (ms: number) => {
-        const d = new Date(ms);
-        const hh = String(d.getUTCHours()).padStart(2, '0');
-        const mm = String(d.getUTCMinutes()).padStart(2, '0');
-        const ss = String(d.getUTCSeconds()).padStart(2, '0');
-        const msStr = String(d.getUTCMilliseconds()).padStart(3, '0');
-        return `${hh}:${mm}:${ss},${msStr}`;
-      };
-
-      const startBase = transcripts[0].timestamp;
-      content = transcripts
-        .map((t, idx) => {
-          const startTime = Math.max(0, t.timestamp - startBase);
+      const startBase = captions[0].ts * 1000;
+      content = captions
+        .map((c, idx) => {
+          const startTime = Math.max(0, c.ts * 1000 - startBase);
           const endTime = startTime + 3500;
-          return `${idx + 1}\n${formatSrtTime(startTime)} --> ${formatSrtTime(endTime)}\n${t.translatedText}\n`;
+          return `${idx + 1}\n${formatSrtTime(startTime)} --> ${formatSrtTime(endTime)}\n${c.targetText}\n`;
         })
         .join('\n');
     }
@@ -550,28 +391,87 @@ export default function Admin() {
     URL.revokeObjectURL(url);
   };
 
-  // Font size styling helper
-  const getTextSizeClass = () => {
-    switch (config.fontSize) {
-      case 'small':
-        return 'text-sm sm:text-base';
-      case 'medium':
-        return 'text-base sm:text-lg';
-      case 'xlarge':
-        return 'text-xl sm:text-2xl';
-      case 'large':
-      default:
-        return 'text-lg sm:text-xl';
-    }
+  // The escape hatch when storage is refusing writes: whatever is still in
+  // memory leaves the browser as a file the operator controls.
+  const downloadProjectBackup = () => {
+    const payload = JSON.stringify(
+      { exportedAt: new Date().toISOString(), projects: [...projects.activeProjects, ...projects.endedProjects] },
+      null,
+      2
+    );
+    const blob = new Blob([payload], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `backup-projects-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
+
+  const isListening = capture.status === 'listening';
+  const micPermissionError = capture.status === 'error';
+
+  // The live subtitle box always shows ONE caption at a time — the latest —
+  // like a YouTube subtitle, so an operator can crop just this box in OBS
+  // for streaming.
+  const latestCaption = captions.length > 0 ? captions[captions.length - 1] : null;
+  // While a sentence is still being spoken the model is already streaming
+  // its translation, so the box shows that in-progress text (faded) and
+  // swaps to the committed caption once the sentence closes.
+  const hasPartial = !!(capture.partialSource || capture.partialTarget);
+  const boxSourceText = capture.partialSource || latestCaption?.sourceText || '';
+  const boxTargetText = capture.partialTarget || latestCaption?.targetText || '';
+  const isEditingBox = editingSeq !== null && editingSeq === latestCaption?.seq;
+
+  // Read live off the project record so the popup fills itself in the moment
+  // the summary lands, rather than holding a stale copy of the session.
+  const summarySession = projects.currentProject?.sessions.find((s) => s.id === summarySessionId) ?? null;
+
+  // ── No project selected: the picker is the whole screen, as it always was ──
+  if (!projects.currentProject) {
+    return (
+      <>
+        <ProjectPicker
+          activeProjects={projects.activeProjects}
+          canCreateProject={projects.canCreateProject}
+          onSelect={projects.selectProject}
+          onCreate={projects.createProject}
+          onOpenHistory={() => setShowHistory(true)}
+        />
+        {showHistory && <HistoryPanel projects={projects.endedProjects} onClose={() => setShowHistory(false)} />}
+        {finishedProject && <BillModal project={finishedProject} onClose={() => setFinishedProject(null)} />}
+      </>
+    );
+  }
 
   return (
     <div className="flex flex-col h-screen w-full bg-slate-100 text-slate-800 font-sans overflow-hidden">
+      {showHistory && <HistoryPanel projects={projects.endedProjects} onClose={() => setShowHistory(false)} />}
+      {finishedProject && <BillModal project={finishedProject} onClose={() => setFinishedProject(null)} />}
+      {showSessionHistory && (
+        <SessionHistoryModal
+          project={projects.currentProject}
+          summarizingIds={projects.summarizingIds}
+          onSummarize={summarizeSession}
+          onViewSummary={(session) => setSummarySessionId(session.id)}
+          onClose={() => setShowSessionHistory(false)}
+        />
+      )}
+      {summarySession && (
+        <SessionSummaryModal
+          project={projects.currentProject}
+          session={summarySession}
+          isSummarizing={projects.summarizingIds.has(summarySession.asrSessionId)}
+          summarizingSince={summarizingSince}
+          onSummarize={summarizeSession}
+          onClose={() => setSummarySessionId(null)}
+        />
+      )}
+
       {/* ─────────────────────────────────────────────────────────────
-          TOP CONTROL & METRICS BAR (Professional Minimal Header)
+          TOP CONTROL & METRICS BAR
       ────────────────────────────────────────────────────────────── */}
       <header className="h-15 bg-white border-b border-slate-200 px-3 sm:px-6 flex items-center justify-between shrink-0 z-30 shadow-xs">
-        {/* Brand & Mobile Sidebar Toggle */}
         <div className="flex items-center gap-2.5">
           <button
             onClick={() => setMobileSettingsOpen(!mobileSettingsOpen)}
@@ -586,184 +486,149 @@ export default function Admin() {
               <Sparkles className="w-4.5 h-4.5" />
             </div>
             <div className="flex flex-col">
-              <span className="font-bold text-sm text-slate-900 tracking-tight leading-none">
-                AI Live Translator
-              </span>
-              <span className="text-[11px] text-slate-400 font-medium leading-tight mt-0.5">
-                Google Chirp + Gemini 3.7
-              </span>
+              <span className="font-bold text-sm text-slate-900 tracking-tight leading-none">AI Live Translator</span>
             </div>
+          </div>
+
+          <div className="hidden sm:flex items-center gap-1.5">
+            <ProjectHeaderBar
+              project={projects.currentProject}
+              activeSession={projects.activeSession}
+              onRequestFinish={handleRequestFinishProject}
+              onSwitchProject={handleSwitchProject}
+              onOpenHistory={() => setShowHistory(true)}
+            />
+            <button
+              type="button"
+              onClick={() => setShowSessionHistory(true)}
+              className="p-1.5 text-slate-400 hover:text-[#DE5C8E] rounded-full hover:bg-slate-100 transition-all shrink-0"
+              title="ดู session และสรุปการประชุมย้อนหลังในโปรเจกต์นี้"
+            >
+              <ClipboardList className="w-4 h-4" />
+            </button>
+            <LiveCostBadge cost={liveCost} isRecording={isSessionActive} />
           </div>
         </div>
 
-        {/* Status Indicators & Main Action Button */}
         <div className="flex items-center gap-2 sm:gap-3">
-          {/* Live Status Badge */}
-          <div
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold transition-all ${
-              isMeetingActive
-                ? 'bg-emerald-50 text-emerald-700 border border-emerald-300 ring-2 ring-emerald-100'
-                : 'bg-slate-100 text-slate-500 border border-slate-200'
-            }`}
-          >
-            {isMeetingActive ? (
+          <span className="hidden sm:block text-xs font-semibold text-slate-700 truncate max-w-48" title={userEmail}>
+            {userEmail}
+          </span>
+
+          {/* The record control itself now lives in the middle of the screen;
+              this corner is reserved for the operator's own account. */}
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setProfileOpen((v) => !v)}
+              className={`w-9 h-9 rounded-full border overflow-hidden flex items-center justify-center transition-all ${
+                profileOpen
+                  ? 'border-pink-200 ring-2 ring-pink-100 text-[#DE5C8E] bg-pink-50'
+                  : 'bg-slate-100 border-slate-200 text-slate-500 hover:text-[#DE5C8E] hover:bg-slate-200'
+              }`}
+              title={userEmail}
+              aria-label="โปรไฟล์ผู้ใช้"
+              aria-expanded={profileOpen}
+            >
+              {userPicture ? (
+                <img src={userPicture} alt="" className="w-full h-full object-cover" />
+              ) : (
+                <User className="w-4.5 h-4.5" />
+              )}
+            </button>
+            {profileOpen && (
               <>
-                <span className="relative flex h-2 w-2">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-                </span>
-                <span className="tracking-wider text-[11px] font-bold uppercase whitespace-nowrap">
-                  กำลังแปลสด
-                </span>
-                {/* Visualizer bars */}
-                <div className="hidden sm:flex items-center gap-0.5 ml-1 h-3.5 bg-emerald-200/70 px-1 rounded">
-                  <div
-                    className="w-1 bg-emerald-600 rounded-full transition-all duration-75"
-                    style={{ height: `${Math.max(25, micAudioLevel)}%` }}
-                  />
-                  <div
-                    className="w-1 bg-emerald-600 rounded-full transition-all duration-75"
-                    style={{ height: `${Math.max(15, micAudioLevel * 0.7)}%` }}
-                  />
+                <div className="fixed inset-0 z-30" onClick={() => setProfileOpen(false)} />
+                <div className="absolute right-0 top-11 z-40 w-64 bg-white border border-slate-200 rounded-xl shadow-lg p-3.5">
+                  <div className="flex items-center gap-2.5">
+                    {userPicture ? (
+                      <img src={userPicture} alt="" className="w-9 h-9 rounded-full shrink-0" />
+                    ) : (
+                      <div className="w-9 h-9 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-400 shrink-0">
+                        <User className="w-4 h-4" />
+                      </div>
+                    )}
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold text-slate-800 truncate">{userEmail}</div>
+                      {userFullName && (
+                        <div className="text-[11px] text-slate-400 truncate">{userFullName}</div>
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleSignOut}
+                    className="mt-3 pt-3 border-t border-slate-100 w-full flex items-center gap-2 text-xs font-semibold text-slate-600 hover:text-red-600 transition-colors"
+                  >
+                    <LogOut className="w-3.5 h-3.5" />
+                    ออกจากระบบ
+                  </button>
                 </div>
-              </>
-            ) : (
-              <>
-                <span className="w-2 h-2 rounded-full bg-slate-400"></span>
-                <span className="text-[11px] whitespace-nowrap">พร้อมใช้งาน</span>
               </>
             )}
           </div>
-
-          {/* Real-time Telemetry (AI Latency & Ping) */}
-          <div className="hidden md:flex items-center gap-2 bg-slate-100 px-3 py-1.5 rounded-full text-[11px] font-mono border border-slate-200">
-            <Zap className={`w-3.5 h-3.5 ${isMeetingActive ? 'text-amber-500' : 'text-slate-400'}`} />
-            <span className="text-slate-500">AI:</span>
-            <span className="font-semibold text-slate-800">
-              {lastAiLatencyMs ? `${lastAiLatencyMs}ms` : '--'}
-            </span>
-            <span className="text-slate-300">|</span>
-            <Activity className="w-3.5 h-3.5 text-emerald-600" />
-            <span className="text-slate-500">Ping:</span>
-            <span className="font-semibold text-slate-800">
-              {socketPingMs !== null ? `${socketPingMs}ms` : '--'}
-            </span>
-          </div>
-
-          {/* Start / Stop Primary Button */}
-          <button
-            onClick={toggleMeeting}
-            className={`px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2 transition-all shadow-xs whitespace-nowrap ${
-              isMeetingActive
-                ? 'bg-rose-600 hover:bg-rose-700 text-white animate-pulse'
-                : 'bg-[#DE5C8E] hover:bg-[#c94577] text-white'
-            }`}
-          >
-            {isMeetingActive ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
-            <span>{isMeetingActive ? 'หยุดแปลสด' : 'เริ่มแปลสด'}</span>
-          </button>
         </div>
       </header>
+
+      <div className="sm:hidden px-3 py-2 bg-white border-b border-slate-200 shrink-0 overflow-x-auto flex items-center gap-1.5">
+        <ProjectHeaderBar
+          project={projects.currentProject}
+          activeSession={projects.activeSession}
+          onRequestFinish={handleRequestFinishProject}
+          onSwitchProject={handleSwitchProject}
+          onOpenHistory={() => setShowHistory(true)}
+        />
+        <button
+          type="button"
+          onClick={() => setShowSessionHistory(true)}
+          className="p-1.5 text-slate-400 hover:text-[#DE5C8E] rounded-full hover:bg-slate-100 transition-all shrink-0"
+          title="ดู session และสรุปการประชุมย้อนหลังในโปรเจกต์นี้"
+        >
+          <ClipboardList className="w-4 h-4" />
+        </button>
+        <LiveCostBadge cost={liveCost} isRecording={isSessionActive} />
+      </div>
 
       {/* ─────────────────────────────────────────────────────────────
           MAIN WORKSPACE LAYOUT
       ────────────────────────────────────────────────────────────── */}
       <div className="flex-1 flex overflow-hidden relative">
-        {/* LEFT SETTINGS SIDEBAR */}
         <aside
           className={`fixed inset-y-15 left-0 z-20 w-84 lg:w-96 bg-white border-r border-slate-200 flex flex-col transition-transform duration-200 lg:static lg:translate-x-0 ${
             mobileSettingsOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-full'
           }`}
         >
-          {/* Navigation Tabs */}
-          <div className="grid grid-cols-3 p-1.5 bg-slate-50 border-b border-slate-200 text-xs gap-1 shrink-0">
+          <div className="grid grid-cols-2 p-1.5 bg-slate-50 border-b border-slate-200 text-xs gap-1 shrink-0">
             <button
               onClick={() => setActiveTab('languages')}
               className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all ${
-                activeTab === 'languages'
-                  ? 'bg-white text-[#DE5C8E] shadow-xs'
-                  : 'text-slate-500 hover:text-slate-800'
+                activeTab === 'languages' ? 'bg-white text-[#DE5C8E] shadow-xs' : 'text-slate-500 hover:text-slate-800'
               }`}
             >
               <Languages className="w-4 h-4" />
-              <span className="whitespace-nowrap">ภาษาและ AI</span>
+              <span className="whitespace-nowrap">ภาษาและการตั้งค่า</span>
             </button>
             <button
               onClick={() => setActiveTab('dictionary')}
               className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all ${
-                activeTab === 'dictionary'
-                  ? 'bg-white text-[#DE5C8E] shadow-xs'
-                  : 'text-slate-500 hover:text-slate-800'
+                activeTab === 'dictionary' ? 'bg-white text-[#DE5C8E] shadow-xs' : 'text-slate-500 hover:text-slate-800'
               }`}
             >
               <BookOpen className="w-4 h-4" />
               <span className="whitespace-nowrap">พจนานุกรม</span>
             </button>
-            <button
-              onClick={() => setActiveTab('token')}
-              className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all relative ${
-                activeTab === 'token'
-                  ? 'bg-white text-[#DE5C8E] shadow-xs'
-                  : 'text-slate-500 hover:text-slate-800'
-              }`}
-            >
-              <Key className="w-4 h-4" />
-              <span className="whitespace-nowrap">API Key</span>
-              {config.hasCustomToken && (
-                <span className="w-2 h-2 rounded-full bg-emerald-500 ring-2 ring-white absolute top-1.5 right-2"></span>
-              )}
-            </button>
           </div>
 
-          {/* Sidebar Tab Content */}
           <div className="flex-1 p-4 overflow-y-auto space-y-4">
-            {/* TAB 1: LANGUAGES & AI ENGINE */}
             {activeTab === 'languages' && (
               <div className="space-y-4">
-                {/* Speech Recognition Engine (Chirp 3 / Cloud ASR) */}
-                <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
-                      <Cpu className="w-4 h-4 text-[#DE5C8E]" />
-                      <span>ระบบแปลงเสียงพูด (Speech ASR)</span>
-                    </span>
-                    <span className="text-[10px] bg-emerald-50 text-emerald-800 font-semibold px-2 py-0.5 rounded-md border border-emerald-200">
-                      Chirp 3 Engine
-                    </span>
-                  </div>
-                  <p className="text-xs text-slate-500 leading-relaxed">
-                    เอนจิน Google Cloud Speech &amp; Chirp แปลงเสียงสดเป็นข้อความอัตโนมัติความเร็วสูง (&lt;100ms)
-                  </p>
-                </div>
-
-                {/* AI Model Selection */}
-                <div>
-                  <div className="flex items-center justify-between mb-1.5">
-                    <label className="block text-xs font-bold text-slate-700">
-                      โมเดล AI แปลภาษา (Translation Model)
-                    </label>
-                    <span className="text-[10px] text-purple-700 font-mono font-semibold">Gemini API</span>
-                  </div>
-                  <select
-                    name="aiModel"
-                    value={config.aiModel || 'gemini-3.7-flash'}
-                    onChange={handleConfigChange}
-                    className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium"
-                  >
-                    <option value="gemini-3.7-flash">Gemini 3.7 Flash (แนะนำ: ความเร็วสูง ตอบสนองทันที)</option>
-                    <option value="gemini-2.5-flash">Gemini 2.5 Flash (มาตรฐานความเร็วสูง)</option>
-                    <option value="gemini-2.5-pro">Gemini 2.5 Pro (แม่นยำสูง สำหรับเนื้อหาเชิงวิชาการ)</option>
-                  </select>
-                </div>
-
-                {/* Source & Target Language (Thai <-> English) */}
                 <div className="space-y-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold text-slate-800">คู่ภาษาแปลสด (Thai ↔ English)</span>
                     <button
                       type="button"
                       onClick={handleSwapLanguages}
-                      className="text-[11px] px-2.5 py-1 bg-white hover:bg-pink-50 text-[#DE5C8E] border border-pink-200 rounded-lg font-bold flex items-center gap-1 shadow-2xs transition-all cursor-pointer"
+                      className="text-[11px] px-2.5 py-1 bg-white hover:bg-pink-50 text-[#DE5C8E] border border-pink-200 rounded-lg font-bold flex items-center gap-1 shadow-2xs transition-all"
                       title="สลับภาษาผู้พูดและภาษาแปล"
                     >
                       <ArrowLeftRight className="w-3.5 h-3.5" />
@@ -771,75 +636,36 @@ export default function Admin() {
                     </button>
                   </div>
 
-                  {/* Source Language */}
                   <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">
-                      ภาษาของผู้พูด (Source Language)
-                    </label>
+                    <label className="block text-xs font-bold text-slate-700 mb-1">ภาษาของผู้พูด (Source Language)</label>
                     <select
-                      name="sourceLang"
-                      value={config.sourceLang}
-                      onChange={handleConfigChange}
-                      disabled={isMeetingActive}
-                      className="w-full p-2.5 text-xs bg-white border border-slate-200 rounded-lg outline-none focus:border-[#DE5C8E] disabled:opacity-60 font-semibold text-slate-800"
+                      value={sourceLang}
+                      onChange={(e) => setLanguage(e.target.value as 'th' | 'en')}
+                      className="w-full p-2.5 text-xs bg-white border border-slate-200 rounded-lg outline-none focus:border-[#DE5C8E] font-semibold text-slate-800"
                     >
-                      <option value="th-TH">ไทย (Thai - th-TH)</option>
-                      <option value="en-US">อังกฤษ (English - en-US)</option>
+                      <option value="th">{LANGS.th}</option>
+                      <option value="en">{LANGS.en}</option>
                     </select>
                   </div>
 
-                  {/* Target Language */}
                   <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">
-                      ภาษาที่ต้องการแปล (Target Language - อัตโนมัติ)
-                    </label>
+                    <label className="block text-xs font-bold text-slate-700 mb-1">ภาษาที่แปลเป็น (Target — อัตโนมัติ)</label>
                     <select
-                      name="targetLang"
-                      value={config.targetLang}
-                      onChange={handleConfigChange}
+                      value={targetLang}
+                      onChange={(e) => setLanguage(other(e.target.value) as 'th' | 'en')}
                       className="w-full p-2.5 text-xs bg-white border border-slate-200 rounded-lg outline-none focus:border-[#DE5C8E] font-semibold text-[#DE5C8E]"
                     >
-                      <option value="English">แปลเป็นอังกฤษ (English)</option>
-                      <option value="Thai">แปลเป็นไทย (Thai)</option>
+                      <option value="en">แปลเป็นอังกฤษ (English)</option>
+                      <option value="th">แปลเป็นไทย (Thai)</option>
                     </select>
                   </div>
                 </div>
 
-                {/* Chunking / Silence Pause Segmentation */}
                 <div>
-                  <div className="flex items-center justify-between mb-1.5">
-                    <label className="block text-xs font-bold text-slate-700">
-                      ความไวการตัดช่วงแปลสด (Live Chunking)
-                    </label>
-                    <span className="text-[10px] text-[#DE5C8E] font-semibold flex items-center gap-1">
-                      <Timer className="w-3 h-3" />
-                      <span>{config.chunkSilenceMs || 900}ms</span>
-                    </span>
-                  </div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1.5">ขนาดตัวอักษรข้อความแปล (Font Size)</label>
                   <select
-                    name="chunkSilenceMs"
-                    value={config.chunkSilenceMs || 900}
-                    onChange={handleConfigChange}
-                    className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium"
-                  >
-                    <option value={600}>⚡ เร็วมาก (Fast: ~0.6 วินาที - แปลสดคำต่อคำ)</option>
-                    <option value={900}>⚖️ มาตรฐาน (Balanced: ~0.9 วินาที - แนะนำ จังหวะหายใจ)</option>
-                    <option value={1400}>🧘 ผ่อนคลาย (Relaxed: ~1.4 วินาที - รอจบประโยคยาว)</option>
-                  </select>
-                  <p className="mt-1 text-[11px] text-slate-500 leading-normal">
-                    ระบบจะตัดวรรคส่งให้ AI แปลทันทีแบบเรียลไทม์เมื่อตรวจพบการหยุดพูดตามเวลาที่กำหนด
-                  </p>
-                </div>
-
-                {/* Font Size Option */}
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1.5">
-                    ขนาดตัวอักษรข้อความแปล (Font Size)
-                  </label>
-                  <select
-                    name="fontSize"
-                    value={config.fontSize || 'large'}
-                    onChange={handleConfigChange}
+                    value={config.fontSize}
+                    onChange={(e) => setConfig((c) => ({ ...c, fontSize: e.target.value as DisplayConfig['fontSize'] }))}
                     className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium"
                   >
                     <option value="small">ขนาดเล็ก (Small)</option>
@@ -849,25 +675,21 @@ export default function Admin() {
                   </select>
                 </div>
 
-                {/* Options checklist */}
                 <div className="pt-3 border-t border-slate-200 space-y-2.5">
                   <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
                     <input
                       type="checkbox"
-                      name="showOriginal"
                       checked={config.showOriginal !== false}
-                      onChange={handleConfigChange}
+                      onChange={(e) => setConfig((c) => ({ ...c, showOriginal: e.target.checked }))}
                       className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
                     />
                     <span>แสดงประโยคต้นฉบับคู่กับคำแปล</span>
                   </label>
-
                   <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
                     <input
                       type="checkbox"
-                      name="showLatency"
                       checked={config.showLatency !== false}
-                      onChange={handleConfigChange}
+                      onChange={(e) => setConfig((c) => ({ ...c, showLatency: e.target.checked }))}
                       className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
                     />
                     <span>แสดงความเร็วการตอบสนอง (Latency ms)</span>
@@ -876,164 +698,11 @@ export default function Admin() {
               </div>
             )}
 
-            {/* TAB 2: DICTIONARY */}
             {activeTab === 'dictionary' && (
-              <div>
-                <DictionaryManager
-                  dictionaryJson={config.dictionaryJson}
-                  onChange={(newJson) => {
-                    const updated = { ...config, dictionaryJson: newJson };
-                    setConfig(updated);
-                    if (socket) socket.emit('update-config', updated);
-                  }}
-                />
-              </div>
-            )}
-
-            {/* TAB 3: API KEY / TOKEN */}
-            {activeTab === 'token' && (
-              <div className="space-y-4">
-                {/* Security Status Banner */}
-                {config.hasCustomToken ? (
-                  <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl space-y-2.5">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2 text-emerald-800 font-semibold text-xs">
-                        <ShieldCheck className="w-4.5 h-4.5 text-emerald-600 shrink-0" />
-                        <span>บันทึก Key บน Server ปลอดภัย</span>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={handleDeleteToken}
-                        className="p-1.5 text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-lg transition-all"
-                        title="ลบ Key ออกจาก Server และกลับไปใช้ Default Key"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-
-                    <button
-                      type="button"
-                      onClick={() => handleTestToken()}
-                      disabled={testingToken}
-                      className="w-full py-2 bg-white border border-emerald-300 hover:bg-emerald-100 text-emerald-800 rounded-lg text-xs font-semibold transition-all shadow-xs disabled:opacity-50 flex items-center justify-center gap-2"
-                    >
-                      <ShieldCheck className="w-4 h-4 text-emerald-600" />
-                      <span>{testingToken ? 'กำลังตรวจสอบ...' : 'ทดสอบการเชื่อมต่อ API Key'}</span>
-                    </button>
-                  </div>
-                ) : (
-                  <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl space-y-1.5">
-                    <div className="flex items-center gap-2 text-slate-700 font-semibold text-xs">
-                      <Lock className="w-4 h-4 text-slate-500 shrink-0" />
-                      <span>กำลังใช้ Default API Key ของระบบ</span>
-                    </div>
-                    <p className="text-xs text-slate-500 leading-relaxed">
-                      คุณสามารถระบุ Gemini API Key ส่วนตัวเพื่อขยายขีดจำกัดโควต้าและความเร็วในการประมวลผลได้
-                    </p>
-                  </div>
-                )}
-
-                {/* Input New Key Form */}
-                <form onSubmit={handleSaveToken} className="space-y-2.5 pt-1">
-                  <div className="flex items-center justify-between">
-                    <label className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
-                      <Key className="w-3.5 h-3.5 text-[#DE5C8E]" />
-                      <span>{config.hasCustomToken ? 'เปลี่ยน API Key ใหม่' : 'ระบุ Gemini API Key ส่วนตัว'}</span>
-                    </label>
-                    {inputToken && (
-                      <button
-                        type="button"
-                        onClick={() => setShowToken(!showToken)}
-                        className="text-xs text-slate-400 hover:text-slate-600 flex items-center gap-1"
-                      >
-                        {showToken ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                        <span>{showToken ? 'ซ่อน' : 'แสดง'}</span>
-                      </button>
-                    )}
-                  </div>
-
-                  <div className="relative">
-                    <input
-                      type={showToken ? 'text' : 'password'}
-                      value={inputToken}
-                      onChange={(e) => setInputToken(e.target.value)}
-                      placeholder="วาง Gemini API Key (เช่น AIzaSy...)"
-                      className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg font-mono outline-none focus:bg-white focus:border-[#DE5C8E] transition-all pr-8"
-                    />
-                    {inputToken && (
-                      <button
-                        type="button"
-                        onClick={() => setInputToken('')}
-                        className="absolute right-2.5 top-2.5 text-slate-400 hover:text-slate-600"
-                      >
-                        <X className="w-4 h-4" />
-                      </button>
-                    )}
-                  </div>
-
-                  <div className="flex gap-2 pt-1">
-                    <button
-                      type="submit"
-                      disabled={!inputToken.trim() || isSavingToken}
-                      className="flex-1 py-2 bg-[#DE5C8E] hover:bg-[#c94577] text-white rounded-lg text-xs font-bold transition-all shadow-xs disabled:opacity-40 flex items-center justify-center gap-1.5"
-                    >
-                      <Lock className="w-3.5 h-3.5" />
-                      <span>{isSavingToken ? 'กำลังบันทึก...' : 'บันทึก Key ลง Server'}</span>
-                    </button>
-                    {inputToken.trim() && (
-                      <button
-                        type="button"
-                        onClick={() => handleTestToken(inputToken.trim())}
-                        disabled={testingToken}
-                        className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-medium transition-all disabled:opacity-50 whitespace-nowrap"
-                      >
-                        ทดสอบ Key
-                      </button>
-                    )}
-                  </div>
-                </form>
-
-                {/* Save Feedback */}
-                {tokenSavedSuccess && (
-                  <div className="p-3 rounded-xl text-xs bg-emerald-50 border border-emerald-300 text-emerald-800 flex items-center gap-2">
-                    <Check className="w-4 h-4 text-emerald-600 shrink-0" />
-                    <span>บันทึก API Key บน Server สำเร็จและซ่อนจากฝั่ง Client แล้ว</span>
-                  </div>
-                )}
-
-                {/* Test Result Feedback */}
-                {tokenTestResult && (
-                  <div
-                    className={`p-3 rounded-xl text-xs flex items-center gap-2 border ${
-                      tokenTestResult.success
-                        ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
-                        : 'bg-rose-50 text-rose-800 border-rose-200'
-                    }`}
-                  >
-                    {tokenTestResult.success ? (
-                      <ShieldCheck className="w-4.5 h-4.5 text-emerald-600 shrink-0" />
-                    ) : (
-                      <ShieldAlert className="w-4.5 h-4.5 text-rose-600 shrink-0" />
-                    )}
-                    <span>{tokenTestResult.message}</span>
-                  </div>
-                )}
-
-                <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-500 space-y-1.5">
-                  <div className="font-semibold text-slate-700 flex items-center gap-1.5">
-                    <ShieldCheck className="w-3.5 h-3.5 text-slate-500" />
-                    <span>ระบบรักษาความปลอดภัย:</span>
-                  </div>
-                  <ul className="list-disc list-inside space-y-1 text-[11px] text-slate-500">
-                    <li>API Key ได้รับการเข้ารหัสและจัดเก็บบน Server-Side เท่านั้น</li>
-                    <li>ไม่เปิดเผย API Key ผ่านทาง Network Request หรือ DevTools</li>
-                  </ul>
-                </div>
-              </div>
+              <DictionaryManager sections={glossary} disabled={false} onAdd={handleGlossaryAdd} onRemove={handleGlossaryRemove} />
             )}
           </div>
 
-          {/* Close drawer button on mobile */}
           <div className="p-3 border-t border-slate-200 lg:hidden">
             <button
               onClick={() => setMobileSettingsOpen(false)}
@@ -1044,62 +713,227 @@ export default function Admin() {
           </div>
         </aside>
 
-        {/* Backdrop for mobile drawer */}
         {mobileSettingsOpen && (
-          <div
-            onClick={() => setMobileSettingsOpen(false)}
-            className="fixed inset-0 bg-black/30 z-10 lg:hidden"
-          />
+          <div onClick={() => setMobileSettingsOpen(false)} className="fixed inset-0 bg-black/30 z-10 lg:hidden" />
         )}
 
         {/* ─────────────────────────────────────────────────────────────
-            MAIN TRANSLATION FEED & ACTIVE TRANSCRIPT MONITOR
+            MAIN TRANSLATION FEED
         ────────────────────────────────────────────────────────────── */}
         <main className="flex-1 flex flex-col bg-slate-50 min-w-0">
-          {/* Feed Header */}
-          <div className="px-4 py-2.5 bg-white border-b border-slate-200 flex items-center justify-between gap-3 shrink-0">
-            <div className="flex items-center gap-2 text-xs text-slate-600">
-              <Radio className={`w-4 h-4 ${isListening ? 'text-emerald-500 animate-pulse' : 'text-slate-400'}`} />
-              <div className="flex items-center gap-1.5 bg-slate-100 px-2.5 py-1 rounded-lg border border-slate-200">
-                <span className="font-bold text-slate-800">
-                  {config.sourceLang === 'th-TH' ? 'ไทย (TH)' : 'อังกฤษ (EN)'} ➔ {config.targetLang}
-                </span>
-                <button
-                  onClick={handleSwapLanguages}
-                  className="p-1 hover:bg-white rounded-md text-slate-500 hover:text-[#DE5C8E] transition-all cursor-pointer"
-                  title="สลับภาษาผู้พูดและภาษาแปล"
-                >
-                  <ArrowLeftRight className="w-3.5 h-3.5" />
-                </button>
+          {projects.persistError && (
+            <div className="shrink-0 flex items-start gap-2.5 m-3 p-3 bg-rose-50 border border-rose-300 rounded-xl text-rose-800 text-xs leading-relaxed">
+              <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" />
+              <div className="flex-1 min-w-0">
+                <p className="font-bold">บันทึกข้อมูลไม่สำเร็จ — การประชุมนี้อาจไม่ถูกเก็บไว้</p>
+                <p className="mt-0.5">
+                  {projects.persistError.reason === 'quota'
+                    ? 'พื้นที่จัดเก็บในเบราว์เซอร์เต็ม กรุณาดาวน์โหลดสำรองไว้ แล้วจบโปรเจกต์เก่าที่ไม่ใช้แล้ว'
+                    : projects.persistError.reason === 'unavailable'
+                    ? 'เบราว์เซอร์นี้ปิดการจัดเก็บข้อมูลไว้ กรุณาดาวน์โหลดสำรองก่อนปิดหน้านี้'
+                    : 'เกิดข้อผิดพลาดที่ไม่รู้จัก กรุณาดาวน์โหลดสำรองก่อนปิดหน้านี้'}
+                </p>
               </div>
-              <span className="text-slate-400 font-medium hidden sm:inline">({transcripts.length} รายการ)</span>
+              <button
+                onClick={downloadProjectBackup}
+                className="shrink-0 px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-lg font-semibold flex items-center gap-1.5"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>ดาวน์โหลดสำรอง</span>
+              </button>
+            </div>
+          )}
+
+          {micPermissionError && (
+            <div className="p-3 bg-rose-50 border-b border-rose-200 text-rose-800 text-xs flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <ShieldAlert className="w-4 h-4 text-rose-600 shrink-0" />
+                <span className="truncate">{capture.error}</span>
+              </div>
+              <button
+                onClick={() => {
+                  setMicActive(false);
+                  setTimeout(() => setMicActive(true), 100);
+                }}
+                className="px-3 py-1 bg-rose-600 text-white rounded-lg text-xs font-semibold flex items-center gap-1 shrink-0"
+              >
+                <RefreshCw className="w-3 h-3" />
+                <span>ลองใหม่อีกครั้ง</span>
+              </button>
+            </div>
+          )}
+
+          {/* ─────────────────────────────────────────────────────────────
+              LIVE SUBTITLE — pinned to the top edge, at most two lines.
+              A caption that outgrows two lines starts a new block from the
+              word that no longer fitted, the way broadcast subtitles do.
+          ────────────────────────────────────────────────────────────── */}
+          <div className="shrink-0 px-3 pt-3 sm:px-6 sm:pt-4">
+            <div className="relative w-full max-w-5xl mx-auto bg-white rounded-2xl border border-slate-200 shadow-sm px-6 py-5 sm:px-10 sm:py-6 text-center">
+              {latestCaption && !isEditingBox && !hasPartial && (
+                <div className="absolute top-2.5 right-2.5 flex items-center gap-1">
+                  <button
+                    onClick={() => handleCopyItem(latestCaption)}
+                    className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
+                    title="คัดลอกข้อความ"
+                  >
+                    {copiedSeq === latestCaption.seq ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                  </button>
+                  <button
+                    onClick={() => startEditing(latestCaption)}
+                    className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
+                    title="แก้ไขคำแปล"
+                  >
+                    <Edit2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+
+              {!latestCaption && !hasPartial ? (
+                <div className="text-slate-400">
+                  <div className="font-bold text-slate-700 text-sm">พร้อมรับเสียงจากไมโครโฟน</div>
+                  <p className="text-xs text-slate-400 leading-relaxed mt-1">
+                    กดปุ่มไมโครโฟนวงกลมกลางจอ จากนั้นพูดใส่ไมโครโฟนเพื่อทำการแปลภาษาแบบเรียลไทม์
+                  </p>
+                </div>
+              ) : isEditingBox ? (
+                <div className="space-y-3 text-left max-w-2xl mx-auto">
+                  <label className="text-xs font-bold text-slate-600 block">คำแปล:</label>
+                  <input
+                    type="text"
+                    autoFocus
+                    value={editDraft}
+                    onChange={(e) => setEditDraft(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && saveEdit()}
+                    className="w-full p-3 text-lg font-bold text-black text-center border border-slate-300 rounded-lg outline-none focus:border-[#DE5C8E]"
+                  />
+                  <div className="flex items-center justify-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setEditingSeq(null)}
+                      className="px-3.5 py-1.5 text-xs text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium transition-all"
+                    >
+                      ยกเลิก
+                    </button>
+                    <button
+                      type="button"
+                      onClick={saveEdit}
+                      className="px-3.5 py-1.5 text-xs text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg font-semibold flex items-center gap-1.5 shadow-xs transition-all"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      <span>บันทึก</span>
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {config.showOriginal && boxSourceText && (
+                    <SubtitleText
+                      text={boxSourceText}
+                      maxLines={1}
+                      className={`text-base sm:text-lg mb-2 ${hasPartial ? 'text-slate-300' : 'text-slate-400'}`}
+                    />
+                  )}
+                  {boxTargetText ? (
+                    <SubtitleText
+                      text={boxTargetText}
+                      maxLines={2}
+                      className={`${boxTextSizeClass(config.fontSize)} font-bold leading-snug tracking-tight text-black`}
+                    />
+                  ) : (
+                    <p className={`${boxTextSizeClass(config.fontSize)} font-normal text-slate-300`}>กำลังแปล…</p>
+                  )}
+                  {config.showLatency && !hasPartial && latestCaption?.latencyMs ? (
+                    <span className="mt-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 font-mono text-[10px] text-slate-500 border border-slate-200">
+                      <Zap className="w-3 h-3 text-amber-500" />
+                      <span>{latestCaption.latencyMs}ms</span>
+                    </span>
+                  ) : null}
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* ─────────────────────────────────────────────────────────────
+              RECORD CONTROL — the one big target, dead centre of the screen.
+          ────────────────────────────────────────────────────────────── */}
+          <div className="flex-1 flex flex-col items-center justify-center gap-4 p-4 min-h-0">
+            <button
+              onClick={isSessionActive ? stopSessionAndMic : startSessionAndMic}
+              disabled={capture.status === 'starting' || endingSession}
+              aria-label={isSessionActive ? 'จบ Session (หยุดอัดเสียง)' : 'เริ่ม Session (อัดเสียง)'}
+              title={isSessionActive ? 'จบ Session' : 'เริ่ม Session'}
+              className={`relative w-28 h-28 sm:w-36 sm:h-36 rounded-full flex items-center justify-center transition-all shadow-lg ring-8 disabled:opacity-60 disabled:cursor-not-allowed ${
+                isSessionActive
+                  ? 'bg-rose-600 hover:bg-rose-700 text-white ring-rose-100'
+                  : 'bg-[#DE5C8E] hover:bg-[#c94577] text-white ring-pink-100'
+              }`}
+            >
+              {isListening && !paused && (
+                <span className="absolute inset-0 rounded-full bg-rose-400/40 animate-ping pointer-events-none" />
+              )}
+              {isSessionActive ? (
+                <MicOff className="relative w-12 h-12 sm:w-14 sm:h-14" />
+              ) : (
+                <Mic className="relative w-12 h-12 sm:w-14 sm:h-14" />
+              )}
+            </button>
+
+            <div className="h-5 flex items-center gap-2 text-xs font-semibold text-slate-500">
+              {capture.status === 'starting' ? (
+                <span>กำลังเริ่ม…</span>
+              ) : endingSession ? (
+                <span>กำลังปิด Session…</span>
+              ) : isSessionActive && paused ? (
+                <span className="text-amber-600">พักการถอดความ — กดปุ่มเล่นต่อด้านล่าง</span>
+              ) : isListening ? (
+                <>
+                  <span className="relative flex h-2 w-2">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+                  </span>
+                  <span className="text-emerald-700">
+                    {capture.partialSource ? 'กำลังฟัง…' : 'กำลังรอเสียงพูด — พูดใส่ไมโครโฟนได้ทันที'}
+                  </span>
+                </>
+              ) : (
+                <span>กดเพื่อเริ่มอัดเสียงและแปลสด</span>
+              )}
             </div>
 
             <div className="flex items-center gap-2">
+              {sessionId && (
+                <button
+                  onClick={() => setPaused((p) => !p)}
+                  title={paused ? 'เล่นต่อ' : 'พักการถอดความ'}
+                  className="px-2.5 py-1.5 text-xs text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg font-semibold transition-all flex items-center gap-1.5 shadow-2xs"
+                >
+                  {paused ? <Play className="w-3.5 h-3.5 text-slate-500" /> : <Pause className="w-3.5 h-3.5 text-slate-500" />}
+                  <span>{paused ? 'เล่นต่อ' : 'พัก'}</span>
+                </button>
+              )}
               <button
                 onClick={() => exportTranscript('txt')}
-                disabled={transcripts.length === 0}
+                disabled={captions.length === 0}
                 className="px-2.5 py-1.5 text-xs text-slate-700 hover:text-slate-900 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg font-semibold transition-all disabled:opacity-40 flex items-center gap-1.5 shadow-2xs"
                 title="ส่งออกข้อความ TXT"
               >
                 <Download className="w-3.5 h-3.5 text-slate-500" />
                 <span>TXT</span>
               </button>
-
               <button
                 onClick={() => exportTranscript('srt')}
-                disabled={transcripts.length === 0}
+                disabled={captions.length === 0}
                 className="px-2.5 py-1.5 text-xs text-slate-700 hover:text-slate-900 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg font-semibold transition-all disabled:opacity-40 flex items-center gap-1.5 shadow-2xs"
                 title="ส่งออกคำบรรยาย SRT"
               >
                 <FileText className="w-3.5 h-3.5 text-slate-500" />
                 <span>SRT</span>
               </button>
-
               <button
                 onClick={clearTranscripts}
-                disabled={transcripts.length === 0}
-                className="p-1.5 text-slate-400 hover:text-rose-600 rounded-lg hover:bg-rose-50 transition-all disabled:opacity-30 ml-1"
+                disabled={captions.length === 0}
+                className="p-1.5 text-slate-400 hover:text-rose-600 rounded-lg hover:bg-rose-50 transition-all disabled:opacity-30"
                 title="ล้างประวัติข้อความทั้งหมด"
               >
                 <Trash2 className="w-4 h-4" />
@@ -1107,340 +941,168 @@ export default function Admin() {
             </div>
           </div>
 
-          {/* Mic Permission Error Alert */}
-          {micPermissionError && (
-            <div className="p-3 bg-rose-50 border-b border-rose-200 text-rose-800 text-xs flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <ShieldAlert className="w-4 h-4 text-rose-600 shrink-0" />
-                <span>ไมโครโฟนถูกบล็อก กรุณาอนุญาตการเข้าถึงไมโครโฟนในเบราว์เซอร์</span>
-              </div>
+          {/* ─────────────────────────────────────────────────────────────
+              HISTORY — collapsed by default so the subtitle box above stays
+              the primary view. Captions run together as paragraphs of
+              continuous speech rather than one card per utterance; the full
+              edit/hide/copy tooling still reaches every caption, through the
+              toolbar that follows the cursor.
+          ────────────────────────────────────────────────────────────── */}
+          {captions.length > 0 && (
+            <div className="border-t border-slate-200 bg-white shrink-0">
               <button
-                onClick={startListening}
-                className="px-3 py-1 bg-rose-600 text-white rounded-lg text-xs font-semibold"
+                onClick={() => setShowAllHistory((v) => !v)}
+                className="w-full flex items-center justify-between px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
               >
-                ลองใหม่อีกครั้ง
+                <span>ประวัติทั้งหมด</span>
+                {showAllHistory ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
               </button>
-            </div>
-          )}
-
-          {/* Live Interim Speech Stream Indicator & Live Chunk Controller */}
-          {isListening && (
-            <div className="px-4 py-2 bg-emerald-50 border-b border-emerald-200 flex items-center justify-between gap-3 text-xs text-emerald-900 transition-all shrink-0">
-              <div className="flex items-center gap-2 min-w-0 flex-1">
-                <div className="flex items-center gap-1.5 shrink-0">
-                  <span className="relative flex h-2 w-2">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-                  </span>
-                  <span className="font-bold text-emerald-800 shrink-0">กำลังฟัง:</span>
-                </div>
-                <div className="flex-1 truncate font-mono text-xs text-emerald-800 font-medium">
-                  {interimSpeechText ? (
-                    <span className="bg-emerald-100/80 px-2 py-0.5 rounded text-emerald-900 font-semibold animate-pulse">
-                      &ldquo;{interimSpeechText}&rdquo;
-                    </span>
-                  ) : (
-                    <span className="text-emerald-600/80 italic">กำลังรอเสียงพูด... (พูดใส่ไมโครโฟนได้ทันที)</span>
-                  )}
-                </div>
-              </div>
-
-              <div className="flex items-center gap-2 shrink-0">
-                {/* Visual Audio Wave */}
-                <div className="flex items-center gap-0.5 h-3.5 bg-emerald-200/80 px-1.5 rounded">
-                  <div
-                    className="w-1 bg-emerald-700 rounded-full transition-all duration-75"
-                    style={{ height: `${Math.max(25, micAudioLevel)}%` }}
-                  />
-                  <div
-                    className="w-1 bg-emerald-700 rounded-full transition-all duration-75"
-                    style={{ height: `${Math.max(20, micAudioLevel * 0.8)}%` }}
-                  />
-                  <div
-                    className="w-1 bg-emerald-700 rounded-full transition-all duration-75"
-                    style={{ height: `${Math.max(15, micAudioLevel * 0.6)}%` }}
-                  />
-                </div>
-
-                {/* Live Chunk Status Badge */}
-                <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 bg-white text-[11px] font-semibold text-emerald-800 border border-emerald-300 rounded-md shadow-2xs">
-                  <Timer className="w-3 h-3 text-emerald-600" />
-                  <span>ตัดวรรค ~{(config.chunkSilenceMs || 900) / 1000}s</span>
-                </span>
-
-                {/* Manual Cut Now Button */}
-                {interimSpeechText && (
-                  <button
-                    type="button"
-                    onClick={handleForceCommitInterim}
-                    className="px-2.5 py-1 bg-[#DE5C8E] hover:bg-[#c94577] text-white rounded-md text-[11px] font-bold flex items-center gap-1 transition-all shadow-2xs cursor-pointer animate-bounce"
-                    title="ตัดวรรคและส่งท่อนนี้ให้ AI แปลทันที"
-                  >
-                    <Scissors className="w-3 h-3" />
-                    <span>ตัดแปลทันที</span>
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Transcripts List Container */}
-          <div
-            ref={transcriptScrollRef}
-            className="flex-1 p-3.5 sm:p-6 overflow-y-auto space-y-3.5"
-          >
-            {transcripts.length === 0 ? (
-              <div className="h-full flex flex-col items-center justify-center text-center p-6 text-slate-400 space-y-3">
-                <div className="w-14 h-14 rounded-2xl bg-white border border-slate-200 shadow-xs flex items-center justify-center text-[#DE5C8E]">
-                  <Mic className="w-7 h-7" />
-                </div>
-                <div className="space-y-1 max-w-sm">
-                  <div className="font-bold text-slate-700 text-sm">พร้อมรับเสียงจากไมโครโฟน</div>
-                  <p className="text-xs text-slate-400 leading-relaxed">
-                    กดปุ่ม <strong>&quot;เริ่มแปลสด&quot;</strong> ด้านบน จากนั้นพูดใส่ไมโครโฟนเพื่อทำการแปลภาษาแบบเรียลไทม์
-                  </p>
-                </div>
-              </div>
-            ) : (
-              transcripts.map((item, index) => {
-                const isEditing = editingItemId === item.id;
-                const isLatest = index === transcripts.length - 1;
-
-                return (
-                  <div
-                    key={item.id}
-                    className={`p-4 rounded-xl border transition-all shadow-xs ${
-                      isEditing
-                        ? 'bg-amber-50/90 border-amber-300 ring-2 ring-amber-200'
-                        : isLatest
-                        ? 'bg-white border-[#DE5C8E]/40 ring-1 ring-[#DE5C8E]/20'
-                        : 'bg-white border-slate-200 hover:border-slate-300'
-                    }`}
-                  >
-                    {isEditing ? (
-                      /* Inline Editor */
-                      <div className="space-y-2.5">
-                        <div>
-                          <label className="text-xs font-bold text-slate-600 block mb-1">
-                            ประโยคต้นฉบับ:
-                          </label>
-                          <input
-                            type="text"
-                            value={editOriginalText}
-                            onChange={(e) => setEditOriginalText(e.target.value)}
-                            className="w-full p-2.5 text-xs bg-white border border-slate-300 rounded-lg outline-none focus:border-[#DE5C8E]"
-                          />
-                        </div>
-                        <div>
-                          <label className="text-xs font-bold text-slate-600 block mb-1">
-                            คำแปล:
-                          </label>
-                          <input
-                            type="text"
-                            value={editTranslatedText}
-                            onChange={(e) => setEditTranslatedText(e.target.value)}
-                            className="w-full p-2.5 text-xs bg-white border border-slate-300 rounded-lg font-bold text-slate-900 outline-none focus:border-[#DE5C8E]"
-                          />
-                        </div>
-                        <div className="flex items-center justify-between pt-1">
-                          <button
-                            type="button"
-                            onClick={() => retranslateItem(item)}
-                            className="px-3 py-1.5 text-xs text-[#DE5C8E] bg-[#DE5C8E]/10 hover:bg-[#DE5C8E]/20 rounded-lg font-semibold flex items-center gap-1.5 transition-all"
-                          >
-                            <RotateCcw className="w-3.5 h-3.5" />
-                            <span>ให้ AI แปลใหม่</span>
-                          </button>
-                          <div className="flex gap-2">
-                            <button
-                              type="button"
-                              onClick={cancelEditing}
-                              className="px-3.5 py-1.5 text-xs text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium transition-all"
-                            >
-                              ยกเลิก
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => saveCorrection(item.id)}
-                              className="px-3.5 py-1.5 text-xs text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg font-semibold flex items-center gap-1.5 shadow-xs transition-all"
-                            >
-                              <Check className="w-3.5 h-3.5" />
-                              <span>บันทึก</span>
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-                    ) : (
-                      /* Clean Item Display */
-                      <div className="space-y-1.5">
-                        {/* Meta header row */}
-                        <div className="flex items-center justify-between text-xs text-slate-400">
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono text-[11px] text-slate-400">
-                              {new Date(item.timestamp).toLocaleTimeString()}
-                            </span>
-                            {config.showLatency && item.latencyMs ? (
-                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 font-mono text-[10px] text-slate-600 border border-slate-200">
-                                <Zap className="w-3 h-3 text-amber-500" />
-                                <span>{item.latencyMs}ms</span>
-                              </span>
-                            ) : null}
-                            {item.isEdited && (
-                              <span className="text-[10px] text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded-md font-medium border border-amber-200">
-                                แก้ไขแล้ว
-                              </span>
-                            )}
-                          </div>
-
-                          <div className="flex items-center gap-1">
-                            <button
-                              onClick={() => handleCopyItem(item)}
-                              className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
-                              title="คัดลอกข้อความ"
-                            >
-                              {copiedItemId === item.id ? (
-                                <Check className="w-3.5 h-3.5 text-emerald-600" />
-                              ) : (
-                                <Copy className="w-3.5 h-3.5" />
-                              )}
-                            </button>
-                            <button
-                              onClick={() => startEditing(item)}
-                              className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
-                              title="แก้ไขคำแปล"
-                            >
-                              <Edit2 className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              onClick={() => deleteItem(item.id)}
-                              className="p-1.5 text-slate-400 hover:text-rose-600 rounded-md hover:bg-rose-50 transition-all"
-                              title="ลบรายการนี้"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        </div>
-
-                        {/* Source text (if enabled) */}
-                        {config.showOriginal && item.originalText && (
-                          <div className="text-xs text-slate-500 font-medium leading-relaxed">
-                            {item.originalText}
-                          </div>
-                        )}
-
-                        {/* Primary Translated text */}
-                        <div className={`${getTextSizeClass()} font-bold text-slate-900 leading-snug tracking-tight`}>
-                          {item.translatedText}
-                        </div>
+              {showAllHistory && (
+                <div
+                  ref={transcriptScrollRef}
+                  onMouseLeave={() => setHoveredSeq(null)}
+                  className="max-h-64 overflow-y-auto px-4 pt-2 pb-3.5 border-t border-slate-100"
+                >
+                  {/* A zero-height sticky row, so the toolbar floats over the
+                      prose at the top of the scroller. Inline controls would
+                      reflow the paragraph every time the cursor moved. */}
+                  <div className="sticky top-0 z-10 h-0 flex justify-end pointer-events-none">
+                    {hoveredItem && editingSeq === null && (
+                      <div className="pointer-events-auto flex items-center gap-1 bg-white/95 backdrop-blur-sm border border-slate-200 rounded-lg shadow-sm px-1.5 py-1">
+                        <span className="font-mono text-[10px] text-slate-400 px-0.5">
+                          {new Date(hoveredItem.ts * 1000).toLocaleTimeString()}
+                        </span>
+                        {config.showLatency && hoveredItem.latencyMs ? (
+                          <span className="inline-flex items-center gap-0.5 font-mono text-[10px] text-slate-600">
+                            <Zap className="w-3 h-3 text-amber-500" />
+                            <span>{hoveredItem.latencyMs}ms</span>
+                          </span>
+                        ) : null}
+                        <button
+                          onClick={() => handleCopyItem(hoveredItem)}
+                          className="p-1 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
+                          title="คัดลอกข้อความ"
+                        >
+                          {copiedSeq === hoveredItem.seq ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-600" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+                        <button
+                          onClick={() => startEditing(hoveredItem)}
+                          className="p-1 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
+                          title="แก้ไขคำแปล"
+                        >
+                          <Edit2 className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={() => hideItem(hoveredItem.seq)}
+                          className="p-1 text-slate-400 hover:text-rose-600 rounded-md hover:bg-rose-50 transition-all"
+                          title="ซ่อนรายการนี้ (ไม่ลบจากรายงานสรุป)"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
                       </div>
                     )}
                   </div>
-                );
-              })
-            )}
-          </div>
 
-          {/* ─────────────────────────────────────────────────────────────
-              BOTTOM TEST & SIMULATION INPUT BAR (Instant Translation Check)
-          ────────────────────────────────────────────────────────────── */}
-          <div className="p-3 bg-white border-t border-slate-200 shrink-0 space-y-2">
-            {/* Quick Test Chips */}
-            <div className="flex items-center gap-1.5 overflow-x-auto text-[11px] no-scrollbar pb-0.5">
-              <span className="text-slate-400 font-semibold shrink-0 flex items-center gap-1">
-                <Sparkles className="w-3 h-3 text-[#DE5C8E]" />
-                <span>ตัวอย่างทดสอบ:</span>
-              </span>
-              {config.sourceLang === 'th-TH' ? (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => handleSendTestText('สวัสดีครับ ยินดีต้อนรับสู่การประชุมประจำปี')}
-                    className="px-2.5 py-1 bg-slate-100 hover:bg-pink-50 hover:text-[#DE5C8E] hover:border-pink-200 border border-slate-200 text-slate-700 rounded-md font-medium shrink-0 transition-all cursor-pointer"
-                  >
-                    &ldquo;สวัสดีครับ ยินดีต้อนรับสู่การประชุม&rdquo;
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleSendTestText('ปัญญาประดิษฐ์และ Machine Learning มีความสำคัญต่อองค์กร')}
-                    className="px-2.5 py-1 bg-slate-100 hover:bg-pink-50 hover:text-[#DE5C8E] hover:border-pink-200 border border-slate-200 text-slate-700 rounded-md font-medium shrink-0 transition-all cursor-pointer"
-                  >
-                    &ldquo;ปัญญาประดิษฐ์และ Machine Learning&rdquo;
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleSendTestText('ตัวชี้วัดความสำเร็จและ ROI ปีนี้เติบโต 25%')}
-                    className="px-2.5 py-1 bg-slate-100 hover:bg-pink-50 hover:text-[#DE5C8E] hover:border-pink-200 border border-slate-200 text-slate-700 rounded-md font-medium shrink-0 transition-all cursor-pointer"
-                  >
-                    &ldquo;ตัวชี้วัดความสำเร็จและ ROI&rdquo;
-                  </button>
-                </>
-              ) : (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => handleSendTestText('Good morning everyone and welcome to the conference.')}
-                    className="px-2.5 py-1 bg-slate-100 hover:bg-pink-50 hover:text-[#DE5C8E] hover:border-pink-200 border border-slate-200 text-slate-700 rounded-md font-medium shrink-0 transition-all cursor-pointer"
-                  >
-                    &ldquo;Good morning everyone and welcome&rdquo;
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleSendTestText('Today we will discuss Artificial Intelligence and Machine Learning.')}
-                    className="px-2.5 py-1 bg-slate-100 hover:bg-pink-50 hover:text-[#DE5C8E] hover:border-pink-200 border border-slate-200 text-slate-700 rounded-md font-medium shrink-0 transition-all cursor-pointer"
-                  >
-                    &ldquo;Artificial Intelligence & Machine Learning&rdquo;
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleSendTestText('Let us review our key performance indicators and return on investment.')}
-                    className="px-2.5 py-1 bg-slate-100 hover:bg-pink-50 hover:text-[#DE5C8E] hover:border-pink-200 border border-slate-200 text-slate-700 rounded-md font-medium shrink-0 transition-all cursor-pointer"
-                  >
-                    &ldquo;KPI & Return on investment&rdquo;
-                  </button>
-                </>
+                  <div className="space-y-4 pt-1.5">
+                    {historyParagraphs.map((paragraph) => (
+                      <div key={paragraph.key} className="space-y-1">
+                        <div className="font-mono text-[10px] text-slate-400">
+                          {new Date(paragraph.startTs * 1000).toLocaleTimeString()}
+                        </div>
+
+                        {config.showOriginal && (
+                          <p className="text-xs text-slate-500 font-medium leading-relaxed">
+                            {paragraph.items
+                              .map((i) => i.sourceText)
+                              .filter(Boolean)
+                              .join(' ')}
+                          </p>
+                        )}
+
+                        {/* A div rather than a p: an open editor is a block
+                            element and cannot legally nest inside a paragraph. */}
+                        <div
+                          className={`${textSizeClass(config.fontSize)} font-bold text-black leading-relaxed tracking-tight`}
+                        >
+                          {paragraph.items.map((item) => {
+                            // Editing the latest caption happens in the box
+                            // above, not duplicated here.
+                            const isEditing = editingSeq === item.seq && item.seq !== latestCaption?.seq;
+                            if (isEditing) {
+                              return (
+                                <div
+                                  key={item.seq}
+                                  className="my-2 p-3.5 bg-amber-50/90 border border-amber-300 ring-2 ring-amber-200 rounded-xl space-y-2.5"
+                                >
+                                  {/* Original text has no re-transcription command in
+                                      this pipeline — it's corrected by re-speaking, not typed. */}
+                                  <div>
+                                    <label className="text-xs font-bold text-slate-600 block mb-1">
+                                      ประโยคต้นฉบับ (แก้ไขไม่ได้):
+                                    </label>
+                                    <p className="w-full p-2.5 text-xs font-normal bg-slate-100 border border-slate-200 rounded-lg text-slate-500">
+                                      {item.sourceText}
+                                    </p>
+                                  </div>
+                                  <div>
+                                    <label className="text-xs font-bold text-slate-600 block mb-1">คำแปล:</label>
+                                    <input
+                                      type="text"
+                                      autoFocus
+                                      value={editDraft}
+                                      onChange={(e) => setEditDraft(e.target.value)}
+                                      onKeyDown={(e) => e.key === 'Enter' && saveEdit()}
+                                      className="w-full p-2.5 text-xs bg-white border border-slate-300 rounded-lg font-bold text-black outline-none focus:border-[#DE5C8E]"
+                                    />
+                                  </div>
+                                  <div className="flex items-center justify-end gap-2 pt-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => setEditingSeq(null)}
+                                      className="px-3.5 py-1.5 text-xs text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium transition-all"
+                                    >
+                                      ยกเลิก
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={saveEdit}
+                                      className="px-3.5 py-1.5 text-xs text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg font-semibold flex items-center gap-1.5 shadow-xs transition-all"
+                                    >
+                                      <Check className="w-3.5 h-3.5" />
+                                      <span>บันทึก</span>
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            }
+                            return (
+                              <span
+                                key={item.seq}
+                                onMouseEnter={() => setHoveredSeq(item.seq)}
+                                title={item.isEdited ? 'แก้ไขแล้ว' : undefined}
+                                className={`rounded px-0.5 -mx-0.5 transition-colors ${
+                                  hoveredSeq === item.seq ? 'bg-amber-100' : ''
+                                } ${
+                                  item.isEdited ? 'underline decoration-dotted decoration-amber-400 underline-offset-4' : ''
+                                }`}
+                              >
+                                {item.targetText || <span className="text-slate-400 font-normal">กำลังแปล…</span>}{' '}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
               )}
             </div>
+          )}
 
-            {/* Test Input Form */}
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                handleSendTestText();
-              }}
-              className="flex items-center gap-2"
-            >
-              <div className="relative flex-1">
-                <input
-                  type="text"
-                  value={testInputText}
-                  onChange={(e) => setTestInputText(e.target.value)}
-                  placeholder={
-                    config.sourceLang === 'th-TH'
-                      ? 'พิมพ์ข้อความภาษาไทยเพื่อทดสอบแปลเป็นอังกฤษ (กด Enter หรือคลิกส่ง)...'
-                      : 'Type English text to test translation to Thai (press Enter or click Send)...'
-                  }
-                  className="w-full pl-3 pr-8 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] transition-all text-slate-800 placeholder:text-slate-400"
-                />
-                {testInputText && (
-                  <button
-                    type="button"
-                    onClick={() => setTestInputText('')}
-                    className="absolute right-2.5 top-2.5 text-slate-400 hover:text-slate-600 cursor-pointer"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
-                )}
-              </div>
-              <button
-                type="submit"
-                disabled={!testInputText.trim()}
-                className="px-4 py-2 bg-[#DE5C8E] hover:bg-[#c94577] text-white rounded-lg text-xs font-bold transition-all shadow-2xs disabled:opacity-40 flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
-              >
-                <Send className="w-3.5 h-3.5" />
-                <span>แปลทันที</span>
-              </button>
-            </form>
-          </div>
         </main>
       </div>
     </div>
