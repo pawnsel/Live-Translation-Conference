@@ -265,16 +265,27 @@ drop policy if exists "read own sessions" on public.project_sessions;
 create policy "read own sessions" on public.project_sessions
   for select to authenticated using (owner_id = auth.uid());
 
+-- WITH CHECK also verifies project_id belongs to this user: FK checks bypass
+-- RLS, so without this an approved user could attach a session to someone
+-- else's project by naming their own owner_id but another user's project_id.
 drop policy if exists "create own sessions" on public.project_sessions;
 create policy "create own sessions" on public.project_sessions
   for insert to authenticated
-  with check (owner_id = auth.uid() and public.is_approved());
+  with check (
+    owner_id = auth.uid() and public.is_approved() and exists (
+      select 1 from public.projects p where p.id = project_id and p.owner_id = auth.uid()
+    )
+  );
 
 drop policy if exists "update own sessions" on public.project_sessions;
 create policy "update own sessions" on public.project_sessions
   for update to authenticated
   using (owner_id = auth.uid())
-  with check (owner_id = auth.uid() and public.is_approved());
+  with check (
+    owner_id = auth.uid() and public.is_approved() and exists (
+      select 1 from public.projects p where p.id = project_id and p.owner_id = auth.uid()
+    )
+  );
 
 drop policy if exists "delete own sessions" on public.project_sessions;
 create policy "delete own sessions" on public.project_sessions
@@ -285,16 +296,29 @@ drop policy if exists "read own transcripts" on public.transcript_items;
 create policy "read own transcripts" on public.transcript_items
   for select to authenticated using (owner_id = auth.uid());
 
+-- WITH CHECK also verifies session_id belongs to this user: FK checks bypass
+-- RLS, so without this an approved user could attach a transcript row to
+-- someone else's session by naming their own owner_id but another user's
+-- session_id — and the security definer count trigger would then write to
+-- that other user's project_sessions.item_count.
 drop policy if exists "create own transcripts" on public.transcript_items;
 create policy "create own transcripts" on public.transcript_items
   for insert to authenticated
-  with check (owner_id = auth.uid() and public.is_approved());
+  with check (
+    owner_id = auth.uid() and public.is_approved() and exists (
+      select 1 from public.project_sessions s where s.id = session_id and s.owner_id = auth.uid()
+    )
+  );
 
 drop policy if exists "update own transcripts" on public.transcript_items;
 create policy "update own transcripts" on public.transcript_items
   for update to authenticated
   using (owner_id = auth.uid())
-  with check (owner_id = auth.uid() and public.is_approved());
+  with check (
+    owner_id = auth.uid() and public.is_approved() and exists (
+      select 1 from public.project_sessions s where s.id = session_id and s.owner_id = auth.uid()
+    )
+  );
 
 drop policy if exists "delete own transcripts" on public.transcript_items;
 create policy "delete own transcripts" on public.transcript_items
