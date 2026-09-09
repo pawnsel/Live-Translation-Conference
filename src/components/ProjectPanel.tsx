@@ -659,10 +659,6 @@ export function SessionHistoryModal({
             <X className="w-4 h-4" />
           </button>
         </div>
-        <p className="px-4 pt-3 text-[11px] text-slate-400 leading-relaxed">
-          {project.name} · กดปุ่ม &quot;สรุปการประชุม&quot; ที่ session ที่ต้องการ เมื่อพร้อมสรุป
-        </p>
-
         <div className="flex-1 overflow-y-auto p-4 space-y-2.5">
           {sessions.length === 0 ? (
             <div className="text-center text-slate-400 text-xs py-8">ยังไม่มี session ในโปรเจกต์นี้</div>

@@ -902,7 +902,7 @@ export default function Admin() {
           ────────────────────────────────────────────────────────────── */}
           <div className="shrink-0 px-3 pt-3 sm:px-6 sm:pt-4">
             <div
-              className={`relative w-full max-w-5xl mx-auto rounded-2xl border shadow-sm px-6 py-5 sm:px-10 sm:py-6 text-center transition-colors ${
+              className={`relative w-full max-w-5xl mx-auto rounded-2xl border shadow-sm px-6 py-6 sm:px-10 sm:py-[28.8px] text-center transition-colors ${
                 isDarkCaption ? 'bg-black border-slate-700' : 'bg-white border-slate-200'
               }`}
             >

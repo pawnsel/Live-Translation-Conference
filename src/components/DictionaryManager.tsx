@@ -7,8 +7,7 @@ import {
   X,
   ClipboardPaste,
   Check,
-  FileSpreadsheet,
-  AlertCircle
+  FileSpreadsheet
 } from 'lucide-react';
 import type { GlossarySection, GlossarySections } from '../glossary';
 import type { GlossaryList } from '../data/glossaryRepo';
@@ -119,13 +118,6 @@ export default function DictionaryManager({
 
   return (
     <div className="space-y-3.5">
-      {/* The glossary belongs to this project, is stored in the database,
-          and follows the operator to any device. */}
-      <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-800 text-xs leading-relaxed">
-        <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-        <span>พจนานุกรมนี้ผูกกับโปรเจกต์นี้ บันทึกในฐานข้อมูล และใช้งานได้จากทุกอุปกรณ์</span>
-      </div>
-
       {sharedLists.length > 0 && (
         <div className="mb-3 pb-3 border-b border-slate-200">
           <p className="text-[11px] font-semibold text-slate-500 mb-1.5">คลังคำศัพท์ที่ใช้ร่วมกัน</p>
