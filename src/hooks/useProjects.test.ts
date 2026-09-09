@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { useProjects } from './useProjects';
+import { PROJECT_TTL_MS, useProjects } from './useProjects';
 import { PersistError } from '../data/persistError';
 import type { ProjectsRepo } from '../data/projectsRepo';
 import type { Project, ProjectSession, TranscriptItem } from '../types';
@@ -347,5 +347,60 @@ describe('useProjects — finishProject', () => {
 
     expect(finished).toBeUndefined();
     expect(repo.finishProject).not.toHaveBeenCalled();
+  });
+});
+
+describe('useProjects — auto-finish retry', () => {
+  // EXPIRY_SWEEP_INTERVAL_MS is internal to the hook, not exported — the
+  // sweep timer's period is a private implementation detail. 60s, matching
+  // the hook's own constant.
+  const SWEEP_INTERVAL_MS = 60 * 1000;
+
+  // Regression for a bug the reviewer found in the auto-finish sync effect: it
+  // used to mark a project's id "synced" in the same tick it *started* the
+  // finishProject write, not once the write actually landed. A write that
+  // failed (server never recorded the finish) triggers run()'s resync, which
+  // reverts the project back to 'active' from the server's still-active copy
+  // — and the next sweep tick re-detects it as expired and flips it to
+  // 'ended' locally again, but the sync effect silently skipped it forever
+  // because the id was already marked. The project could sit ended in the UI
+  // with the server still holding it open, with no retry, ever.
+  it('retries a failed auto-finish write on the next sweep instead of skipping it forever', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const expired = project({ createdAt: Date.now() - PROJECT_TTL_MS - 1000 });
+      const repo = fakeRepo({
+        listProjects: vi.fn().mockResolvedValue([expired]),
+        finishProject: vi
+          .fn()
+          .mockRejectedValueOnce(new PersistError('network', 'offline'))
+          .mockResolvedValueOnce(undefined)
+      });
+
+      const { result } = await renderLoaded(repo);
+      expect(repo.finishProject).not.toHaveBeenCalled();
+
+      // First sweep tick: detects the already-expired project, auto-finishes
+      // it locally, and fires the write — which fails. run() resyncs from
+      // the (unchanged) server copy, reverting the project back to 'active'.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(SWEEP_INTERVAL_MS);
+      });
+      expect(repo.finishProject).toHaveBeenCalledTimes(1);
+      expect(result.current.activeProjects.map((p) => p.id)).toEqual(['proj-1']);
+      expect(result.current.endedProjects).toHaveLength(0);
+
+      // Second sweep tick: the project (still expired by createdAt) is
+      // auto-finished again. This is the retry — it must actually happen,
+      // not be skipped because the first attempt already marked it synced.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(SWEEP_INTERVAL_MS);
+      });
+      expect(repo.finishProject).toHaveBeenCalledTimes(2);
+      expect(result.current.activeProjects).toHaveLength(0);
+      expect(result.current.endedProjects.map((p) => p.id)).toEqual(['proj-1']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

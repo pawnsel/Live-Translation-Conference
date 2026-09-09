@@ -178,15 +178,29 @@ export function useProjects({ repo, userId = null }: UseProjectsOptions = {}) {
   }, [sweepExpired]);
 
   // Fires the finishProject write for a project the sweep above just closed,
-  // exactly once per project id — decoupled from the state updater so it can
-  // stay pure. The ref survives re-renders, so this is safe even if the
-  // effect itself re-runs.
+  // exactly once per project id that actually lands — decoupled from the
+  // state updater so it can stay pure. The ref survives re-renders, so this
+  // is safe even if the effect itself re-runs.
   useEffect(() => {
     for (const p of projects) {
       if (p.status === 'ended' && p.autoFinished && p.bill && !syncedAutoFinishIds.current.has(p.id)) {
+        // Marked in-flight immediately, before the write resolves, so a
+        // second effect run triggered by an unrelated state change during
+        // the same write can't dispatch a concurrent duplicate for this id.
         syncedAutoFinishIds.current.add(p.id);
         const openIds = p.sessions.filter((s) => !s.endedAt).map((s) => s.id);
-        void run(() => activeRepo.finishProject(p.id, p.bill!, p.endedAt ?? Date.now(), openIds));
+        void run(() => activeRepo.finishProject(p.id, p.bill!, p.endedAt ?? Date.now(), openIds)).then(
+          (ok) => {
+            // A failed write leaves the server's project still active — run()
+            // resyncs on failure, so the local copy reverts to 'active' too.
+            // Un-marking here means the NEXT sweep tick, which will detect
+            // the same project as expired all over again, gets a real retry
+            // instead of finding the id already in the set and silently
+            // skipping it forever. A success leaves the id marked: the
+            // server now agrees, and firing again would just be a wasted call.
+            if (!ok) syncedAutoFinishIds.current.delete(p.id);
+          }
+        );
       }
     }
   }, [projects, activeRepo, run]);
