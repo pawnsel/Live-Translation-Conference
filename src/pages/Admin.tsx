@@ -263,6 +263,9 @@ export default function Admin() {
     setEndingSession(false);
     setSessionId(null);
     setPaused(false);
+    // The last sentences must be on the record before the operator moves on —
+    // finishing a project prices what the database holds.
+    await projects.flushCaptions();
     await projects.detachAsrSession();
     return sessionCaptions;
   };

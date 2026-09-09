@@ -228,7 +228,7 @@ describe('useProjects — captions', () => {
     expect(repo.appendCaption).toHaveBeenCalledWith('sess-1', item);
   });
 
-  it('reports a caption that never lands', async () => {
+  it('reports a caption that never lands, after the retries are exhausted', async () => {
     const repo = fakeRepo({
       listProjects: vi.fn().mockResolvedValue([project({ sessions: [session()] })]),
       appendCaption: vi.fn().mockRejectedValue(new PersistError('network', 'offline'))
@@ -246,10 +246,11 @@ describe('useProjects — captions', () => {
         latencyMs: 1,
         isEdited: false
       });
+      await result.current.flushCaptions();
     });
 
-    expect(result.current.persistError).toMatchObject({ reason: 'network' });
-  });
+    await waitFor(() => expect(result.current.persistError).toMatchObject({ reason: 'network' }));
+  }, 20000);
 
   it('does nothing for a caption whose session is not on the record', async () => {
     const repo = fakeRepo();

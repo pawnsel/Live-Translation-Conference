@@ -3,6 +3,7 @@ import { Project, ProjectBill, ProjectSession, TranscriptItem } from '../types';
 import { loadSelectedId, saveSelectedId } from '../storage/projectStore';
 import { toPersistError, type PersistFailureReason } from '../data/persistError';
 import { createProjectsRepo, type ProjectsRepo } from '../data/projectsRepo';
+import { createCaptionQueue } from '../data/captionQueue';
 import { supabase } from '../lib/supabase';
 import { ceilCents } from '../billing/geminiCost';
 import { projectCost, projectTranscripts, type LiveBuffer } from '../billing/projectCost';
@@ -135,6 +136,17 @@ export function useProjects({ repo, userId = null }: UseProjectsOptions = {}) {
     },
     [fail, reload]
   );
+
+  // One outbox for the whole console. `send` closes over the repo rather than
+  // over React state, so a retry that fires seconds later still writes to the
+  // right session.
+  const captionQueue = useRef<ReturnType<typeof createCaptionQueue> | undefined>(undefined);
+  if (!captionQueue.current) {
+    captionQueue.current = createCaptionQueue({
+      send: (sessionId, item) => activeRepo.appendCaption(sessionId, item),
+      onFailure: fail
+    });
+  }
 
   useEffect(() => {
     saveSelectedId(selectedProjectId);
@@ -315,22 +327,21 @@ export function useProjects({ repo, userId = null }: UseProjectsOptions = {}) {
     });
   };
 
-  /** One closed caption, written as it happens. A crashed tab now loses at
-   *  most the sentence in flight instead of the whole meeting. */
+  /** One closed caption. The optimistic state update happens now; the write
+   *  goes through the retry queue, so a blip costs nothing and only a caption
+   *  that never lands reaches the banner. */
   const appendCaption = useCallback(
     async (asrSessionId: string, item: TranscriptItem) => {
       const target = findSession(asrSessionId);
       if (!target) return;
-      await run(async () => {
-        await activeRepo.appendCaption(target.id, item);
-        updateSessionBy(asrSessionId, (s) => ({
-          ...s,
-          transcripts: [...(s.transcripts ?? []).filter((t) => t.seq !== item.seq), item],
-          itemCount: Math.max(s.itemCount, item.seq)
-        }));
-      });
+      updateSessionBy(asrSessionId, (s) => ({
+        ...s,
+        transcripts: [...(s.transcripts ?? []).filter((t) => t.seq !== item.seq), item],
+        itemCount: Math.max(s.itemCount, item.seq)
+      }));
+      captionQueue.current!.enqueue(target.id, item);
     },
-    [activeRepo, run, projects]
+    [projects]
   );
 
   const editCaption = useCallback(
@@ -453,6 +464,7 @@ export function useProjects({ repo, userId = null }: UseProjectsOptions = {}) {
     detachAsrSession,
     endSession,
     appendCaption,
+    flushCaptions: () => captionQueue.current!.flush(),
     editCaption,
     loadSessionTranscript,
     saveSessionSummary,
