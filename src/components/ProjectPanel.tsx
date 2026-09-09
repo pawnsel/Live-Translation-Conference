@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { jsPDF } from 'jspdf';
 import {
   FolderPlus,
   FlagTriangleRight,
@@ -26,45 +27,218 @@ function formatDuration(ms: number): string {
   return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
 }
 
-function billFileContent(project: Project, bill: ProjectBill): string {
-  const lines = [
-    `=== Project Bill: ${project.name} ===`,
-    `Created: ${new Date(project.createdAt).toLocaleString()}`,
-    `Finished: ${project.endedAt ? new Date(project.endedAt).toLocaleString() : '-'}${
-      project.autoFinished ? ' (auto-finished at the 7-day deadline)' : ''
-    }`,
-    '',
-    `Sessions: ${bill.sessionCount}`,
-    `Total duration: ${formatDuration(bill.durationMs)}`,
-    `Words translated: ${bill.wordCount}`,
-    `Estimated cost: $${bill.estimatedCost.toFixed(2)} (upper bound on Gemini API spend)`
-  ];
+const PDF_MARGIN_X = 48;
+const PDF_INK = '#0f172a';
+const PDF_MUTED = '#64748b';
+const PDF_LINE = '#e2e8f0';
+const PDF_ACCENT = '#DE5C8E';
+
+/** The embedded Thai-capable face, registered on the document by
+ *  `downloadBill` before any text is drawn. jsPDF's built-in helvetica is
+ *  Latin-1 only and turns Thai — including most project names — into
+ *  mojibake, so every setFont call below names this instead. */
+export const PDF_FONT = 'Sarabun';
+
+/** Renders the bill as a one-page PDF laid out like an ordinary purchase
+ *  receipt — line items, a subtotal, a service fee, then a boxed total —
+ *  rather than the plain key/value TXT file this replaces.
+ *
+ *  The caller must have registered PDF_FONT on `doc` already (see
+ *  `downloadBill`); this function only lays text out. */
+function billToPdf(doc: jsPDF, project: Project, bill: ProjectBill): jsPDF {
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const rightX = pageWidth - PDF_MARGIN_X;
+  let y = 60;
+
+  // ── Header ────────────────────────────────────────────────────────────
+  doc.setFont(PDF_FONT, 'bold');
+  doc.setFontSize(18);
+  doc.setTextColor(PDF_ACCENT);
+  doc.text('Live Translation', PDF_MARGIN_X, y);
+
+  doc.setFont(PDF_FONT, 'normal');
+  doc.setFontSize(10);
+  doc.setTextColor(PDF_MUTED);
+  doc.text('ใบสรุปค่าใช้จ่าย / BILL', rightX, y, { align: 'right' });
+
+  y += 16;
+  doc.setFontSize(9);
+  doc.text(`Bill No. ${project.id.slice(0, 8).toUpperCase()}`, rightX, y, { align: 'right' });
+  y += 14;
+  doc.text(`Issued ${new Date().toLocaleString()}`, rightX, y, { align: 'right' });
+
+  y += 18;
+  doc.setDrawColor(PDF_LINE);
+  doc.line(PDF_MARGIN_X, y, rightX, y);
+  y += 26;
+
+  // ── Project meta, two columns ────────────────────────────────────────
+  const metaRow = (label: string, value: string, x: number) => {
+    doc.setFontSize(8);
+    doc.setTextColor(PDF_MUTED);
+    doc.text(label.toUpperCase(), x, y);
+    doc.setFontSize(11);
+    doc.setTextColor(PDF_INK);
+    doc.setFont(PDF_FONT, 'bold');
+    doc.text(value, x, y + 14);
+    doc.setFont(PDF_FONT, 'normal');
+  };
+  const colWidth = (rightX - PDF_MARGIN_X) / 2;
+  metaRow('Project', project.name, PDF_MARGIN_X);
+  metaRow(
+    'Finished',
+    project.endedAt
+      ? new Date(project.endedAt).toLocaleString() + (project.autoFinished ? ' (auto)' : '')
+      : '-',
+    PDF_MARGIN_X + colWidth
+  );
+  y += 34;
+  metaRow('Sessions', String(bill.sessionCount), PDF_MARGIN_X);
+  metaRow('Duration', formatDuration(bill.durationMs), PDF_MARGIN_X + colWidth);
+  y += 34;
+  metaRow('Words translated', String(bill.wordCount), PDF_MARGIN_X);
+
+  y += 30;
+  doc.setDrawColor(PDF_LINE);
+  doc.line(PDF_MARGIN_X, y, rightX, y);
+  y += 20;
+
+  // ── Line items ────────────────────────────────────────────────────────
+  doc.setFontSize(9);
+  doc.setTextColor(PDF_MUTED);
+  doc.setFont(PDF_FONT, 'bold');
+  doc.text('DESCRIPTION', PDF_MARGIN_X, y);
+  doc.text('AMOUNT (USD)', rightX, y, { align: 'right' });
+  y += 10;
+  doc.setDrawColor(PDF_LINE);
+  doc.line(PDF_MARGIN_X, y, rightX, y);
+  y += 20;
+
+  doc.setFont(PDF_FONT, 'normal');
+  doc.setFontSize(10);
+  const lineItem = (label: string, amount: number) => {
+    doc.setTextColor(PDF_INK);
+    doc.text(label, PDF_MARGIN_X, y);
+    doc.text(`$${amount.toFixed(4)}`, rightX, y, { align: 'right' });
+    y += 20;
+  };
+
+  let subtotal = 0;
   if (bill.costBreakdown) {
     const b = bill.costBreakdown;
-    lines.push(
-      `  Live audio (${b.liveMinutes.toFixed(1)} min): $${b.liveAudioCost.toFixed(4)}`,
-      `  Translation text:            $${b.liveTextCost.toFixed(4)}`,
-      `  Meeting summaries (${b.summaryRuns} run${b.summaryRuns === 1 ? '' : 's'}): $${b.summaryCost.toFixed(4)}`
-    );
+    lineItem(`Live audio (${b.liveMinutes.toFixed(1)} min)`, b.liveAudioCost);
+    lineItem('Translation text', b.liveTextCost);
+    lineItem(`Meeting summaries (${b.summaryRuns} run${b.summaryRuns === 1 ? '' : 's'})`, b.summaryCost);
+    subtotal = b.liveAudioCost + b.liveTextCost + b.summaryCost;
+  } else {
+    lineItem('Estimated usage cost', bill.estimatedCost - (bill.serviceFee ?? 0));
+    subtotal = bill.estimatedCost - (bill.serviceFee ?? 0);
   }
-  lines.push('', '--- Session breakdown ---');
+
+  y += 4;
+  doc.setDrawColor(PDF_LINE);
+  doc.line(PDF_MARGIN_X, y, rightX, y);
+  y += 20;
+
+  doc.setTextColor(PDF_MUTED);
+  doc.text('Subtotal', PDF_MARGIN_X, y);
+  doc.setTextColor(PDF_INK);
+  doc.text(`$${subtotal.toFixed(4)}`, rightX, y, { align: 'right' });
+  y += 20;
+
+  doc.setTextColor(PDF_MUTED);
+  doc.text('Service fee', PDF_MARGIN_X, y);
+  doc.setTextColor(PDF_INK);
+  doc.text(`$${(bill.serviceFee ?? 0).toFixed(2)}`, rightX, y, { align: 'right' });
+  y += 28;
+
+  // ── Total, boxed ──────────────────────────────────────────────────────
+  doc.setFillColor('#fdf2f8');
+  doc.setDrawColor('#fbcfe8');
+  doc.roundedRect(PDF_MARGIN_X, y - 18, rightX - PDF_MARGIN_X, 34, 6, 6, 'FD');
+  doc.setFont(PDF_FONT, 'bold');
+  doc.setFontSize(12);
+  doc.setTextColor(PDF_ACCENT);
+  doc.text('TOTAL (upper bound)', PDF_MARGIN_X + 14, y + 3);
+  doc.setFontSize(14);
+  doc.text(`$${bill.estimatedCost.toFixed(2)}`, rightX - 14, y + 3, { align: 'right' });
+  y += 44;
+
+  // ── Session breakdown ────────────────────────────────────────────────
+  doc.setFont(PDF_FONT, 'bold');
+  doc.setFontSize(9);
+  doc.setTextColor(PDF_MUTED);
+  doc.text('SESSIONS', PDF_MARGIN_X, y);
+  y += 14;
+  doc.setDrawColor(PDF_LINE);
+  doc.line(PDF_MARGIN_X, y, rightX, y);
+  y += 16;
+
+  doc.setFont(PDF_FONT, 'normal');
+  doc.setFontSize(9);
+  doc.setTextColor(PDF_INK);
+  // A project runs for up to seven days and can hold far more sessions than
+  // fit below the total box. Without a break they were simply drawn past the
+  // bottom edge and lost, taking the footer with them.
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const bottomLimit = pageHeight - 72;
   project.sessions.forEach((s, i) => {
+    if (y > bottomLimit) {
+      doc.addPage();
+      y = 60;
+      doc.setFont(PDF_FONT, 'bold');
+      doc.setFontSize(9);
+      doc.setTextColor(PDF_MUTED);
+      doc.text('SESSIONS (continued)', PDF_MARGIN_X, y);
+      y += 14;
+      doc.setDrawColor(PDF_LINE);
+      doc.line(PDF_MARGIN_X, y, rightX, y);
+      y += 16;
+      doc.setFont(PDF_FONT, 'normal');
+      doc.setTextColor(PDF_INK);
+    }
     const duration = s.endedAt ? formatDuration(s.endedAt - s.startedAt) : '-';
-    lines.push(`[${i + 1}] ${s.sourceLang} -> ${s.targetLang} · ${duration}`);
+    doc.text(`#${i + 1}  ${s.sourceLang} → ${s.targetLang}`, PDF_MARGIN_X, y);
+    doc.text(duration, rightX, y, { align: 'right' });
+    y += 16;
   });
-  return lines.join('\n');
+
+  // ── Footer ────────────────────────────────────────────────────────────
+  y += 16;
+  if (y > bottomLimit) {
+    doc.addPage();
+    y = 60;
+  }
+  doc.setFontSize(8);
+  doc.setTextColor(PDF_MUTED);
+  const disclaimer =
+    'Estimated from published Gemini API rates, billed pessimistically (full session duration counted as audio). ' +
+    'Actual spend will not exceed this figure. This is not an official payment invoice.';
+  const wrapped = doc.splitTextToSize(disclaimer, rightX - PDF_MARGIN_X);
+  doc.text(wrapped, PDF_MARGIN_X, y);
+
+  return doc;
 }
 
-function downloadBill(project: Project) {
+async function downloadBill(project: Project) {
   if (!project.bill) return;
-  const content = billFileContent(project, project.bill);
-  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `bill_${project.name.replace(/\s+/g, '_')}_${new Date(project.createdAt).toISOString().slice(0, 10)}.txt`;
-  a.click();
-  URL.revokeObjectURL(url);
+  const doc = new jsPDF({ unit: 'pt', format: 'a4' });
+
+  // Imported here, not at module scope: the two base64 faces are ~115 KB, and
+  // nothing but this one click needs them. Awaiting a dynamic import inside a
+  // click handler is safe — jsPDF's own save() is what opens the download, and
+  // it is called below, not by the browser's gesture handling.
+  const { SARABUN_REGULAR_BASE64, SARABUN_BOLD_BASE64 } = await import('./billPdfFont');
+  doc.addFileToVFS('Sarabun-Regular.ttf', SARABUN_REGULAR_BASE64);
+  doc.addFont('Sarabun-Regular.ttf', PDF_FONT, 'normal');
+  doc.addFileToVFS('Sarabun-Bold.ttf', SARABUN_BOLD_BASE64);
+  doc.addFont('Sarabun-Bold.ttf', PDF_FONT, 'bold');
+
+  billToPdf(doc, project, project.bill);
+  const filename = `bill_${project.name.replace(/\s+/g, '_')}_${new Date(project.createdAt)
+    .toISOString()
+    .slice(0, 10)}.pdf`;
+  doc.save(filename);
 }
 
 // Countdown toward the 7-day deadline, amber in the last two days.
@@ -395,6 +569,10 @@ export function BillModal({ project, onClose }: { project: Project; onClose: () 
               <span>สรุปการประชุม ({bill.costBreakdown.summaryRuns} ครั้ง)</span>
               <span className="font-mono">${bill.costBreakdown.summaryCost.toFixed(4)}</span>
             </div>
+            <div className="flex justify-between gap-2 pt-1 border-t border-slate-100">
+              <span>ค่าบริการ (Service fee)</span>
+              <span className="font-mono">${(bill.serviceFee ?? 0).toFixed(2)}</span>
+            </div>
           </div>
         )}
 
@@ -411,7 +589,7 @@ export function BillModal({ project, onClose }: { project: Project; onClose: () 
             ปิด
           </button>
           <button
-            onClick={() => downloadBill(project)}
+            onClick={() => void downloadBill(project)}
             className="flex-1 py-2 bg-[#DE5C8E] hover:bg-[#c94577] text-white rounded-lg text-xs font-bold flex items-center justify-center gap-1.5"
           >
             <Download className="w-3.5 h-3.5" />
@@ -449,7 +627,7 @@ export function HistoryPanel({ projects, onClose }: { projects: Project[]; onClo
                   <span className="font-semibold text-xs text-slate-800 truncate">{p.name}</span>
                   {p.bill && (
                     <button
-                      onClick={() => downloadBill(p)}
+                      onClick={() => void downloadBill(p)}
                       className="p-1.5 text-slate-400 hover:text-[#DE5C8E] rounded-lg hover:bg-white transition-all shrink-0"
                       title="ดาวน์โหลดบิล"
                     >
@@ -524,10 +702,6 @@ export function SessionHistoryModal({
             <X className="w-4 h-4" />
           </button>
         </div>
-        <p className="px-4 pt-3 text-[11px] text-slate-400 leading-relaxed">
-          {project.name} · กดปุ่ม &quot;สรุปการประชุม&quot; ที่ session ที่ต้องการ เมื่อพร้อมสรุป
-        </p>
-
         <div className="flex-1 overflow-y-auto p-4 space-y-2.5">
           {sessions.length === 0 ? (
             <div className="text-center text-slate-400 text-xs py-8">ยังไม่มี session ในโปรเจกต์นี้</div>

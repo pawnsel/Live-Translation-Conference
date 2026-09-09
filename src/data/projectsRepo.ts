@@ -32,6 +32,41 @@ const SESSION_COLUMNS =
 const TRANSCRIPT_COLUMNS =
   'session_id, seq, source_text, target_text, source_lang, target_lang, ts, latency_ms, is_edited';
 
+/** Rows per transcript request. PostgREST refuses to return more than its
+ *  configured cap (Supabase ships that at 1000) and does not say when it
+ *  truncates — the response is simply short. A three-hour meeting runs to a
+ *  couple of thousand captions, so every transcript read pages. */
+export const TRANSCRIPT_PAGE_SIZE = 1000;
+
+/** Guards against an unbounded loop if a server ever kept answering with
+ *  rows. Well above any real meeting: at ~10 captions a minute this is over
+ *  eighty hours of talking. */
+const TRANSCRIPT_MAX_ROWS = 50_000;
+
+/**
+ * Reads every row of a windowed query, one page at a time.
+ *
+ * Two rules, both learned from how PostgREST truncates:
+ *
+ *  - The offset advances by the rows that actually **arrived**, never by the
+ *    page size. If the server's own cap is smaller than the page asked for,
+ *    advancing by the page size would step straight over the rows in between.
+ *  - Only an empty page ends the loop. A short page proves nothing — a capped
+ *    page is short too — so the last request of every read comes back empty.
+ *    That is one cheap round trip in exchange for never losing a meeting's
+ *    tail.
+ */
+async function readAllPages<T>(page: (from: number, to: number) => Promise<T[]>): Promise<T[]> {
+  const all: T[] = [];
+  for (let from = 0; from < TRANSCRIPT_MAX_ROWS; ) {
+    const rows = await page(from, from + TRANSCRIPT_PAGE_SIZE - 1);
+    if (rows.length === 0) break;
+    all.push(...rows);
+    from += rows.length;
+  }
+  return all;
+}
+
 export interface ProjectsRepo {
   listProjects(): Promise<Project[]>;
   loadSessionTranscript(sessionId: string): Promise<TranscriptItem[]>;
@@ -73,30 +108,44 @@ export function createProjectsRepo(client: QueryClient): ProjectsRepo {
     },
 
     async loadSessionTranscript(sessionId) {
-      const rows = unwrap<TranscriptRow[]>(
-        await client
-          .from('transcript_items')
-          .select(TRANSCRIPT_COLUMNS)
-          .eq('session_id', sessionId)
-          .order('seq', { ascending: true })
+      const rows = await readAllPages<TranscriptRow>(async (from, to) =>
+        unwrap<TranscriptRow[]>(
+          await client
+            .from('transcript_items')
+            .select(TRANSCRIPT_COLUMNS)
+            .eq('session_id', sessionId)
+            .order('seq', { ascending: true })
+            .range(from, to)
+        ) ?? []
       );
-      return (rows ?? []).map(toTranscriptItem);
+      return rows.map(toTranscriptItem);
     },
 
     async loadProjectTranscripts(projectId) {
-      // One statement for the whole project: the running cost badge needs
-      // every session's captions, and a query per session would be N round
-      // trips on every project switch.
-      const rows = unwrap<(TranscriptRow & { session_id: string })[]>(
-        await client
-          .from('transcript_items')
-          .select(`${TRANSCRIPT_COLUMNS}, project_sessions!inner(project_id)`)
-          .eq('project_sessions.project_id', projectId)
-          .order('seq', { ascending: true })
+      // One query for the whole project rather than one per session: the
+      // running cost badge needs every session's captions, and a query per
+      // session would be N round trips on every project switch. Paged, so
+      // "one query" still means every row — see readAllPages.
+      const rows = await readAllPages<TranscriptRow & { session_id: string }>(async (from, to) =>
+        unwrap<(TranscriptRow & { session_id: string })[]>(
+          await client
+            .from('transcript_items')
+            .select(`${TRANSCRIPT_COLUMNS}, project_sessions!inner(project_id)`)
+            .eq('project_sessions.project_id', projectId)
+            // Ordered by session first, THEN seq. Paging needs a total
+            // order: `seq` alone repeats across sessions, and rows that
+            // compare equal may come back in a different order on each
+            // request — which is how a paged read ends up skipping one row
+            // and returning another twice. (session_id, seq) is the
+            // transcript_items primary key, so it can never tie.
+            .order('session_id', { ascending: true })
+            .order('seq', { ascending: true })
+            .range(from, to)
+        ) ?? []
       );
 
       const grouped: Record<string, TranscriptItem[]> = {};
-      for (const row of rows ?? []) {
+      for (const row of rows) {
         (grouped[row.session_id] ||= []).push(toTranscriptItem(row));
       }
       return grouped;

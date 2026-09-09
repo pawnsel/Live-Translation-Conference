@@ -8,10 +8,18 @@ import {
   ClipboardPaste,
   Check,
   FileSpreadsheet,
-  AlertCircle
+  Upload,
+  Download,
+  AlertTriangle
 } from 'lucide-react';
-import type { GlossarySection, GlossarySections } from '../glossary';
+import { emptyGlossary, type GlossarySection, type GlossarySections } from '../glossary';
 import type { GlossaryList } from '../data/glossaryRepo';
+import {
+  MAX_IMPORT_TERM_LENGTH,
+  parseGlossaryFile,
+  toGlossaryFile,
+  type GlossaryImportResult
+} from '../data/glossaryImport';
 
 // The glossary belongs to this project and is stored in the database — it
 // follows the operator to any device, not just this browser. These
@@ -37,6 +45,9 @@ export interface DictionaryManagerProps {
   subscribedIds: Set<string>;
   onToggleList: (listId: string) => void;
   onAdd: (section: GlossarySection, abbr: string, full: string) => void;
+  /** Writes a whole parsed file in one go. Separate from `onAdd` because an
+   *  import of a hundred names must be one statement, not a hundred. */
+  onAddMany: (sections: GlossarySections) => void;
   onRemove: (section: GlossarySection, abbr: string) => void;
   /** True when `term` in `section` resolves from the project's own list — as
    *  opposed to a subscribed shared list, which `onRemove` cannot touch (it
@@ -52,6 +63,7 @@ export default function DictionaryManager({
   subscribedIds,
   onToggleList,
   onAdd,
+  onAddMany,
   onRemove,
   isOwnTerm,
   disabled
@@ -65,6 +77,13 @@ export default function DictionaryManager({
   const [showPasteModal, setShowPasteModal] = useState(false);
   const [pasteRawText, setPasteRawText] = useState('');
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  // The parsed file waiting for a confirm, plus the name it came from. Held
+  // rather than applied on selection: an import overwrites terms, so the
+  // operator sees what it will do before it does it.
+  const [pendingImport, setPendingImport] = useState<GlossaryImportResult | null>(null);
+  const [importFileName, setImportFileName] = useState('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const activeMeta = SECTIONS.find((s) => s.key === activeSection)!;
   const entries = useMemo(() => Object.entries(sections?.[activeSection] ?? {}), [sections, activeSection]);
@@ -109,23 +128,60 @@ export default function DictionaryManager({
   }, [pasteRawText]);
 
   const handleConfirmPaste = () => {
-    for (const row of parsedPasteRows) {
-      onAdd(activeSection, row.term, row.equivalent);
-    }
+    // One write for the whole paste, same path an import takes.
+    const pasted = emptyGlossary();
+    for (const row of parsedPasteRows) pasted[activeSection][row.term] = row.equivalent;
+    onAddMany(pasted);
     showToast(`เพิ่ม ${parsedPasteRows.length} คำในหมวด "${activeMeta.label}" แล้ว`);
     setPasteRawText('');
     setShowPasteModal(false);
   };
 
+  // ── JSON import / export ───────────────────────────────────────────────
+  const handleFilePicked = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    // Reset immediately so picking the SAME file twice in a row still fires
+    // a change event — the second attempt is usually a corrected file.
+    event.target.value = '';
+    if (!file) return;
+    setImportFileName(file.name);
+    try {
+      setPendingImport(parseGlossaryFile(await file.text(), activeSection));
+    } catch {
+      setPendingImport({ status: 'error', error: 'อ่านไฟล์ไม่สำเร็จ' });
+    }
+  };
+
+  const handleConfirmImport = () => {
+    if (pendingImport?.status !== 'ok') return;
+    onAddMany(pendingImport.sections);
+    showToast(`นำเข้า ${pendingImport.total} คำแล้ว`);
+    setPendingImport(null);
+    setImportFileName('');
+  };
+
+  const handleExport = () => {
+    // Exports everything the operator can SEE, which includes terms coming
+    // from subscribed shared lists. That is the point: the file is a
+    // snapshot of the glossary this project actually translates with, and
+    // it stays usable even if a shared list changes later.
+    const text = toGlossaryFile(sections ?? emptyGlossary());
+    const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `glossary-${new Date().toISOString().slice(0, 10)}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    showToast('ดาวน์โหลดไฟล์ glossary แล้ว');
+  };
+
+  const totalTermsShown = useMemo(
+    () => SECTIONS.reduce((sum, s) => sum + Object.keys(sections?.[s.key] ?? {}).length, 0),
+    [sections]
+  );
+
   return (
     <div className="space-y-3.5">
-      {/* The glossary belongs to this project, is stored in the database,
-          and follows the operator to any device. */}
-      <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-800 text-xs leading-relaxed">
-        <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-        <span>พจนานุกรมนี้ผูกกับโปรเจกต์นี้ บันทึกในฐานข้อมูล และใช้งานได้จากทุกอุปกรณ์</span>
-      </div>
-
       {sharedLists.length > 0 && (
         <div className="mb-3 pb-3 border-b border-slate-200">
           <p className="text-[11px] font-semibold text-slate-500 mb-1.5">คลังคำศัพท์ที่ใช้ร่วมกัน</p>
@@ -195,6 +251,31 @@ export default function DictionaryManager({
           className="p-2 bg-slate-50 hover:bg-pink-50 hover:text-[#DE5C8E] border border-slate-200 rounded-lg text-slate-500 transition-all disabled:opacity-40"
         >
           <ClipboardPaste className="w-4 h-4" />
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="application/json,.json"
+          onChange={handleFilePicked}
+          className="hidden"
+        />
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={disabled}
+          title="นำเข้าคำศัพท์จากไฟล์ .json"
+          className="p-2 bg-slate-50 hover:bg-pink-50 hover:text-[#DE5C8E] border border-slate-200 rounded-lg text-slate-500 transition-all disabled:opacity-40"
+        >
+          <Upload className="w-4 h-4" />
+        </button>
+        <button
+          type="button"
+          onClick={handleExport}
+          disabled={totalTermsShown === 0}
+          title="ดาวน์โหลดคำศัพท์ทั้งหมดเป็นไฟล์ .json"
+          className="p-2 bg-slate-50 hover:bg-pink-50 hover:text-[#DE5C8E] border border-slate-200 rounded-lg text-slate-500 transition-all disabled:opacity-40"
+        >
+          <Download className="w-4 h-4" />
         </button>
       </div>
 
@@ -297,6 +378,111 @@ export default function DictionaryManager({
                 <BookmarkPlus className="w-3.5 h-3.5" />
                 <span>เพิ่มทั้งหมด</span>
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Import preview. An import overwrites terms that already exist, so
+          nothing is written until the operator has seen the tally. */}
+      {pendingImport && (
+        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-xl max-w-lg w-full p-5 space-y-3.5">
+            <div className="flex items-center justify-between">
+              <h3 className="font-bold text-sm text-slate-900 flex items-center gap-2">
+                <Upload className="w-4 h-4 text-[#DE5C8E]" />
+                <span>นำเข้าคำศัพท์จากไฟล์</span>
+              </h3>
+              <button onClick={() => setPendingImport(null)} className="text-slate-400 hover:text-slate-700">
+                <X className="w-4.5 h-4.5" />
+              </button>
+            </div>
+
+            {importFileName && (
+              <p className="text-[11px] text-slate-400 font-mono truncate">{importFileName}</p>
+            )}
+
+            {pendingImport.status !== 'ok' ? (
+              <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg space-y-2">
+                <p className="text-xs text-rose-800 font-semibold">{pendingImport.error}</p>
+                <div className="text-[11px] text-rose-700 space-y-1">
+                  <p>รูปแบบที่รับได้มีสองแบบ:</p>
+                  <pre className="bg-white/70 border border-rose-100 rounded-md p-2 overflow-x-auto font-mono leading-relaxed">
+{`{ "Kawin": "กวิน" }
+
+{ "en_th_corrections": { "Kawin": "กวิน" },
+  "person_names": { "นพ. สมชาย": "Dr. Somchai" } }`}
+                  </pre>
+                </div>
+              </div>
+            ) : (
+              <>
+                <p className="text-xs text-slate-600">
+                  {pendingImport.form === 'flat' ? (
+                    <>
+                      ไฟล์นี้ไม่ได้ระบุหมวด — จะนำเข้าทั้งหมดลงหมวด{' '}
+                      <span className="font-bold text-[#DE5C8E]">{activeMeta.label}</span> ที่เปิดอยู่
+                    </>
+                  ) : (
+                    <>ไฟล์นี้ระบุหมวดมาเอง — จะนำเข้าตามที่ไฟล์กำหนด</>
+                  )}
+                </p>
+
+                <div className="space-y-1 text-xs">
+                  {SECTIONS.map((s) => {
+                    const count = Object.keys(pendingImport.sections[s.key] ?? {}).length;
+                    if (count === 0) return null;
+                    return (
+                      <div
+                        key={s.key}
+                        className="flex justify-between gap-2 bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5"
+                      >
+                        <span className="text-slate-700 font-medium">{s.label}</span>
+                        <span className="font-bold text-slate-900">{count} คำ</span>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div className="text-[11px] text-slate-500 space-y-1">
+                  <p>คำที่มีอยู่แล้วจะถูกทับด้วยค่าจากไฟล์</p>
+                  <p>คำที่นำเข้าจะอยู่ในคลังของโปรเจกต์นี้ ไม่กระทบคลังที่ใช้ร่วมกัน</p>
+                  {pendingImport.skipped > 0 && (
+                    <p className="text-amber-600">
+                      ข้าม {pendingImport.skipped} แถวที่มีช่องว่างอยู่ข้างใดข้างหนึ่ง
+                    </p>
+                  )}
+                </div>
+
+                {pendingImport.tooLong.length > 0 && (
+                  <div className="p-2.5 bg-amber-50 border border-amber-200 rounded-lg flex gap-2">
+                    <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
+                    <p className="text-[11px] text-amber-800">
+                      มี {pendingImport.tooLong.length} คำที่ยาวเกิน {MAX_IMPORT_TERM_LENGTH} ตัวอักษร —
+                      เก็บได้ครบ แต่ระบบจะตัดให้สั้นลงก่อนส่งให้ AI ทำให้อาจไม่ตรงกับที่พูดจริง
+                    </p>
+                  </div>
+                )}
+              </>
+            )}
+
+            <div className="flex justify-end gap-2 pt-1">
+              <button
+                onClick={() => setPendingImport(null)}
+                className="px-3.5 py-1.5 text-xs text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium"
+              >
+                {pendingImport.status === 'ok' ? 'ยกเลิก' : 'ปิด'}
+              </button>
+              {pendingImport.status === 'ok' && (
+                <button
+                  onClick={handleConfirmImport}
+                  disabled={disabled}
+                  className="px-3.5 py-1.5 text-xs text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg font-semibold flex items-center gap-1.5 disabled:opacity-40"
+                >
+                  <BookmarkPlus className="w-3.5 h-3.5" />
+                  <span>นำเข้า {pendingImport.total} คำ</span>
+                </button>
+              )}
             </div>
           </div>
         </div>

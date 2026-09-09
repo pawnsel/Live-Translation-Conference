@@ -95,11 +95,12 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function renderCapture() {
+function renderCapture(deviceId?: string) {
   return renderHook(() =>
     useGeminiLiveCapture({
       active: true,
       paused: false,
+      deviceId,
       sourceLang: 'th',
       targetLang: 'en',
       glossary: emptyGlossary(),
@@ -221,5 +222,68 @@ describe('useGeminiLiveCapture reconnect loop', () => {
     expect(contexts.length).toBe(1);
     expect(tracks.filter((t) => !t.stopped).length).toBe(1);
     expect(contexts.filter((c) => !c.closed).length).toBe(1);
+  });
+});
+
+// A meeting room swaps interfaces between sessions. The operator's remembered
+// microphone can be gone by the time the next session starts, and a device id
+// is passed to getUserMedia as `{ exact: ... }` — a constraint the browser
+// refuses outright rather than approximating.
+describe('useGeminiLiveCapture microphone selection', () => {
+  it('asks for the chosen device exactly', async () => {
+    renderCapture('mic-abc');
+    await settle();
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => {
+      socket.setupComplete();
+    });
+    await settle();
+
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledWith({
+      audio: expect.objectContaining({ deviceId: { exact: 'mic-abc' } })
+    });
+  });
+
+  it('falls back to the default microphone when the chosen one is gone', async () => {
+    const getUserMedia = vi
+      .fn()
+      // OverconstrainedError is what Chrome throws for an { exact } device id
+      // that no longer resolves to anything.
+      .mockRejectedValueOnce(Object.assign(new Error('no device'), { name: 'OverconstrainedError' }))
+      .mockImplementation(async () => makeStream());
+    Object.defineProperty(navigator, 'mediaDevices', { value: { getUserMedia }, configurable: true });
+
+    renderCapture('mic-unplugged');
+    await settle();
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => {
+      socket.setupComplete();
+    });
+    await settle();
+
+    expect(getUserMedia).toHaveBeenCalledTimes(2);
+    // The retry drops the device constraint entirely rather than naming
+    // another device, so the browser picks whatever it considers default.
+    expect(getUserMedia.mock.calls[1][0].audio.deviceId).toBeUndefined();
+    // …and the session actually starts, which is the whole point.
+    expect(tracks.length).toBe(1);
+  });
+
+  it('does not retry when no device was chosen', async () => {
+    const getUserMedia = vi.fn().mockRejectedValue(new Error('denied'));
+    Object.defineProperty(navigator, 'mediaDevices', { value: { getUserMedia }, configurable: true });
+
+    renderCapture();
+    await settle();
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => {
+      socket.setupComplete();
+    });
+    await settle();
+
+    // A refusal with no device constraint is a permission problem, and asking
+    // again with the identical constraints would only prompt the operator
+    // twice for the same denial.
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
   });
 });

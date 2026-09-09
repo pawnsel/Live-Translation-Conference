@@ -114,6 +114,40 @@ export function useGlossary({ repo, projectId = null }: UseGlossaryOptions = {})
     [activeRepo, guard, ownList]
   );
 
+  /** Writes a whole GlossarySections in one statement — what a JSON import
+   *  produces. One round trip rather than one per term, and one failure
+   *  rather than a glossary left half-written. */
+  const addTerms = useCallback(
+    async (incoming: GlossarySections) => {
+      if (!ownList) return;
+      const listId = ownList.id;
+      const entries = (Object.keys(incoming) as GlossarySection[]).flatMap((section) =>
+        Object.entries(incoming[section] ?? {}).map(([term, translation]) => ({
+          section,
+          term,
+          translation
+        }))
+      );
+      if (entries.length === 0) return;
+
+      await guard(async () => {
+        await activeRepo.addTerms(listId, entries);
+        setTermsByList((prev) => {
+          const list = prev[listId] ?? emptyGlossary();
+          const next = { ...list };
+          for (const entry of entries) {
+            next[entry.section] = {
+              ...next[entry.section],
+              [entry.term.trim()]: entry.translation.trim()
+            };
+          }
+          return { ...prev, [listId]: next };
+        });
+      });
+    },
+    [activeRepo, guard, ownList]
+  );
+
   const removeTerm = useCallback(
     async (section: GlossarySection, term: string) => {
       if (!ownList) return;
@@ -177,6 +211,7 @@ export function useGlossary({ repo, projectId = null }: UseGlossaryOptions = {})
     loading,
     error,
     addTerm,
+    addTerms,
     removeTerm,
     isOwnTerm,
     toggleList,

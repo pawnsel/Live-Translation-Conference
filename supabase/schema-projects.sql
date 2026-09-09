@@ -1,5 +1,5 @@
 -- ===========================================================================
---  AI Live Translator — project, session, transcript and glossary schema
+--  Live Translation — project, session, transcript and glossary schema
 --  Run once in Supabase → SQL Editor, AFTER schema.sql.
 --  Safe to re-run: every statement is guarded.
 -- ===========================================================================

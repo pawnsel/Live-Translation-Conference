@@ -41,6 +41,9 @@ import DictionaryManager from '../components/DictionaryManager';
 import { captionsReducer, initialCaptionState, selectCaptions, type Caption } from '../asr/captions';
 import { groupCaptionsIntoParagraphs } from '../asr/historyParagraphs';
 import { useGeminiLiveCapture, type CaptionResult } from '../asr/audio/useGeminiLiveCapture';
+import { useAudioInputDevices } from '../asr/audio/useAudioInputDevices';
+import { deviceLabel, resolveDeviceId } from '../asr/audio/audioDevices';
+import { loadMicDeviceId, saveMicDeviceId } from '../storage/micStore';
 import SubtitleText from '../components/SubtitleText';
 import { useProjects } from '../hooks/useProjects';
 import { useLiveProjectCost } from '../hooks/useLiveProjectCost';
@@ -62,6 +65,14 @@ const ANONYMOUS_USER_NAME = 'ผู้ใช้งาน';
 // the model is instructed to expect.
 const LANGS: Record<'th' | 'en', string> = { th: 'ไทย (Thai)', en: 'อังกฤษ (English)' };
 const other = (lang: string) => (lang === 'th' ? 'en' : 'th');
+
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const h = String(Math.floor(totalSeconds / 3600)).padStart(2, '0');
+  const m = String(Math.floor(totalSeconds / 60) % 60).padStart(2, '0');
+  const s = String(totalSeconds % 60).padStart(2, '0');
+  return `${h}:${m}:${s}`;
+}
 
 function formatSrtTime(ms: number): string {
   const h = String(Math.floor(ms / 3600000)).padStart(2, '0');
@@ -114,11 +125,43 @@ export default function Admin() {
 
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [micActive, setMicActive] = useState(false);
+
+  // ── Microphone choice ─────────────────────────────────────────────────────
+  // A real meeting swaps interfaces between sessions, so the operator picks
+  // one here rather than in the OS. It is remembered per device, and it is
+  // frozen for the whole of a session — including while paused. Changing it
+  // flows into useGeminiLiveCapture's effect dependencies, which tears the
+  // pipeline down and reconnects; doing that mid-meeting would drop the
+  // sentence in flight and cost a fresh handshake. The picker below is
+  // disabled whenever a session is open, and this state is what enforces it.
+  const { devices: micDevices, refresh: refreshMicDevices } = useAudioInputDevices();
+  const [micDeviceId, setMicDeviceId] = useState<string | null>(() => loadMicDeviceId());
+  const effectiveMicDeviceId = resolveDeviceId(micDeviceId, micDevices);
+  // True once the machine has a list AND the remembered choice is not in it:
+  // the interface was unplugged, and this session will fall back to default.
+  const micDeviceMissing = micDeviceId !== null && micDevices.length > 0 && effectiveMicDeviceId === undefined;
+
+  const handleSelectMicDevice = (deviceId: string) => {
+    const next = deviceId === '' ? null : deviceId;
+    setMicDeviceId(next);
+    saveMicDeviceId(next);
+  };
   const [sourceLang, setSourceLangState] = useState<'th' | 'en'>('th');
   const [targetLang, setTargetLangState] = useState<'th' | 'en'>('en');
   const [paused, setPaused] = useState(false);
 
-  const [config, setConfig] = useState<DisplayConfig>({ fontSize: 'medium', showOriginal: false, showLatency: false });
+  // Real-time elapsed clock for the current session, hh:mm:ss — mirrors a
+  // voice-recorder timer: it runs while recording and freezes while paused,
+  // so the number always reads "how much has actually been recorded".
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const elapsedTickRef = useRef<number | null>(null);
+
+  const [config, setConfig] = useState<DisplayConfig>({
+    fontSize: 'medium',
+    showOriginal: false,
+    showLatency: false,
+    captionTheme: 'light'
+  });
   const [activeTab, setActiveTab] = useState<'languages' | 'dictionary'>('languages');
   const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
@@ -205,12 +248,22 @@ export default function Admin() {
   const capture = useGeminiLiveCapture({
     active: micActive,
     paused,
+    deviceId: effectiveMicDeviceId,
     sourceLang,
     targetLang,
     glossary: glossary ?? emptyGlossary(),
     onResult: handleCaptureResult,
     accessToken: session?.access_token ?? null
   });
+
+  // A browser hides microphone LABELS until the page has been granted
+  // permission at least once, so the very first enumeration comes back as a
+  // list of blank names. The first successful capture is that grant — read
+  // the list again there and the picker fills in with real product names,
+  // without ever prompting on its own just to populate a dropdown.
+  useEffect(() => {
+    if (capture.status === 'listening') void refreshMicDevices();
+  }, [capture.status, refreshMicDevices]);
 
   // ── Session + mic as one combined "Session" toggle, matching the original
   //    single Start/Stop button ─────────────────────────────────────────────
@@ -228,6 +281,7 @@ export default function Admin() {
     setSessionId(id);
     dispatchCaption({ kind: 'reset' });
     setHiddenSeqs(new Set());
+    setElapsedMs(0);
     const ok = await projects.attachAsrSession(id, sourceLang, targetLang);
     setStartingSession(false);
     if (!ok) {
@@ -275,6 +329,34 @@ export default function Admin() {
   };
 
   const isSessionActive = !!sessionId && micActive;
+
+  // Deliberately wider than isSessionActive, which is false during the two
+  // windows where a switch would do the most damage: after startSessionAndMic
+  // has attached a session but before the mic is up, and while
+  // stopSessionAndMic is flushing the last sentence. `paused` is not an
+  // escape either — a paused session still owns its websocket and its
+  // caption sequence.
+  const micLocked = sessionId !== null || micActive || startingSession || endingSession;
+
+  // Ticks the elapsed-time clock once a second while actually recording;
+  // freezes (clears the interval) the moment the session pauses or ends, so
+  // the displayed duration always matches time actually captured. The ref
+  // tracks the last tick's wall-clock time so a delta is added rather than
+  // a fixed 1000ms, keeping the clock accurate even if a tab is throttled.
+  useEffect(() => {
+    if (!isSessionActive || paused) {
+      elapsedTickRef.current = null;
+      return;
+    }
+    elapsedTickRef.current = Date.now();
+    const id = setInterval(() => {
+      const now = Date.now();
+      const last = elapsedTickRef.current ?? now;
+      elapsedTickRef.current = now;
+      setElapsedMs((prev) => prev + (now - last));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [isSessionActive, paused]);
 
   // Running total for the header badge: finished sessions come off the project
   // record, the session recording right now comes out of the live caption
@@ -349,6 +431,10 @@ export default function Admin() {
   // are maintained from the Supabase dashboard.
   const handleGlossaryAdd = (section: GlossarySection, term: string, equivalent: string) => {
     void glossaryState.addTerm(section, term, equivalent);
+  };
+
+  const handleGlossaryAddMany = (incoming: GlossarySections) => {
+    void glossaryState.addTerms(incoming);
   };
 
   const handleGlossaryRemove = (section: GlossarySection, term: string) => {
@@ -461,6 +547,7 @@ export default function Admin() {
   const boxSourceText = capture.partialSource || latestCaption?.sourceText || '';
   const boxTargetText = capture.partialTarget || latestCaption?.targetText || '';
   const isEditingBox = editingSeq !== null && editingSeq === latestCaption?.seq;
+  const isDarkCaption = config.captionTheme === 'dark';
 
   // Read live off the project record so the popup fills itself in the moment
   // the summary lands, rather than holding a stale copy of the session.
@@ -534,7 +621,7 @@ export default function Admin() {
               <Sparkles className="w-4.5 h-4.5" />
             </div>
             <div className="flex flex-col">
-              <span className="font-bold text-sm text-slate-900 tracking-tight leading-none">AI Live Translator</span>
+              <span className="font-bold text-sm text-slate-900 tracking-tight leading-none">Live Translation</span>
             </div>
           </div>
 
@@ -723,6 +810,81 @@ export default function Admin() {
                   </select>
                 </div>
 
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1.5">ธีมคำบรรยาย (Caption Theme)</label>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setConfig((c) => ({ ...c, captionTheme: 'light' }))}
+                      className={`flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all ${
+                        (config.captionTheme ?? 'light') === 'light'
+                          ? 'border-[#DE5C8E] ring-2 ring-pink-100 bg-white text-slate-800'
+                          : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-white'
+                      }`}
+                    >
+                      <span className="w-3.5 h-3.5 rounded-full bg-white border border-slate-300 text-black flex items-center justify-center text-[8px] font-black">A</span>
+                      <span>ตัวดำพื้นขาว</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfig((c) => ({ ...c, captionTheme: 'dark' }))}
+                      className={`flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all ${
+                        config.captionTheme === 'dark'
+                          ? 'border-[#DE5C8E] ring-2 ring-pink-100 bg-white text-slate-800'
+                          : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-white'
+                      }`}
+                    >
+                      <span className="w-3.5 h-3.5 rounded-full bg-black text-white flex items-center justify-center text-[8px] font-black">A</span>
+                      <span>ตัวขาวพื้นดำ</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Microphone picker. Locked for the whole of a session —
+                    pausing does not unlock it, because switching device
+                    reconnects the capture pipeline and would cut the meeting
+                    mid-sentence. */}
+                <div>
+                  <label htmlFor="mic-device" className="block text-xs font-bold text-slate-700 mb-1.5">
+                    ไมโครโฟนที่ใช้อัดเสียง (Microphone)
+                  </label>
+                  <select
+                    id="mic-device"
+                    value={micDeviceId ?? ''}
+                    onChange={(e) => handleSelectMicDevice(e.target.value)}
+                    disabled={micLocked}
+                    title={
+                      micLocked
+                        ? 'เปลี่ยนไมโครโฟนระหว่าง session ไม่ได้ — จบ session นี้ก่อน'
+                        : 'เลือกไมโครโฟนที่จะใช้อัดเสียงใน session ถัดไป'
+                    }
+                    className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <option value="">ไมโครโฟนเริ่มต้นของเบราว์เซอร์</option>
+                    {micDevices.map((device, index) => (
+                      <option key={device.deviceId} value={device.deviceId}>
+                        {deviceLabel(device, index)}
+                      </option>
+                    ))}
+                  </select>
+                  {/* Ranked by urgency, not by state: a session recording on
+                      the WRONG microphone is the one thing the operator has to
+                      hear about immediately, even while the picker is locked. */}
+                  {capture.deviceFallback ? (
+                    <p className="mt-1 text-[11px] text-amber-600 font-semibold">
+                      เปิดไมโครโฟนที่เลือกไว้ไม่ได้ — กำลังอัดด้วยไมโครโฟนเริ่มต้นของเครื่องแทน
+                    </p>
+                  ) : micLocked ? (
+                    <p className="mt-1 text-[11px] text-slate-400">
+                      เปลี่ยนไมโครโฟนได้เมื่อจบ session แล้วเท่านั้น
+                    </p>
+                  ) : micDeviceMissing ? (
+                    <p className="mt-1 text-[11px] text-amber-600">
+                      ไม่พบไมโครโฟนที่เคยเลือกไว้ — session ถัดไปจะใช้ไมโครโฟนเริ่มต้นแทน
+                    </p>
+                  ) : null}
+                </div>
+
                 <div className="pt-3 border-t border-slate-200 space-y-2.5">
                   <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
                     <input
@@ -754,6 +916,7 @@ export default function Admin() {
                 onToggleList={(id) => void glossaryState.toggleList(id)}
                 disabled={false}
                 onAdd={handleGlossaryAdd}
+                onAddMany={handleGlossaryAddMany}
                 onRemove={handleGlossaryRemove}
                 isOwnTerm={glossaryState.isOwnTerm}
               />
@@ -830,19 +993,31 @@ export default function Admin() {
               word that no longer fitted, the way broadcast subtitles do.
           ────────────────────────────────────────────────────────────── */}
           <div className="shrink-0 px-3 pt-3 sm:px-6 sm:pt-4">
-            <div className="relative w-full max-w-5xl mx-auto bg-white rounded-2xl border border-slate-200 shadow-sm px-6 py-5 sm:px-10 sm:py-6 text-center">
+            <div
+              className={`relative w-full max-w-5xl mx-auto rounded-2xl border shadow-sm px-6 py-6 sm:px-10 sm:py-[28.8px] text-center transition-colors ${
+                isDarkCaption ? 'bg-black border-slate-700' : 'bg-white border-slate-200'
+              }`}
+            >
               {latestCaption && !isEditingBox && !hasPartial && (
                 <div className="absolute top-2.5 right-2.5 flex items-center gap-1">
                   <button
                     onClick={() => handleCopyItem(latestCaption)}
-                    className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
+                    className={`p-1.5 rounded-md transition-all ${
+                      isDarkCaption
+                        ? 'text-slate-500 hover:text-white hover:bg-white/10'
+                        : 'text-slate-400 hover:text-slate-700 hover:bg-slate-100'
+                    }`}
                     title="คัดลอกข้อความ"
                   >
-                    {copiedSeq === latestCaption.seq ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                    {copiedSeq === latestCaption.seq ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
                   </button>
                   <button
                     onClick={() => startEditing(latestCaption)}
-                    className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
+                    className={`p-1.5 rounded-md transition-all ${
+                      isDarkCaption
+                        ? 'text-slate-500 hover:text-white hover:bg-white/10'
+                        : 'text-slate-400 hover:text-slate-700 hover:bg-slate-100'
+                    }`}
                     title="แก้ไขคำแปล"
                   >
                     <Edit2 className="w-3.5 h-3.5" />
@@ -851,9 +1026,11 @@ export default function Admin() {
               )}
 
               {!latestCaption && !hasPartial ? (
-                <div className="text-slate-400">
-                  <div className="font-bold text-slate-700 text-sm">พร้อมรับเสียงจากไมโครโฟน</div>
-                  <p className="text-xs text-slate-400 leading-relaxed mt-1">
+                <div className={isDarkCaption ? 'text-slate-500' : 'text-slate-400'}>
+                  <div className={`font-bold text-sm ${isDarkCaption ? 'text-slate-300' : 'text-slate-700'}`}>
+                    พร้อมรับเสียงจากไมโครโฟน
+                  </div>
+                  <p className="text-xs leading-relaxed mt-1">
                     กดปุ่มไมโครโฟนวงกลมกลางจอ จากนั้นพูดใส่ไมโครโฟนเพื่อทำการแปลภาษาแบบเรียลไทม์
                   </p>
                 </div>
@@ -892,20 +1069,38 @@ export default function Admin() {
                     <SubtitleText
                       text={boxSourceText}
                       maxLines={1}
-                      className={`text-base sm:text-lg mb-2 ${hasPartial ? 'text-slate-300' : 'text-slate-400'}`}
+                      className={`text-base sm:text-lg mb-2 ${
+                        isDarkCaption
+                          ? hasPartial ? 'text-slate-600' : 'text-slate-400'
+                          : hasPartial ? 'text-slate-300' : 'text-slate-400'
+                      }`}
                     />
                   )}
                   {boxTargetText ? (
                     <SubtitleText
                       text={boxTargetText}
                       maxLines={2}
-                      className={`${boxTextSizeClass(config.fontSize)} font-bold leading-snug tracking-tight text-black`}
+                      className={`${boxTextSizeClass(config.fontSize)} font-bold leading-snug tracking-tight ${
+                        isDarkCaption ? 'text-white' : 'text-black'
+                      }`}
                     />
                   ) : (
-                    <p className={`${boxTextSizeClass(config.fontSize)} font-normal text-slate-300`}>กำลังแปล…</p>
+                    <p
+                      className={`${boxTextSizeClass(config.fontSize)} font-normal ${
+                        isDarkCaption ? 'text-slate-600' : 'text-slate-300'
+                      }`}
+                    >
+                      กำลังแปล…
+                    </p>
                   )}
                   {config.showLatency && !hasPartial && latestCaption?.latencyMs ? (
-                    <span className="mt-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 font-mono text-[10px] text-slate-500 border border-slate-200">
+                    <span
+                      className={`mt-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-mono text-[10px] border ${
+                        isDarkCaption
+                          ? 'bg-white/5 text-slate-400 border-slate-700'
+                          : 'bg-slate-100 text-slate-500 border-slate-200'
+                      }`}
+                    >
                       <Zap className="w-3 h-3 text-amber-500" />
                       <span>{latestCaption.latencyMs}ms</span>
                     </span>
@@ -961,6 +1156,16 @@ export default function Admin() {
                 <span>กดเพื่อเริ่มอัดเสียงและแปลสด</span>
               )}
             </div>
+
+            {isSessionActive && (
+              <div
+                className="flex items-center gap-1.5 font-mono text-sm font-bold text-slate-700 tabular-nums"
+                title="เวลาที่บันทึกไปแล้วใน session นี้"
+              >
+                <span className={`w-2 h-2 rounded-full ${paused ? 'bg-amber-500' : 'bg-rose-500 animate-pulse'}`} />
+                <span>{formatElapsed(elapsedMs)}</span>
+              </div>
+            )}
 
             <div className="flex items-center gap-2">
               {sessionId && (

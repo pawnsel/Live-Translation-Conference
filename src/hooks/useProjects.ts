@@ -5,7 +5,7 @@ import { PersistError, toPersistError, type PersistFailureReason } from '../data
 import { createProjectsRepo, type ProjectsRepo } from '../data/projectsRepo';
 import { createCaptionQueue } from '../data/captionQueue';
 import { supabase } from '../lib/supabase';
-import { ceilCents } from '../billing/geminiCost';
+import { ceilCents, SERVICE_FEE_USD } from '../billing/geminiCost';
 import { projectCost, projectTranscripts, type LiveBuffer } from '../billing/projectCost';
 
 export const MAX_ACTIVE_PROJECTS = 3;
@@ -44,7 +44,8 @@ function buildBill(project: Project, live: LiveBuffer) {
     sessionCount: closedSessions.length,
     durationMs,
     wordCount: countWords(transcripts),
-    estimatedCost: ceilCents(cost.total),
+    estimatedCost: ceilCents(cost.total) + SERVICE_FEE_USD,
+    serviceFee: SERVICE_FEE_USD,
     costBreakdown: {
       liveMinutes: cost.liveMinutes,
       liveAudioCost: cost.liveAudioCost,
