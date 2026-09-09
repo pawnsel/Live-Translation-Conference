@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Project, ProjectBill, ProjectSession, TranscriptItem } from '../types';
 import { loadSelectedId, saveSelectedId } from '../storage/projectStore';
-import { toPersistError, type PersistFailureReason } from '../data/persistError';
+import { PersistError, toPersistError, type PersistFailureReason } from '../data/persistError';
 import { createProjectsRepo, type ProjectsRepo } from '../data/projectsRepo';
 import { createCaptionQueue } from '../data/captionQueue';
 import { supabase } from '../lib/supabase';
@@ -259,23 +259,59 @@ export function useProjects({ repo, userId = null }: UseProjectsOptions = {}) {
     });
   };
 
+  // Tracks which project ids have had their transcripts eagerly loaded (or
+  // are in flight), shared between the click path (selectProject) and the
+  // restore-on-mount effect below so the two can never race into two
+  // loadProjectTranscripts calls for the same project. Cleared on failure so
+  // a later render gets a real retry instead of silently giving up forever.
+  const transcriptsLoadedFor = useRef<Set<string>>(new Set());
+
+  /** The transcript-loading body shared by selectProject (the click path)
+   *  and the restore-on-mount effect below (the reload path, for a selection
+   *  seeded from localStorage before the server has answered). */
+  const loadProjectTranscriptsInto = useCallback(
+    (id: string) => {
+      transcriptsLoadedFor.current.add(id);
+      return run(async () => {
+        const bySession = await activeRepo.loadProjectTranscripts(id);
+        setProjects((prev) =>
+          prev.map((p) =>
+            p.id === id
+              ? { ...p, sessions: p.sessions.map((s) => ({ ...s, transcripts: bySession[s.id] ?? [] })) }
+              : p
+          )
+        );
+      }).then((ok) => {
+        if (!ok) transcriptsLoadedFor.current.delete(id);
+        return ok;
+      });
+    },
+    [activeRepo, run]
+  );
+
   /** Selecting a project pulls its transcripts in. The running cost badge
    *  prices every session in the current project, so leaving them lazy would
    *  make that number silently undercount. Ended projects in the history list
    *  stay lazy — they are read one summary at a time. */
   const selectProject = async (id: string) => {
     setSelectedProjectId(id);
-    await run(async () => {
-      const bySession = await activeRepo.loadProjectTranscripts(id);
-      setProjects((prev) =>
-        prev.map((p) =>
-          p.id === id
-            ? { ...p, sessions: p.sessions.map((s) => ({ ...s, transcripts: bySession[s.id] ?? [] })) }
-            : p
-        )
-      );
-    });
+    await loadProjectTranscriptsInto(id);
   };
+
+  // A selection restored from localStorage at mount time never goes through
+  // selectProject above, so its sessions can be left with transcripts still
+  // undefined — which projectCost.ts silently reads as "recorded nothing".
+  // Once the initial reload() has populated `projects`, catch up here for
+  // whatever project came back already selected, but only if it actually has
+  // recorded history (itemCount > 0) that hasn't been fetched yet, and only
+  // once per project id.
+  useEffect(() => {
+    if (loading || !currentProject) return;
+    if (transcriptsLoadedFor.current.has(currentProject.id)) return;
+    const needsLoad = currentProject.sessions.some((s) => s.transcripts === undefined && s.itemCount > 0);
+    if (!needsLoad) return;
+    void loadProjectTranscriptsInto(currentProject.id);
+  }, [loading, currentProject, loadProjectTranscriptsInto]);
 
   const clearSelection = () => setSelectedProjectId(null);
 
@@ -284,9 +320,9 @@ export function useProjects({ repo, userId = null }: UseProjectsOptions = {}) {
   // statement that inserts the new one, so this cannot collide with the "one
   // open session" rule and silently drop the new recording.
   const attachAsrSession = async (asrSessionId: string, sourceLang: string, targetLang: string) => {
-    if (!currentProject) return;
+    if (!currentProject) return false;
     const projectId = currentProject.id;
-    await run(async () => {
+    return run(async () => {
       const created = await activeRepo.attachAsrSession(
         projectId,
         asrSessionId,
@@ -333,15 +369,20 @@ export function useProjects({ repo, userId = null }: UseProjectsOptions = {}) {
   const appendCaption = useCallback(
     async (asrSessionId: string, item: TranscriptItem) => {
       const target = findSession(asrSessionId);
-      if (!target) return;
-      updateSessionBy(asrSessionId, (s) => ({
-        ...s,
-        transcripts: [...(s.transcripts ?? []).filter((t) => t.seq !== item.seq), item],
-        itemCount: Math.max(s.itemCount, item.seq)
-      }));
+      if (!target) {
+        // Nowhere to put this caption — a live mic with no attached session,
+        // most likely from a failed attachAsrSession. Reported, not dropped
+        // silently: the operator needs to know the meeting isn't recording.
+        fail(new PersistError('unknown', 'caption ไม่มี session ให้บันทึก'));
+        return;
+      }
+      updateSessionBy(asrSessionId, (s) => {
+        const transcripts = [...(s.transcripts ?? []).filter((t) => t.seq !== item.seq), item];
+        return { ...s, transcripts, itemCount: Math.max(s.itemCount, transcripts.length) };
+      });
       captionQueue.current!.enqueue(target.id, item);
     },
-    [projects]
+    [projects, fail]
   );
 
   const editCaption = useCallback(

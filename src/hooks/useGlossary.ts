@@ -131,6 +131,20 @@ export function useGlossary({ repo, projectId = null }: UseGlossaryOptions = {})
     [activeRepo, guard, ownList]
   );
 
+  /** `sections` is the merge of every subscribed shared list plus the
+   *  project's own, overlaid last (see mergeGlossary), so a delete button
+   *  bound only to `removeTerm` (which always targets `ownList`) silently
+   *  no-ops on a term that actually came from a shared list — the DELETE
+   *  matches zero rows, and the next merge just puts it right back. Callers
+   *  use this to tell the two apart before offering a delete control. */
+  const isOwnTerm = useCallback(
+    (section: GlossarySection, term: string): boolean => {
+      if (!ownList) return false;
+      return Object.prototype.hasOwnProperty.call(termsByList[ownList.id]?.[section] ?? {}, term);
+    },
+    [ownList, termsByList]
+  );
+
   const toggleList = useCallback(
     async (listId: string) => {
       if (!projectId) return;
@@ -155,5 +169,17 @@ export function useGlossary({ repo, projectId = null }: UseGlossaryOptions = {})
     [activeRepo, guard, projectId, subscribedIds]
   );
 
-  return { sections, sharedLists, subscribedIds, ownList, loading, error, addTerm, removeTerm, toggleList, reload: load };
+  return {
+    sections,
+    sharedLists,
+    subscribedIds,
+    ownList,
+    loading,
+    error,
+    addTerm,
+    removeTerm,
+    isOwnTerm,
+    toggleList,
+    reload: load
+  };
 }

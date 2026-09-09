@@ -183,6 +183,49 @@ describe('useProjects — selecting a project', () => {
       expect(result.current.currentProject?.sessions[0].transcripts).toEqual([item])
     );
   });
+
+  // A tab reload seeds selectedProjectId straight from localStorage, which
+  // never goes through selectProject — without a catch-up effect, the
+  // restored project's sessions keep transcripts === undefined and the cost
+  // badge (via projectCost.ts's `transcripts ?? []`) silently treats it as
+  // empty.
+  it('eagerly loads transcripts for a selection restored from localStorage', async () => {
+    const item: TranscriptItem = {
+      seq: 1,
+      sourceText: 'ก',
+      targetText: 'A',
+      sourceLang: 'th',
+      targetLang: 'en',
+      ts: 1767225600,
+      latencyMs: 10,
+      isEdited: false
+    };
+    localStorage.setItem('ai_translate_selected_project', 'proj-1');
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockResolvedValue([project({ sessions: [session({ itemCount: 1 })] })]),
+      loadProjectTranscripts: vi.fn().mockResolvedValue({ 'sess-1': [item] })
+    });
+    const { result } = await renderLoaded(repo);
+
+    expect(result.current.currentProject?.id).toBe('proj-1');
+    await waitFor(() => expect(repo.loadProjectTranscripts).toHaveBeenCalledWith('proj-1'));
+    await waitFor(() =>
+      expect(result.current.currentProject?.sessions[0].transcripts).toEqual([item])
+    );
+  });
+
+  // A session with itemCount 0 has nothing recorded yet, so the restore
+  // effect must not spend a round trip fetching it.
+  it('does not fetch transcripts for a restored project with no recorded items', async () => {
+    localStorage.setItem('ai_translate_selected_project', 'proj-1');
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockResolvedValue([project({ sessions: [session({ itemCount: 0 })] })])
+    });
+    const { result } = await renderLoaded(repo);
+
+    expect(result.current.currentProject?.id).toBe('proj-1');
+    expect(repo.loadProjectTranscripts).not.toHaveBeenCalled();
+  });
 });
 
 describe('useProjects — attachAsrSession', () => {
@@ -252,7 +295,7 @@ describe('useProjects — captions', () => {
     await waitFor(() => expect(result.current.persistError).toMatchObject({ reason: 'network' }));
   }, 20000);
 
-  it('does nothing for a caption whose session is not on the record', async () => {
+  it('reports, rather than silently drops, a caption whose session is not on the record', async () => {
     const repo = fakeRepo();
     const { result } = await renderLoaded(repo);
 
@@ -270,6 +313,34 @@ describe('useProjects — captions', () => {
     });
 
     expect(repo.appendCaption).not.toHaveBeenCalled();
+    expect(result.current.persistError).not.toBeNull();
+  });
+
+  it('counts itemCount from the actual transcript length, not the (0-based, cross-session) seq', async () => {
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockResolvedValue([project({ sessions: [session()] })])
+    });
+    const { result } = await renderLoaded(repo);
+    await act(async () => {
+      await result.current.selectProject('proj-1');
+    });
+
+    // seqRef in useGeminiLiveCapture is 0-based and never resets per session,
+    // so a session's very first caption can easily arrive with seq === 0.
+    await act(async () => {
+      await result.current.appendCaption('local_1', {
+        seq: 0,
+        sourceText: 'ก',
+        targetText: 'A',
+        sourceLang: 'th',
+        targetLang: 'en',
+        ts: 1,
+        latencyMs: 1,
+        isEdited: false
+      });
+    });
+
+    expect(result.current.currentProject?.sessions[0].itemCount).toBe(1);
   });
 });
 

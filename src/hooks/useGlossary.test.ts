@@ -129,6 +129,24 @@ describe('useGlossary', () => {
     await waitFor(() => expect(result.current.subscribedIds.has('list-shared')).toBe(true));
   });
 
+  // removeTerm always targets the project's own list, so a delete button
+  // wired only to it silently no-ops on a shared-origin term (the DELETE
+  // matches zero rows, and the next merge puts the term right back).
+  // isOwnTerm is how callers tell the two apart before offering delete.
+  it('tells a shared-origin term apart from the project\'s own', async () => {
+    const repo = fakeRepo({
+      loadTerms: vi.fn().mockResolvedValue({
+        'list-shared': { ...emptyGlossary(), person_names: { 'สมชาย': 'Somchai' } },
+        'list-own': { ...emptyGlossary(), protected_terms: { 'ภาควิชา': 'Department' } }
+      })
+    });
+    const { result } = await renderLoaded(repo);
+
+    expect(result.current.isOwnTerm('person_names', 'สมชาย')).toBe(false);
+    expect(result.current.isOwnTerm('protected_terms', 'ภาควิชา')).toBe(true);
+    expect(result.current.isOwnTerm('protected_terms', 'ไม่มีคำนี้')).toBe(false);
+  });
+
   it('reports a failed term write instead of silently dropping it', async () => {
     const repo = fakeRepo({ addTerm: vi.fn().mockRejectedValue(new Error('permission denied')) });
     const { result } = await renderLoaded(repo);

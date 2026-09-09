@@ -228,9 +228,13 @@ export default function Admin() {
     setSessionId(id);
     dispatchCaption({ kind: 'reset' });
     setHiddenSeqs(new Set());
-    await projects.attachAsrSession(id, sourceLang, targetLang);
-    setMicActive(true);
+    const ok = await projects.attachAsrSession(id, sourceLang, targetLang);
     setStartingSession(false);
+    if (!ok) {
+      setSessionId(null);
+      return;
+    }
+    setMicActive(true);
   };
 
   // Ending the session flushes whatever audio is still buffered (so the last
@@ -751,6 +755,7 @@ export default function Admin() {
                 disabled={false}
                 onAdd={handleGlossaryAdd}
                 onRemove={handleGlossaryRemove}
+                isOwnTerm={glossaryState.isOwnTerm}
               />
             )}
           </div>

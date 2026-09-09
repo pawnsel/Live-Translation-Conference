@@ -335,13 +335,21 @@ create policy "read shared and own lists" on public.glossary_lists
 drop policy if exists "create own project lists" on public.glossary_lists;
 create policy "create own project lists" on public.glossary_lists
   for insert to authenticated
-  with check (scope = 'project' and owner_id = auth.uid() and public.is_approved());
+  with check (
+    scope = 'project' and owner_id = auth.uid() and public.is_approved() and exists (
+      select 1 from public.projects p where p.id = project_id and p.owner_id = auth.uid()
+    )
+  );
 
 drop policy if exists "update own project lists" on public.glossary_lists;
 create policy "update own project lists" on public.glossary_lists
   for update to authenticated
   using (scope = 'project' and owner_id = auth.uid())
-  with check (scope = 'project' and owner_id = auth.uid() and public.is_approved());
+  with check (
+    scope = 'project' and owner_id = auth.uid() and public.is_approved() and exists (
+      select 1 from public.projects p where p.id = project_id and p.owner_id = auth.uid()
+    )
+  );
 
 drop policy if exists "delete own project lists" on public.glossary_lists;
 create policy "delete own project lists" on public.glossary_lists

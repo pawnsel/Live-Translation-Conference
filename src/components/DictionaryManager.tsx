@@ -38,6 +38,11 @@ export interface DictionaryManagerProps {
   onToggleList: (listId: string) => void;
   onAdd: (section: GlossarySection, abbr: string, full: string) => void;
   onRemove: (section: GlossarySection, abbr: string) => void;
+  /** True when `term` in `section` resolves from the project's own list — as
+   *  opposed to a subscribed shared list, which `onRemove` cannot touch (it
+   *  always targets the project's own list, so deleting a shared-origin term
+   *  would match zero rows and just reappear on the next merge). */
+  isOwnTerm: (section: GlossarySection, term: string) => boolean;
   disabled: boolean;
 }
 
@@ -48,6 +53,7 @@ export default function DictionaryManager({
   onToggleList,
   onAdd,
   onRemove,
+  isOwnTerm,
   disabled
 }: DictionaryManagerProps) {
   const [activeSection, setActiveSection] = useState<GlossarySection>('protected_terms');
@@ -199,22 +205,25 @@ export default function DictionaryManager({
             {entries.length === 0 ? 'ยังไม่มีคำในหมวดนี้' : 'ไม่พบคำที่ค้นหา'}
           </p>
         )}
-        {filteredEntries.map(([term, equivalent]) => (
-          <div key={term} className="flex items-center gap-2 bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs">
-            <span className="flex-1 min-w-0 truncate font-semibold text-slate-800">{term}</span>
-            <span className="text-slate-300 shrink-0">→</span>
-            <span className="flex-1 min-w-0 truncate text-[#DE5C8E] font-medium">{equivalent}</span>
-            <button
-              type="button"
-              onClick={() => handleDeleteRow(term)}
-              disabled={disabled}
-              className="p-1 text-slate-400 hover:text-rose-600 rounded-md hover:bg-rose-50 transition-all disabled:opacity-30 shrink-0"
-              title="ลบคำนี้"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        ))}
+        {filteredEntries.map(([term, equivalent]) => {
+          const isOwn = isOwnTerm(activeSection, term);
+          return (
+            <div key={term} className="flex items-center gap-2 bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs">
+              <span className="flex-1 min-w-0 truncate font-semibold text-slate-800">{term}</span>
+              <span className="text-slate-300 shrink-0">→</span>
+              <span className="flex-1 min-w-0 truncate text-[#DE5C8E] font-medium">{equivalent}</span>
+              <button
+                type="button"
+                onClick={() => handleDeleteRow(term)}
+                disabled={disabled || !isOwn}
+                className="p-1 text-slate-400 hover:text-rose-600 rounded-md hover:bg-rose-50 transition-all disabled:opacity-30 shrink-0"
+                title={isOwn ? 'ลบคำนี้' : 'มาจากคลังคำศัพท์ที่ใช้ร่วมกัน — ลบไม่ได้ที่นี่'}
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          );
+        })}
       </div>
 
       {/* Add a new row */}
