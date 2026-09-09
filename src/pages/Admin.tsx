@@ -25,7 +25,7 @@ import {
   LogOut
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import { useAuth } from '../auth/mockAuth';
+import { useAuth } from '../auth/AuthProvider';
 // ProjectPanel.tsx has NO default export — it exports named components only.
 import {
   BillModal,
@@ -125,18 +125,18 @@ export default function Admin() {
   const [profileOpen, setProfileOpen] = useState(false);
   const [finishedProject, setFinishedProject] = useState<Project | null>(null);
 
-  // The signed-in operator. Mock only — see src/auth/mockAuth.tsx. The header
-  // identifies the account by its email address, which is what the user
+  // The signed-in operator (Supabase — see src/auth/AuthProvider.tsx). The
+  // header identifies the account by its email address, which is what the user
   // actually recognises; the Google display name is secondary.
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
-  const userEmail = user?.email ?? ANONYMOUS_USER_NAME;
+  const userEmail = user?.email || ANONYMOUS_USER_NAME;
   const userPicture = user?.picture;
   const userFullName = [user?.firstName, user?.lastName].filter(Boolean).join(' ') || user?.name || '';
 
-  const handleSignOut = useCallback(() => {
+  const handleSignOut = useCallback(async () => {
     setProfileOpen(false);
-    signOut();
+    await signOut();
     navigate('/login', { replace: true });
   }, [signOut, navigate]);
 

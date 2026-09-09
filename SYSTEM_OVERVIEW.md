@@ -61,11 +61,20 @@
 | `src/glossary.ts` | glossary ใน localStorage + แปลงเป็น `customVocabulary` |
 | `src/pages/Admin.tsx` | หน้าจอควบคุมทั้งหมด |
 | `src/hooks/useProjects.ts` | โปรเจกต์/ประวัติ session (localStorage) |
+| `src/auth/AuthProvider.tsx` | session (Supabase Auth) + สถานะการอนุมัติบัญชี |
+| `src/auth/accountStatus.ts` | กฎโดเมนอีเมลที่สมัครได้ + อ่านสถานะบัญชีจาก DB |
+| `src/pages/Login.tsx` / `Register.tsx` / `AuthCallback.tsx` | เข้าสู่ระบบ, สมัคร (ส่งคำขอ), ปลายทาง OAuth |
+| `supabase/schema.sql` | ตาราง `access_requests`, RLS และฟังก์ชัน `get_account_status` |
+
+รายละเอียดการติดตั้งฝั่ง Supabase อยู่ใน `docs/supabase-auth-setup.md`
 
 ### 1.4 ตัวแปรสภาพแวดล้อม (`.env`)
 
 | ตัวแปร | ค่าเริ่มต้น | ใช้ทำอะไร |
 |---|---|---|
+| `VITE_SUPABASE_URL` | — (ต้องกำหนด) | URL ของโปรเจกต์ Supabase (อ่านจาก browser) |
+| `VITE_SUPABASE_ANON_KEY` | — (ต้องกำหนด) | anon key ของ Supabase — ปลอดภัยเพราะมี RLS กำกับ |
+| `VITE_ALLOWED_EMAIL_DOMAIN` | `chula.ac.th` | โดเมนอีเมลที่สมัครสมาชิกได้ (รวมโดเมนย่อย) |
 | `GEMINI_API_KEY` | — (ต้องกำหนด) | กุญแจเรียก Gemini ทุกเส้นทาง |
 | `GEMINI_LIVE_MODEL` | `gemini-3.5-live-translate-preview` | โมเดลแปลสดผ่าน WebSocket |
 | `GEMINI_MODEL` | `gemini-3.6-flash` | โมเดลข้อความสำหรับสรุปผล |
