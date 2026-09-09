@@ -1,10 +1,9 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Project, ProjectBill, ProjectSession, TranscriptItem } from '../types';
-import {
-  localStorageProjectStore,
-  type PersistFailureReason,
-  type ProjectStore
-} from '../storage/projectStore';
+import { loadSelectedId, saveSelectedId } from '../storage/projectStore';
+import { toPersistError, type PersistFailureReason } from '../data/persistError';
+import { createProjectsRepo, type ProjectsRepo } from '../data/projectsRepo';
+import { supabase } from '../lib/supabase';
 import { ceilCents } from '../billing/geminiCost';
 import { projectCost, projectTranscripts, type LiveBuffer } from '../billing/projectCost';
 
@@ -56,47 +55,119 @@ function buildBill(project: Project, live: LiveBuffer) {
   return { closedSessions, bill, transcripts };
 }
 
-export function useProjects(store: ProjectStore = localStorageProjectStore) {
-  const [projects, setProjects] = useState<Project[]>(() => store.loadProjects());
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(() => store.loadSelectedId());
+export interface UseProjectsOptions {
+  /** Injected in tests. Defaults to the live Supabase-backed repo. */
+  repo?: ProjectsRepo;
+  /** The signed-in, approved account. Null means "load nothing and hold
+   *  nothing" — a signed-out console on a shared machine must not still be
+   *  showing the last person's meetings. */
+  userId?: string | null;
+}
+
+const defaultRepo = () => createProjectsRepo(supabase as never);
+
+export function useProjects({ repo, userId = null }: UseProjectsOptions = {}) {
+  const activeRepo = useMemo(() => repo ?? defaultRepo(), [repo]);
+
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(() => loadSelectedId());
   const [summarizingIds, setSummarizingIds] = useState<Set<string>>(() => new Set());
   // A write that fails is the operator's problem, not something to hide: with
-  // no signal here a full quota looks exactly like a working recording.
+  // no signal here a refused write looks exactly like a working recording.
   const [persistError, setPersistError] = useState<{
     reason: PersistFailureReason;
     message: string;
     at: number;
   } | null>(null);
 
-  useEffect(() => {
-    const result = store.saveProjects(projects);
-    // Narrows on `'reason' in result` rather than `result.ok`: this repo's
-    // tsconfig has no strictNullChecks, and without it TS won't narrow a
-    // discriminated union across a boolean literal tag, only a property
-    // presence check.
-    setPersistError('reason' in result ? { reason: result.reason, message: result.message, at: Date.now() } : null);
-  }, [projects, store]);
+  const fail = useCallback((error: unknown) => {
+    const persist = toPersistError(error);
+    setPersistError({ reason: persist.reason, message: persist.message, at: Date.now() });
+  }, []);
+
+  // ── Loading ───────────────────────────────────────────────────────────────
+  const loadSeq = useRef(0);
+
+  const reload = useCallback(async () => {
+    const seq = ++loadSeq.current;
+    if (!userId) {
+      setProjects([]);
+      setLoading(false);
+      return;
+    }
+    try {
+      const loaded = await activeRepo.listProjects();
+      if (seq !== loadSeq.current) return; // a newer load superseded this one
+      setProjects(loaded);
+      setPersistError(null);
+    } catch (error) {
+      if (seq === loadSeq.current) fail(error);
+    } finally {
+      if (seq === loadSeq.current) setLoading(false);
+    }
+  }, [activeRepo, userId, fail]);
 
   useEffect(() => {
-    const result = store.saveSelectedId(selectedProjectId);
-    if ('reason' in result) setPersistError({ reason: result.reason, message: result.message, at: Date.now() });
-  }, [selectedProjectId, store]);
+    setLoading(true);
+    void reload();
+  }, [reload]);
 
+  /** Runs a mutation, and on failure raises the banner and resyncs from the
+   *  server rather than leaving an optimistic edit the database never took.
+   *
+   *  The resync is awaited before the banner is raised, not fired off in the
+   *  background: reload()'s own success path clears persistError (a clean
+   *  load has nothing to report), so a resync left running after fail() sets
+   *  the error would race it and could silently wipe the banner the moment it
+   *  completes. Awaiting first means the banner set below is always the last
+   *  write. */
+  const run = useCallback(
+    async (mutate: () => Promise<void>) => {
+      try {
+        await mutate();
+        return true;
+      } catch (error) {
+        await reload();
+        fail(error);
+        return false;
+      }
+    },
+    [fail, reload]
+  );
+
+  useEffect(() => {
+    saveSelectedId(selectedProjectId);
+  }, [selectedProjectId]);
+
+  // Tracks which auto-finished projects have already had their finishProject
+  // write issued, so a re-render or a StrictMode double-invoke of the pure
+  // updater below can never fire the write twice for the same expiry.
+  const syncedAutoFinishIds = useRef<Set<string>>(new Set());
+
+  // ── Expiry sweep ──────────────────────────────────────────────────────────
   // A project must be finished within 7 days; past that the system closes it
   // and bills it from whatever it recorded, rather than letting it run forever.
+  // Still client-side, so it only runs while someone has the console open —
+  // see the follow-ups in the design doc.
+  //
+  // The updater below is deliberately pure — no repo call inside it. React
+  // may invoke a state updater more than once for the same update (notably
+  // under StrictMode), so any side effect placed there would risk firing
+  // twice. The actual write happens in the effect further down, which is
+  // idempotent by construction (guarded by syncedAutoFinishIds).
   const sweepExpired = useCallback(() => {
+    const now = Date.now();
     setProjects((prev) => {
-      const now = Date.now();
-      let changed = false;
-      const swept = prev.map((p) => {
+      const anyExpired = prev.some((p) => p.status === 'active' && now >= projectExpiresAt(p));
+      if (!anyExpired) return prev;
+      return prev.map((p) => {
         if (p.status !== 'active' || now < projectExpiresAt(p)) return p;
-        changed = true;
         // Nothing is holding a live buffer here — a sweep runs on a timer,
         // not off the console — so every session bills from its own record.
         const { closedSessions, bill } = buildBill(p, { transcripts: [], asrSessionId: null, now });
         return { ...p, status: 'ended' as const, sessions: closedSessions, endedAt: now, bill, autoFinished: true };
       });
-      return changed ? swept : prev;
     });
   }, []);
 
@@ -106,6 +177,21 @@ export function useProjects(store: ProjectStore = localStorageProjectStore) {
     return () => clearInterval(timer);
   }, [sweepExpired]);
 
+  // Fires the finishProject write for a project the sweep above just closed,
+  // exactly once per project id — decoupled from the state updater so it can
+  // stay pure. The ref survives re-renders, so this is safe even if the
+  // effect itself re-runs.
+  useEffect(() => {
+    for (const p of projects) {
+      if (p.status === 'ended' && p.autoFinished && p.bill && !syncedAutoFinishIds.current.has(p.id)) {
+        syncedAutoFinishIds.current.add(p.id);
+        const openIds = p.sessions.filter((s) => !s.endedAt).map((s) => s.id);
+        void run(() => activeRepo.finishProject(p.id, p.bill!, p.endedAt ?? Date.now(), openIds));
+      }
+    }
+  }, [projects, activeRepo, run]);
+
+  // ── Derived ───────────────────────────────────────────────────────────────
   const activeProjects = projects.filter((p) => p.status === 'active');
   const endedProjects = projects
     .filter((p) => p.status === 'ended')
@@ -115,188 +201,232 @@ export function useProjects(store: ProjectStore = localStorageProjectStore) {
   const activeSession = currentProject?.sessions.find((s) => !s.endedAt);
   const canCreateProject = activeProjects.length < MAX_ACTIVE_PROJECTS;
 
-  const createProject = (name: string) => {
-    if (!canCreateProject) return;
-    const project: Project = {
-      id: `proj_${Date.now()}`,
-      name: name.trim(),
-      status: 'active',
-      sessions: [],
-      transcripts: [],
-      createdAt: Date.now()
-    };
-    setProjects((prev) => [project, ...prev]);
-    setSelectedProjectId(project.id);
+  /** Applies `change` to whichever session recorded `asrSessionId`, wherever
+   *  it lives. Searched inside the updater rather than gated on
+   *  currentProject, so it stays correct if the selection moved on while a
+   *  request was in flight. */
+  const updateSessionBy = (
+    asrSessionId: string,
+    change: (session: ProjectSession) => ProjectSession
+  ) => {
+    setProjects((prev) =>
+      prev.map((p) => {
+        const idx = p.sessions.findIndex((s) => s.asrSessionId === asrSessionId);
+        if (idx === -1) return p;
+        const sessions = p.sessions.slice();
+        sessions[idx] = change(sessions[idx]);
+        return { ...p, sessions };
+      })
+    );
   };
 
-  const selectProject = (id: string) => setSelectedProjectId(id);
+  const findSession = (asrSessionId: string): ProjectSession | undefined =>
+    projects.flatMap((p) => p.sessions).find((s) => s.asrSessionId === asrSessionId);
+
+  // ── Actions ───────────────────────────────────────────────────────────────
+  const createProject = async (name: string) => {
+    if (!canCreateProject) return;
+    await run(async () => {
+      const created = await activeRepo.createProject(name);
+      setProjects((prev) => [created, ...prev]);
+      setSelectedProjectId(created.id);
+    });
+  };
+
+  /** Selecting a project pulls its transcripts in. The running cost badge
+   *  prices every session in the current project, so leaving them lazy would
+   *  make that number silently undercount. Ended projects in the history list
+   *  stay lazy — they are read one summary at a time. */
+  const selectProject = async (id: string) => {
+    setSelectedProjectId(id);
+    await run(async () => {
+      const bySession = await activeRepo.loadProjectTranscripts(id);
+      setProjects((prev) =>
+        prev.map((p) =>
+          p.id === id
+            ? { ...p, sessions: p.sessions.map((s) => ({ ...s, transcripts: bySession[s.id] ?? [] })) }
+            : p
+        )
+      );
+    });
+  };
+
   const clearSelection = () => setSelectedProjectId(null);
 
-  const startSession = (asrSessionId: string, sourceLang: string, targetLang: string) => {
-    if (!currentProject || activeSession) return;
-    const session: ProjectSession = {
-      id: `sess_${Date.now()}`,
-      asrSessionId,
-      startedAt: Date.now(),
-      sourceLang,
-      targetLang
-    };
-    setProjects((prev) =>
-      prev.map((p: Project) => (p.id === currentProject.id ? { ...p, sessions: [...p.sessions, session] } : p))
-    );
-  };
-
-  const endSession = () => {
-    if (!currentProject || !activeSession) return;
-    setProjects((prev) =>
-      prev.map((p: Project) =>
-        p.id === currentProject.id
-          ? {
-              ...p,
-              sessions: p.sessions.map((s) => (s.id === activeSession.id ? { ...s, endedAt: Date.now() } : s))
-            }
-          : p
-      )
-    );
-  };
-
-  // A project outlives many ASR sessions: the Python registry is in memory,
-  // so a backend restart forces a new session id under the same project.
-  // Any session left open by the old id (e.g. the backend restarted rather
-  // than the console cleanly detaching) is closed in this same update, so
-  // this can't collide with startSession's "already have an open session"
-  // guard and silently drop the new recording.
-  const attachAsrSession = (asrSessionId: string, sourceLang: string, targetLang: string) => {
+  // A project outlives many capture sessions: a dropped websocket reconnects
+  // under a new id. Any session left open by the old id is closed by the same
+  // statement that inserts the new one, so this cannot collide with the "one
+  // open session" rule and silently drop the new recording.
+  const attachAsrSession = async (asrSessionId: string, sourceLang: string, targetLang: string) => {
     if (!currentProject) return;
-    const now = Date.now();
-    const session: ProjectSession = {
-      id: `sess_${now}`,
-      asrSessionId,
-      startedAt: now,
-      sourceLang,
-      targetLang
-    };
-    setProjects((prev) =>
-      prev.map((p: Project) =>
-        p.id === currentProject.id
-          ? {
-              ...p,
-              asrSessionId,
-              sessions: [...p.sessions.map((s) => (s.endedAt ? s : { ...s, endedAt: now })), session]
-            }
-          : p
-      )
-    );
-  };
-
-  const detachAsrSession = () => {
-    if (!currentProject) return;
-    endSession();
-    setProjects((prev) =>
-      prev.map((p: Project) => (p.id === currentProject.id ? { ...p, asrSessionId: null } : p))
-    );
-  };
-
-  // Mirrors the live server buffer into the selected project, so each project
-  // keeps its own transcript and its own bill.
-  const saveTranscripts = useCallback((projectId: string, transcripts: TranscriptItem[]) => {
-    setProjects((prev) => prev.map((p: Project) => (p.id === projectId ? { ...p, transcripts } : p)));
-  }, []);
-
-  // Keeps each session's own captions with the session record, so the
-  // operator can ask for its summary minutes or days later — summarising is
-  // on demand, not something that fires the moment a session ends.
-  const saveSessionTranscript = useCallback((asrSessionId: string, transcripts: TranscriptItem[]) => {
-    setProjects((prev) =>
-      prev.map((p) => {
-        const idx = p.sessions.findIndex((s) => s.asrSessionId === asrSessionId);
-        if (idx === -1) return p;
-        const sessions = p.sessions.slice();
-        sessions[idx] = { ...sessions[idx], transcripts };
-        return { ...p, sessions };
-      })
-    );
-  }, []);
-
-  // Attaches a summary to whichever ProjectSession recorded that ASR
-  // session, wherever it lives — searched by `asrSessionId` inside the
-  // updater rather than gated on `currentProject`, so it stays correct even
-  // if the summary resolves after the project selection moved on.
-  // No P2 database exists yet, so this is the "mock" persistence: the same
-  // localStorage record every other project field already rides on.
-  const saveSessionSummary = useCallback((asrSessionId: string, summary: string, reportItemCount: number) => {
-    setSummarizingIds((prev) => {
-      if (!prev.has(asrSessionId)) return prev;
-      const next = new Set(prev);
-      next.delete(asrSessionId);
-      return next;
+    const projectId = currentProject.id;
+    await run(async () => {
+      const created = await activeRepo.attachAsrSession(
+        projectId,
+        asrSessionId,
+        sourceLang,
+        targetLang
+      );
+      const now = Date.now();
+      setProjects((prev) =>
+        prev.map((p) =>
+          p.id === projectId
+            ? {
+                ...p,
+                asrSessionId,
+                sessions: [...p.sessions.map((s) => (s.endedAt ? s : { ...s, endedAt: now })), created]
+              }
+            : p
+        )
+      );
     });
-    setProjects((prev) =>
-      prev.map((p) => {
-        const idx = p.sessions.findIndex((s) => s.asrSessionId === asrSessionId);
-        if (idx === -1) return p;
-        const sessions = p.sessions.slice();
-        sessions[idx] = { ...sessions[idx], summary, reportItemCount };
-        return { ...p, sessions };
-      })
-    );
-  }, []);
+  };
+
+  const endSession = async () => {
+    if (!currentProject || !activeSession) return;
+    const sessionId = activeSession.id;
+    await run(async () => {
+      await activeRepo.endSession(sessionId);
+      updateSessionBy(activeSession.asrSessionId, (s) => ({ ...s, endedAt: Date.now() }));
+    });
+  };
+
+  const detachAsrSession = async () => {
+    if (!currentProject) return;
+    const projectId = currentProject.id;
+    await endSession();
+    await run(async () => {
+      await activeRepo.detachAsrSession(projectId);
+      setProjects((prev) => prev.map((p) => (p.id === projectId ? { ...p, asrSessionId: null } : p)));
+    });
+  };
+
+  /** One closed caption, written as it happens. A crashed tab now loses at
+   *  most the sentence in flight instead of the whole meeting. */
+  const appendCaption = useCallback(
+    async (asrSessionId: string, item: TranscriptItem) => {
+      const target = findSession(asrSessionId);
+      if (!target) return;
+      await run(async () => {
+        await activeRepo.appendCaption(target.id, item);
+        updateSessionBy(asrSessionId, (s) => ({
+          ...s,
+          transcripts: [...(s.transcripts ?? []).filter((t) => t.seq !== item.seq), item],
+          itemCount: Math.max(s.itemCount, item.seq)
+        }));
+      });
+    },
+    [activeRepo, run, projects]
+  );
+
+  const editCaption = useCallback(
+    async (asrSessionId: string, seq: number, targetText: string) => {
+      const target = findSession(asrSessionId);
+      if (!target) return;
+      await run(async () => {
+        await activeRepo.editCaption(target.id, seq, targetText);
+        updateSessionBy(asrSessionId, (s) => ({
+          ...s,
+          transcripts: (s.transcripts ?? []).map((t) =>
+            t.seq === seq ? { ...t, targetText, isEdited: true } : t
+          )
+        }));
+      });
+    },
+    [activeRepo, run, projects]
+  );
+
+  /** Fetches one ended session's captions on demand, so the history list can
+   *  stay cheap until a summary is actually asked for. */
+  const loadSessionTranscript = useCallback(
+    async (asrSessionId: string): Promise<TranscriptItem[]> => {
+      const target = findSession(asrSessionId);
+      if (!target) return [];
+      if (target.transcripts) return target.transcripts;
+      let items: TranscriptItem[] = [];
+      await run(async () => {
+        items = await activeRepo.loadSessionTranscript(target.id);
+        updateSessionBy(asrSessionId, (s) => ({ ...s, transcripts: items }));
+      });
+      return items;
+    },
+    [activeRepo, run, projects]
+  );
 
   // Summarising is a request that can take many seconds, so the history view
-  // needs to tell "still working on it" apart from "not summarised yet".
-  // Deliberately NOT persisted: a reload kills the in-flight request, and a
-  // flag stored in localStorage would leave that session showing a spinner
-  // forever.
-  const markSessionSummarizing = useCallback((asrSessionId: string) => {
-    setSummarizingIds((prev) => new Set(prev).add(asrSessionId));
-    // The run counter, unlike the spinner, IS persisted: every attempt spends
-    // tokens whether or not it comes back with a summary, and the cost
-    // estimate would understate the bill if a retry cost nothing.
-    setProjects((prev) =>
-      prev.map((p) => {
-        const idx = p.sessions.findIndex((s) => s.asrSessionId === asrSessionId);
-        if (idx === -1) return p;
-        const sessions = p.sessions.slice();
-        sessions[idx] = { ...sessions[idx], summarizeRuns: (sessions[idx].summarizeRuns ?? 0) + 1 };
-        return { ...p, sessions };
-      })
-    );
-  }, []);
+  // needs to tell "still working on it" apart from "not summarised yet". The
+  // spinner is deliberately NOT persisted — a reload kills the in-flight
+  // request, and a stored flag would spin forever. The run COUNTER is
+  // persisted: every attempt spends tokens whether or not a summary comes
+  // back, and the estimate would understate the bill if a retry cost nothing.
+  const markSessionSummarizing = useCallback(
+    async (asrSessionId: string) => {
+      const target = findSession(asrSessionId);
+      if (!target) return;
+      const runs = (target.summarizeRuns ?? 0) + 1;
+      setSummarizingIds((prev) => new Set(prev).add(asrSessionId));
+      await run(async () => {
+        await activeRepo.markSummarizing(target.id, runs);
+        updateSessionBy(asrSessionId, (s) => ({ ...s, summarizeRuns: runs }));
+      });
+    },
+    [activeRepo, run, projects]
+  );
+
+  const saveSessionSummary = useCallback(
+    async (asrSessionId: string, summary: string, reportItemCount: number) => {
+      const target = findSession(asrSessionId);
+      setSummarizingIds((prev) => {
+        if (!prev.has(asrSessionId)) return prev;
+        const next = new Set(prev);
+        next.delete(asrSessionId);
+        return next;
+      });
+      if (!target) return;
+      await run(async () => {
+        // '' is a real value here — it records that the AI call failed, which
+        // is different from nobody having asked.
+        await activeRepo.saveSummary(target.id, summary, reportItemCount);
+        updateSessionBy(asrSessionId, (s) => ({ ...s, summary, reportItemCount }));
+      });
+    },
+    [activeRepo, run, projects]
+  );
 
   /** `liveTranscripts` are the captions of the session that was just stopped,
    *  and `liveAsrSessionId` names which session they belong to. Naming it
-   *  matters: the bill is priced per session now, and whether that session's
-   *  own transcript has been written to the record yet is a race this must
-   *  not depend on. */
-  const finishProject = (
+   *  matters: the bill is priced per session, and whether that session's own
+   *  transcript has reached the record yet is a race this must not depend on. */
+  const finishProject = async (
     liveTranscripts: TranscriptItem[],
     liveAsrSessionId: string | null
-  ): Project | undefined => {
+  ): Promise<Project | undefined> => {
     if (!currentProject) return undefined;
 
     const now = Date.now();
     const live: LiveBuffer = { transcripts: liveTranscripts, asrSessionId: liveAsrSessionId, now };
+    const { closedSessions, bill, transcripts } = buildBill(currentProject, live);
+    const openIds = currentProject.sessions.filter((s) => !s.endedAt).map((s) => s.id);
+    const projectId = currentProject.id;
+
+    const ok = await run(() => activeRepo.finishProject(projectId, bill, now, openIds));
+    if (!ok) return undefined;
 
     setProjects((prev) =>
-      prev.map((p: Project) => {
-        if (p.id !== currentProject.id) return p;
-        // Built from the freshest record rather than the render-time copy:
-        // finishing a project stops the live session first, and that write
-        // (the session's own transcript) must survive this one.
-        const { closedSessions, bill, transcripts } = buildBill(p, live);
-        return { ...p, status: 'ended' as const, sessions: closedSessions, transcripts, endedAt: now, bill };
-      })
+      prev.map((p) =>
+        p.id === projectId
+          ? { ...p, status: 'ended' as const, sessions: closedSessions, transcripts, endedAt: now, bill, asrSessionId: null }
+          : p
+      )
     );
     setSelectedProjectId(null);
 
-    // What the bill modal shows. The numbers match the record written above:
-    // both price the same sessions from the same live buffer, and the only
-    // thing the newer write adds is that buffer, which `live` supplies here.
-    const { closedSessions, bill, transcripts } = buildBill(currentProject, live);
+    // What the bill modal shows — the same numbers just written.
     return { ...currentProject, status: 'ended', sessions: closedSessions, transcripts, endedAt: now, bill };
   };
 
   return {
+    loading,
     activeProjects,
     endedProjects,
     currentProject,
@@ -305,16 +435,17 @@ export function useProjects(store: ProjectStore = localStorageProjectStore) {
     createProject,
     selectProject,
     clearSelection,
-    startSession,
     attachAsrSession,
     detachAsrSession,
     endSession,
-    saveTranscripts,
-    saveSessionTranscript,
+    appendCaption,
+    editCaption,
+    loadSessionTranscript,
     saveSessionSummary,
     markSessionSummarizing,
     summarizingIds,
     persistError,
+    reload,
     finishProject
   };
 }
