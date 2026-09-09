@@ -36,10 +36,15 @@ export interface ProjectSession {
    *  `Project` already uses — undefined means "never summarised", never
    *  "the summary failed": a failed AI summary is stored as "". */
   summary?: string;
-  /** Captions recorded during this session, kept so a summary can be asked
-   *  for long after the session ended. Undefined for sessions recorded
-   *  before summaries became on-demand. */
+  /** Captions recorded during this session. Loaded on demand — undefined
+   *  means "not fetched yet", NOT "this session recorded nothing". Use
+   *  `itemCount` to tell those apart. */
   transcripts?: TranscriptItem[];
+  /** How many transcript rows this session holds. Always known, because it
+   *  comes from a denormalised column; `transcripts` is loaded on demand and
+   *  stays undefined until something needs the text. Sessions in the ended
+   *  history are listed by this number without fetching a single caption. */
+  itemCount: number;
   /** Items sent to the summariser, so an empty `summary` (the AI call
    *  failed) can still say "N ข้อความถูกบันทึกไว้" instead of nothing. */
   reportItemCount?: number;
