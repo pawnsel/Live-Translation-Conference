@@ -215,15 +215,22 @@ export default function Admin() {
   // ── Session + mic as one combined "Session" toggle, matching the original
   //    single Start/Stop button ─────────────────────────────────────────────
   const [endingSession, setEndingSession] = useState(false);
+  const [startingSession, setStartingSession] = useState(false);
 
   const startSessionAndMic = async () => {
-    if (micActive) return;
+    // Guard set synchronously, before the await below — otherwise a rapid
+    // double-click re-enters this function while attachAsrSession is still
+    // in flight, generating a second sessionId and a second concurrent
+    // attach call. Mirrors the endingSession guard on the stop path.
+    if (micActive || startingSession) return;
+    setStartingSession(true);
     const id = `local_${Date.now()}`;
     setSessionId(id);
     dispatchCaption({ kind: 'reset' });
     setHiddenSeqs(new Set());
     await projects.attachAsrSession(id, sourceLang, targetLang);
     setMicActive(true);
+    setStartingSession(false);
   };
 
   // Ending the session flushes whatever audio is still buffered (so the last
@@ -897,7 +904,7 @@ export default function Admin() {
           <div className="flex-1 flex flex-col items-center justify-center gap-4 p-4 min-h-0">
             <button
               onClick={isSessionActive ? stopSessionAndMic : startSessionAndMic}
-              disabled={capture.status === 'starting' || endingSession}
+              disabled={capture.status === 'starting' || endingSession || startingSession}
               aria-label={isSessionActive ? 'จบ Session (หยุดอัดเสียง)' : 'เริ่ม Session (อัดเสียง)'}
               title={isSessionActive ? 'จบ Session' : 'เริ่ม Session'}
               className={`relative w-28 h-28 sm:w-36 sm:h-36 rounded-full flex items-center justify-center transition-all shadow-lg ring-8 disabled:opacity-60 disabled:cursor-not-allowed ${
