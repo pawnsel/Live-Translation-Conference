@@ -44,7 +44,7 @@ export function createFakeSupabase(results: FakeResult[] = []) {
         call.payload = payload;
         return chain;
       },
-      upsert(payload: unknown) {
+      upsert(payload: unknown, _options?: unknown) {
         call.op = 'upsert';
         call.payload = payload;
         return chain;

@@ -11,7 +11,7 @@
 
 import type { Project, ProjectBill, ProjectSession, TranscriptItem } from '../types';
 import type { QueryClient } from './queryClient';
-import { PersistError, toPersistError } from './persistError';
+import { toPersistError } from './persistError';
 import {
   fromTranscriptItem,
   toProject,
@@ -189,18 +189,45 @@ export function createProjectsRepo(client: QueryClient): ProjectsRepo {
       );
     },
 
-    // Implemented in Task 6.
-    async appendCaption() {
-      throw new PersistError('unknown', 'not implemented');
+    async appendCaption(sessionId, item) {
+      // Upsert rather than insert: a caption whose write timed out may have
+      // landed anyway, and the retry queue must not deadlock on a duplicate
+      // key. (session_id, seq) is the primary key, so this is idempotent.
+      unwrap(
+        await client
+          .from('transcript_items')
+          .upsert(fromTranscriptItem(sessionId, item), { onConflict: 'session_id,seq' })
+      );
     },
-    async editCaption() {
-      throw new PersistError('unknown', 'not implemented');
+
+    async editCaption(sessionId, seq, targetText) {
+      unwrap(
+        await client
+          .from('transcript_items')
+          .update({ target_text: targetText, is_edited: true })
+          .eq('session_id', sessionId)
+          .eq('seq', seq)
+      );
     },
-    async markSummarizing() {
-      throw new PersistError('unknown', 'not implemented');
+
+    async markSummarizing(sessionId, runs) {
+      // Counted by the caller, which knows the previous value. Postgres has no
+      // "increment" through PostgREST without an RPC, and the count only has
+      // to be right, not race-proof: one operator, one console.
+      unwrap(
+        await client.from('project_sessions').update({ summarize_runs: runs }).eq('id', sessionId)
+      );
     },
-    async saveSummary() {
-      throw new PersistError('unknown', 'not implemented');
+
+    async saveSummary(sessionId, summary, reportItemCount) {
+      // `summary` may legitimately be '' — that is how a failed AI call is
+      // recorded. It must not become null on the way to the column.
+      unwrap(
+        await client
+          .from('project_sessions')
+          .update({ summary, report_item_count: reportItemCount })
+          .eq('id', sessionId)
+      );
     }
   };
 }

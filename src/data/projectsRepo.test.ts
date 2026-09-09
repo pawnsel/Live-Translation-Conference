@@ -279,3 +279,98 @@ describe('projectsRepo.finishProject', () => {
     expect(fake.calls[0].table).toBe('projects');
   });
 });
+
+const caption = {
+  seq: 7,
+  sourceText: 'สวัสดีครับ',
+  targetText: 'Hello',
+  sourceLang: 'th',
+  targetLang: 'en',
+  ts: Date.parse('2026-01-01T00:10:00.000Z') / 1000,
+  latencyMs: 250,
+  isEdited: false
+};
+
+describe('projectsRepo.appendCaption', () => {
+  it('upserts one row keyed by (session_id, seq)', async () => {
+    const fake = createFakeSupabase([{ data: null }]);
+
+    await createProjectsRepo(fake.client).appendCaption('sess-1', caption);
+
+    // Upsert, not insert: a retry after a timeout that actually succeeded
+    // must not fail on the primary key and strand the retry queue.
+    expect(fake.calls[0]).toMatchObject({
+      table: 'transcript_items',
+      op: 'upsert',
+      payload: {
+        session_id: 'sess-1',
+        seq: 7,
+        source_text: 'สวัสดีครับ',
+        target_text: 'Hello',
+        ts: '2026-01-01T00:10:00.000Z',
+        latency_ms: 250,
+        is_edited: false
+      }
+    });
+  });
+
+  it('throws a classified error when the write is refused', async () => {
+    const fake = createFakeSupabase([{ error: new TypeError('Failed to fetch') }]);
+    await expect(
+      createProjectsRepo(fake.client).appendCaption('sess-1', caption)
+    ).rejects.toMatchObject({ reason: 'network' });
+  });
+});
+
+describe('projectsRepo.editCaption', () => {
+  it('updates one row and marks it edited', async () => {
+    const fake = createFakeSupabase([{ data: null }]);
+
+    await createProjectsRepo(fake.client).editCaption('sess-1', 7, 'Good morning');
+
+    expect(fake.calls[0]).toMatchObject({
+      table: 'transcript_items',
+      op: 'update',
+      payload: { target_text: 'Good morning', is_edited: true },
+      filters: [
+        { kind: 'eq', column: 'session_id', value: 'sess-1' },
+        { kind: 'eq', column: 'seq', value: 7 }
+      ]
+    });
+  });
+});
+
+describe('projectsRepo.markSummarizing', () => {
+  // The run counter is persisted even though the spinner is not: every
+  // attempt spends tokens, so a retry that fails must still be billed.
+  it('writes the caller-computed run count', async () => {
+    const fake = createFakeSupabase([{ data: null }]);
+    await createProjectsRepo(fake.client).markSummarizing('sess-1', 3);
+    expect(fake.calls[0]).toMatchObject({
+      table: 'project_sessions',
+      op: 'update',
+      payload: { summarize_runs: 3 },
+      filters: [{ kind: 'eq', column: 'id', value: 'sess-1' }]
+    });
+  });
+});
+
+describe('projectsRepo.saveSummary', () => {
+  it('stores a real summary with the item count sent to the summariser', async () => {
+    const fake = createFakeSupabase([{ data: null }]);
+    await createProjectsRepo(fake.client).saveSummary('sess-1', 'สรุปการประชุม', 42);
+    expect(fake.calls[0]).toMatchObject({
+      table: 'project_sessions',
+      op: 'update',
+      payload: { summary: 'สรุปการประชุม', report_item_count: 42 }
+    });
+  });
+
+  // '' must reach the column as '', never as null: null would read back as
+  // "nobody asked for a summary" and hide the failure from the operator.
+  it('stores a failed summary as an empty string, not null', async () => {
+    const fake = createFakeSupabase([{ data: null }]);
+    await createProjectsRepo(fake.client).saveSummary('sess-1', '', 42);
+    expect((fake.calls[0].payload as { summary: unknown }).summary).toBe('');
+  });
+});

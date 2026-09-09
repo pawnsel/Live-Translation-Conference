@@ -19,7 +19,7 @@ export interface QueryResult<T = unknown> {
 export interface QueryBuilder {
   select(columns?: string): QueryBuilder;
   insert(payload: unknown): QueryBuilder;
-  upsert(payload: unknown): QueryBuilder;
+  upsert(payload: unknown, options?: { onConflict?: string }): QueryBuilder;
   update(payload: unknown): QueryBuilder;
   delete(): QueryBuilder;
   eq(column: string, value: unknown): QueryBuilder;
