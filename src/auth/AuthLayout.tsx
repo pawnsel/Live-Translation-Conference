@@ -19,7 +19,7 @@ export default function AuthLayout({ children }: { children: ReactNode }) {
           <div className="w-9 h-9 rounded-xl bg-white/15 flex items-center justify-center backdrop-blur-xs">
             <Sparkles className="w-5 h-5" />
           </div>
-          <span className="font-bold tracking-tight">AI Live Translator</span>
+          <span className="font-bold tracking-tight">Live Translation</span>
         </div>
 
         <div>
@@ -54,7 +54,7 @@ export default function AuthLayout({ children }: { children: ReactNode }) {
             <div className="w-9 h-9 rounded-xl bg-[#DE5C8E] flex items-center justify-center text-white">
               <Sparkles className="w-5 h-5" />
             </div>
-            <span className="font-bold tracking-tight text-slate-900">AI Live Translator</span>
+            <span className="font-bold tracking-tight text-slate-900">Live Translation</span>
           </div>
           {children}
         </div>

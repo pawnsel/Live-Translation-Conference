@@ -46,7 +46,7 @@ function billToPdf(project: Project, bill: ProjectBill): jsPDF {
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(18);
   doc.setTextColor(PDF_ACCENT);
-  doc.text('AI Live Translator', PDF_MARGIN_X, y);
+  doc.text('Live Translation', PDF_MARGIN_X, y);
 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(10);

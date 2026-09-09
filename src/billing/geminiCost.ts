@@ -192,9 +192,17 @@ export function liveSessionCost(durationMs: number, transcripts: TranscriptItem[
 
 /** What one summarise run over this transcript costs, map calls plus the
  *  reduce call. A run that failed still burned tokens, so callers pass the
- *  number of runs *attempted*, not the number that produced a summary. */
+ *  number of runs *attempted*, not the number that produced a summary.
+ *
+ *  `runs` is the only thing that decides whether anything is charged.
+ *  `transcripts` decides how much — and an empty one means "no text to
+ *  measure here", NOT "no summary was made": captions load lazily, so a
+ *  session that was summarised half an hour ago can reach this with its
+ *  text still unfetched. Priced at zero, that made the bill report a real
+ *  summary as "0 ครั้ง". With no text the estimate falls back to a single
+ *  minimum chunk, which is the least one call can have cost. */
 export function summaryCost(transcripts: TranscriptItem[], runs: number, at: number): CostBreakdown {
-  if (runs <= 0 || transcripts.length === 0) return ZERO_COST;
+  if (runs <= 0) return ZERO_COST;
   const rates = flashRatesAt(at);
 
   // chunkTranscript packs greedily and never splits a line, so it produces at

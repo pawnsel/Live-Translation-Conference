@@ -41,6 +41,9 @@ import DictionaryManager from '../components/DictionaryManager';
 import { captionsReducer, initialCaptionState, selectCaptions, type Caption } from '../asr/captions';
 import { groupCaptionsIntoParagraphs } from '../asr/historyParagraphs';
 import { useGeminiLiveCapture, type CaptionResult } from '../asr/audio/useGeminiLiveCapture';
+import { useAudioInputDevices } from '../asr/audio/useAudioInputDevices';
+import { deviceLabel, resolveDeviceId } from '../asr/audio/audioDevices';
+import { loadMicDeviceId, saveMicDeviceId } from '../storage/micStore';
 import SubtitleText from '../components/SubtitleText';
 import { useProjects } from '../hooks/useProjects';
 import { useLiveProjectCost } from '../hooks/useLiveProjectCost';
@@ -122,6 +125,27 @@ export default function Admin() {
 
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [micActive, setMicActive] = useState(false);
+
+  // ── Microphone choice ─────────────────────────────────────────────────────
+  // A real meeting swaps interfaces between sessions, so the operator picks
+  // one here rather than in the OS. It is remembered per device, and it is
+  // frozen for the whole of a session — including while paused. Changing it
+  // flows into useGeminiLiveCapture's effect dependencies, which tears the
+  // pipeline down and reconnects; doing that mid-meeting would drop the
+  // sentence in flight and cost a fresh handshake. The picker below is
+  // disabled whenever a session is open, and this state is what enforces it.
+  const { devices: micDevices, refresh: refreshMicDevices } = useAudioInputDevices();
+  const [micDeviceId, setMicDeviceId] = useState<string | null>(() => loadMicDeviceId());
+  const effectiveMicDeviceId = resolveDeviceId(micDeviceId, micDevices);
+  // True once the machine has a list AND the remembered choice is not in it:
+  // the interface was unplugged, and this session will fall back to default.
+  const micDeviceMissing = micDeviceId !== null && micDevices.length > 0 && effectiveMicDeviceId === undefined;
+
+  const handleSelectMicDevice = (deviceId: string) => {
+    const next = deviceId === '' ? null : deviceId;
+    setMicDeviceId(next);
+    saveMicDeviceId(next);
+  };
   const [sourceLang, setSourceLangState] = useState<'th' | 'en'>('th');
   const [targetLang, setTargetLangState] = useState<'th' | 'en'>('en');
   const [paused, setPaused] = useState(false);
@@ -224,12 +248,22 @@ export default function Admin() {
   const capture = useGeminiLiveCapture({
     active: micActive,
     paused,
+    deviceId: effectiveMicDeviceId,
     sourceLang,
     targetLang,
     glossary: glossary ?? emptyGlossary(),
     onResult: handleCaptureResult,
     accessToken: session?.access_token ?? null
   });
+
+  // A browser hides microphone LABELS until the page has been granted
+  // permission at least once, so the very first enumeration comes back as a
+  // list of blank names. The first successful capture is that grant — read
+  // the list again there and the picker fills in with real product names,
+  // without ever prompting on its own just to populate a dropdown.
+  useEffect(() => {
+    if (capture.status === 'listening') void refreshMicDevices();
+  }, [capture.status, refreshMicDevices]);
 
   // ── Session + mic as one combined "Session" toggle, matching the original
   //    single Start/Stop button ─────────────────────────────────────────────
@@ -295,6 +329,14 @@ export default function Admin() {
   };
 
   const isSessionActive = !!sessionId && micActive;
+
+  // Deliberately wider than isSessionActive, which is false during the two
+  // windows where a switch would do the most damage: after startSessionAndMic
+  // has attached a session but before the mic is up, and while
+  // stopSessionAndMic is flushing the last sentence. `paused` is not an
+  // escape either — a paused session still owns its websocket and its
+  // caption sequence.
+  const micLocked = sessionId !== null || micActive || startingSession || endingSession;
 
   // Ticks the elapsed-time clock once a second while actually recording;
   // freezes (clears the interval) the moment the session pauses or ends, so
@@ -575,7 +617,7 @@ export default function Admin() {
               <Sparkles className="w-4.5 h-4.5" />
             </div>
             <div className="flex flex-col">
-              <span className="font-bold text-sm text-slate-900 tracking-tight leading-none">AI Live Translator</span>
+              <span className="font-bold text-sm text-slate-900 tracking-tight leading-none">Live Translation</span>
             </div>
           </div>
 
@@ -792,6 +834,44 @@ export default function Admin() {
                       <span>ตัวขาวพื้นดำ</span>
                     </button>
                   </div>
+                </div>
+
+                {/* Microphone picker. Locked for the whole of a session —
+                    pausing does not unlock it, because switching device
+                    reconnects the capture pipeline and would cut the meeting
+                    mid-sentence. */}
+                <div>
+                  <label htmlFor="mic-device" className="block text-xs font-bold text-slate-700 mb-1.5">
+                    ไมโครโฟนที่ใช้อัดเสียง (Microphone)
+                  </label>
+                  <select
+                    id="mic-device"
+                    value={micDeviceId ?? ''}
+                    onChange={(e) => handleSelectMicDevice(e.target.value)}
+                    disabled={micLocked}
+                    title={
+                      micLocked
+                        ? 'เปลี่ยนไมโครโฟนระหว่าง session ไม่ได้ — จบ session นี้ก่อน'
+                        : 'เลือกไมโครโฟนที่จะใช้อัดเสียงใน session ถัดไป'
+                    }
+                    className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <option value="">ไมโครโฟนเริ่มต้นของเบราว์เซอร์</option>
+                    {micDevices.map((device, index) => (
+                      <option key={device.deviceId} value={device.deviceId}>
+                        {deviceLabel(device, index)}
+                      </option>
+                    ))}
+                  </select>
+                  {micLocked ? (
+                    <p className="mt-1 text-[11px] text-slate-400">
+                      เปลี่ยนไมโครโฟนได้เมื่อจบ session แล้วเท่านั้น
+                    </p>
+                  ) : micDeviceMissing ? (
+                    <p className="mt-1 text-[11px] text-amber-600">
+                      ไม่พบไมโครโฟนที่เคยเลือกไว้ — session ถัดไปจะใช้ไมโครโฟนเริ่มต้นแทน
+                    </p>
+                  ) : null}
                 </div>
 
                 <div className="pt-3 border-t border-slate-200 space-y-2.5">

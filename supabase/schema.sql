@@ -1,5 +1,5 @@
 -- ===========================================================================
---  AI Live Translator — account approval schema
+--  Live Translation — account approval schema
 --  Run once in Supabase → SQL Editor (or `supabase db push`).
 --  Safe to re-run: every statement is guarded.
 -- ===========================================================================

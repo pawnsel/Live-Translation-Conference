@@ -7,7 +7,7 @@
  */
 
 export interface RecordedFilter {
-  kind: 'eq' | 'in' | 'is' | 'order' | 'limit';
+  kind: 'eq' | 'in' | 'is' | 'order' | 'limit' | 'range';
   column: string;
   value: unknown;
 }
@@ -76,6 +76,12 @@ export function createFakeSupabase(results: FakeResult[] = []) {
       },
       limit(count: number) {
         call.filters.push({ kind: 'limit', column: '', value: count });
+        return chain;
+      },
+      // Recorded as a [from, to] pair so a paging test can assert the window
+      // each request asked for, which is the whole point of paging.
+      range(from: number, to: number) {
+        call.filters.push({ kind: 'range', column: '', value: [from, to] });
         return chain;
       },
       single() {
