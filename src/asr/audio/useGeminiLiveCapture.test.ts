@@ -103,7 +103,8 @@ function renderCapture() {
       sourceLang: 'th',
       targetLang: 'en',
       glossary: emptyGlossary(),
-      onResult: () => {}
+      onResult: () => {},
+      accessToken: 'test-token'
     })
   );
 }

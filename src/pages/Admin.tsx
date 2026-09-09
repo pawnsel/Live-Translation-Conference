@@ -21,8 +21,12 @@ import {
   RefreshCw,
   ChevronDown,
   ChevronUp,
-  User
+  User,
+  LogOut
 } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../auth/AuthProvider';
+import { getAccessToken } from '../lib/supabase';
 // ProjectPanel.tsx has NO default export — it exports named components only.
 import {
   BillModal,
@@ -49,9 +53,9 @@ import type { DisplayConfig, Project, ProjectSession } from '../types';
 // (SUMMARIZE_TIMEOUT_MS, 150s) or the client abandons work about to succeed.
 const REPORT_WAIT_TIMEOUT_MS = 180000;
 
-// There is no sign-in yet; the header shows a placeholder until accounts and
-// the profile page land, and everything reads this one constant.
-const CURRENT_USER_NAME = 'ผู้ใช้งาน';
+// Shown when the mock session somehow has no address on it — the guard in
+// App.tsx means this should not be reachable, but the header must render.
+const ANONYMOUS_USER_NAME = 'ผู้ใช้งาน';
 
 // Only the pair this console supports. Anything else is not a language
 // the model is instructed to expect.
@@ -122,6 +126,21 @@ export default function Admin() {
   const [profileOpen, setProfileOpen] = useState(false);
   const [finishedProject, setFinishedProject] = useState<Project | null>(null);
 
+  // The signed-in operator (Supabase — see src/auth/AuthProvider.tsx). The
+  // header identifies the account by its email address, which is what the user
+  // actually recognises; the Google display name is secondary.
+  const { user, session, signOut } = useAuth();
+  const navigate = useNavigate();
+  const userEmail = user?.email || ANONYMOUS_USER_NAME;
+  const userPicture = user?.picture;
+  const userFullName = [user?.firstName, user?.lastName].filter(Boolean).join(' ') || user?.name || '';
+
+  const handleSignOut = useCallback(async () => {
+    setProfileOpen(false);
+    await signOut();
+    navigate('/login', { replace: true });
+  }, [signOut, navigate]);
+
   // Captions have no "delete" concept anymore (there is no server to delete
   // them from) — "delete" stays a local-only hide so an operator can tidy
   // the visible history. Hiding removes a caption from the on-screen view
@@ -163,7 +182,8 @@ export default function Admin() {
     sourceLang,
     targetLang,
     glossary,
-    onResult: handleCaptureResult
+    onResult: handleCaptureResult,
+    accessToken: session?.access_token ?? null
   });
 
   // ── Session + mic as one combined "Session" toggle, matching the original
@@ -235,9 +255,15 @@ export default function Admin() {
     projects.markSessionSummarizing(session.asrSessionId);
     const items = transcripts.map((c) => ({ source_text: c.sourceText, target_text: c.targetText }));
     try {
+      // The server checks this against the approval table before spending a
+      // single token on the summary.
+      const accessToken = await getAccessToken();
       const res = await fetch('/api/gemini/summarize', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {})
+        },
         body: JSON.stringify({ items }),
         signal: AbortSignal.timeout(REPORT_WAIT_TIMEOUT_MS)
       });
@@ -485,8 +511,8 @@ export default function Admin() {
         </div>
 
         <div className="flex items-center gap-2 sm:gap-3">
-          <span className="hidden sm:block text-xs font-semibold text-slate-700 truncate max-w-40" title={CURRENT_USER_NAME}>
-            {CURRENT_USER_NAME}
+          <span className="hidden sm:block text-xs font-semibold text-slate-700 truncate max-w-48" title={userEmail}>
+            {userEmail}
           </span>
 
           {/* The record control itself now lives in the middle of the screen;
@@ -495,33 +521,48 @@ export default function Admin() {
             <button
               type="button"
               onClick={() => setProfileOpen((v) => !v)}
-              className={`w-9 h-9 rounded-full border flex items-center justify-center transition-all ${
+              className={`w-9 h-9 rounded-full border overflow-hidden flex items-center justify-center transition-all ${
                 profileOpen
-                  ? 'bg-pink-50 border-pink-200 text-[#DE5C8E]'
+                  ? 'border-pink-200 ring-2 ring-pink-100 text-[#DE5C8E] bg-pink-50'
                   : 'bg-slate-100 border-slate-200 text-slate-500 hover:text-[#DE5C8E] hover:bg-slate-200'
               }`}
-              title="โปรไฟล์ผู้ใช้"
+              title={userEmail}
               aria-label="โปรไฟล์ผู้ใช้"
               aria-expanded={profileOpen}
             >
-              <User className="w-4.5 h-4.5" />
+              {userPicture ? (
+                <img src={userPicture} alt="" className="w-full h-full object-cover" />
+              ) : (
+                <User className="w-4.5 h-4.5" />
+              )}
             </button>
             {profileOpen && (
               <>
                 <div className="fixed inset-0 z-30" onClick={() => setProfileOpen(false)} />
-                <div className="absolute right-0 top-11 z-40 w-56 bg-white border border-slate-200 rounded-xl shadow-lg p-3.5">
+                <div className="absolute right-0 top-11 z-40 w-64 bg-white border border-slate-200 rounded-xl shadow-lg p-3.5">
                   <div className="flex items-center gap-2.5">
-                    <div className="w-8 h-8 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-400">
-                      <User className="w-4 h-4" />
-                    </div>
+                    {userPicture ? (
+                      <img src={userPicture} alt="" className="w-9 h-9 rounded-full shrink-0" />
+                    ) : (
+                      <div className="w-9 h-9 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-400 shrink-0">
+                        <User className="w-4 h-4" />
+                      </div>
+                    )}
                     <div className="min-w-0">
-                      <div className="text-xs font-bold text-slate-800 truncate">{CURRENT_USER_NAME}</div>
-                      <div className="text-[11px] text-slate-400 truncate">ยังไม่ได้เข้าสู่ระบบ</div>
+                      <div className="text-xs font-bold text-slate-800 truncate">{userEmail}</div>
+                      {userFullName && (
+                        <div className="text-[11px] text-slate-400 truncate">{userFullName}</div>
+                      )}
                     </div>
                   </div>
-                  <p className="text-[11px] text-slate-400 leading-relaxed mt-2.5 pt-2.5 border-t border-slate-100">
-                    หน้าโปรไฟล์และการตั้งค่าบัญชีผู้ใช้จะเปิดให้ใช้งานเร็ว ๆ นี้
-                  </p>
+                  <button
+                    type="button"
+                    onClick={handleSignOut}
+                    className="mt-3 pt-3 border-t border-slate-100 w-full flex items-center gap-2 text-xs font-semibold text-slate-600 hover:text-red-600 transition-colors"
+                  >
+                    <LogOut className="w-3.5 h-3.5" />
+                    ออกจากระบบ
+                  </button>
                 </div>
               </>
             )}

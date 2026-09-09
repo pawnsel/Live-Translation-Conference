@@ -7,6 +7,7 @@ import { GoogleGenAI } from "@google/genai";
 import { registerGeminiRoutes } from "./server/geminiRoutes";
 import type { GenerateContentClient } from "./server/gemini";
 import { registerGeminiLiveProxy } from "./server/geminiLiveProxy";
+import { createSupabaseVerifier, requireApprovedUser, withVerifierCache, type Verifier } from "./server/auth";
 
 async function startServer() {
   const app = express();
@@ -17,6 +18,32 @@ async function startServer() {
   // Transcript items for a long session add up; the default 100kb JSON body
   // limit is too small for /api/gemini/summarize's full-transcript payload.
   app.use(express.json({ limit: "5mb" }));
+
+  // Every Gemini path costs money, so all of them sit behind an approved
+  // account. The VITE_-prefixed names are the same values the browser gets —
+  // the prefix only controls what Vite *exposes*, and there is no second copy
+  // worth keeping in sync. No service-role key is used: server/auth.ts checks
+  // each caller with that caller's own token.
+  const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+  const supabaseAnonKey = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
+
+  let verify: Verifier;
+  if (supabaseUrl && supabaseAnonKey) {
+    verify = withVerifierCache(createSupabaseVerifier({ url: supabaseUrl, anonKey: supabaseAnonKey }));
+  } else {
+    // Fail closed. Running with the API endpoints unguarded would hand the
+    // Gemini key to anyone who can reach the port.
+    console.error(
+      "[auth] SUPABASE_URL / SUPABASE_ANON_KEY (or their VITE_ equivalents) are not set — " +
+        "every Gemini request and live session will be refused. See .env.example."
+    );
+    verify = async () => ({ kind: "deny", status: 503, reason: "authentication is not configured on this server" });
+  }
+
+  // Registered before the routes themselves so it covers every /api/gemini/*
+  // endpoint, including any added later. /api/health stays open: it costs
+  // nothing and load balancers need it.
+  app.use("/api/gemini", requireApprovedUser(verify));
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (apiKey) {
@@ -32,6 +59,7 @@ async function startServer() {
     // Live captions for the console — see server/geminiLiveProxy.ts.
     registerGeminiLiveProxy(httpServer, {
       apiKey,
+      verify,
       // gemini-3.5-transcribe-live only transcribes and ignores any
       // instruction to translate; this model does both, returning the
       // translation as outputTranscription and the source speech as
