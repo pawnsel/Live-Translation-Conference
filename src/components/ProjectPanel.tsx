@@ -33,22 +33,30 @@ const PDF_MUTED = '#64748b';
 const PDF_LINE = '#e2e8f0';
 const PDF_ACCENT = '#DE5C8E';
 
+/** The embedded Thai-capable face, registered on the document by
+ *  `downloadBill` before any text is drawn. jsPDF's built-in helvetica is
+ *  Latin-1 only and turns Thai — including most project names — into
+ *  mojibake, so every setFont call below names this instead. */
+export const PDF_FONT = 'Sarabun';
+
 /** Renders the bill as a one-page PDF laid out like an ordinary purchase
  *  receipt — line items, a subtotal, a service fee, then a boxed total —
- *  rather than the plain key/value TXT file this replaces. */
-function billToPdf(project: Project, bill: ProjectBill): jsPDF {
-  const doc = new jsPDF({ unit: 'pt', format: 'a4' });
+ *  rather than the plain key/value TXT file this replaces.
+ *
+ *  The caller must have registered PDF_FONT on `doc` already (see
+ *  `downloadBill`); this function only lays text out. */
+function billToPdf(doc: jsPDF, project: Project, bill: ProjectBill): jsPDF {
   const pageWidth = doc.internal.pageSize.getWidth();
   const rightX = pageWidth - PDF_MARGIN_X;
   let y = 60;
 
   // ── Header ────────────────────────────────────────────────────────────
-  doc.setFont('helvetica', 'bold');
+  doc.setFont(PDF_FONT, 'bold');
   doc.setFontSize(18);
   doc.setTextColor(PDF_ACCENT);
   doc.text('Live Translation', PDF_MARGIN_X, y);
 
-  doc.setFont('helvetica', 'normal');
+  doc.setFont(PDF_FONT, 'normal');
   doc.setFontSize(10);
   doc.setTextColor(PDF_MUTED);
   doc.text('ใบสรุปค่าใช้จ่าย / BILL', rightX, y, { align: 'right' });
@@ -71,9 +79,9 @@ function billToPdf(project: Project, bill: ProjectBill): jsPDF {
     doc.text(label.toUpperCase(), x, y);
     doc.setFontSize(11);
     doc.setTextColor(PDF_INK);
-    doc.setFont('helvetica', 'bold');
+    doc.setFont(PDF_FONT, 'bold');
     doc.text(value, x, y + 14);
-    doc.setFont('helvetica', 'normal');
+    doc.setFont(PDF_FONT, 'normal');
   };
   const colWidth = (rightX - PDF_MARGIN_X) / 2;
   metaRow('Project', project.name, PDF_MARGIN_X);
@@ -98,7 +106,7 @@ function billToPdf(project: Project, bill: ProjectBill): jsPDF {
   // ── Line items ────────────────────────────────────────────────────────
   doc.setFontSize(9);
   doc.setTextColor(PDF_MUTED);
-  doc.setFont('helvetica', 'bold');
+  doc.setFont(PDF_FONT, 'bold');
   doc.text('DESCRIPTION', PDF_MARGIN_X, y);
   doc.text('AMOUNT (USD)', rightX, y, { align: 'right' });
   y += 10;
@@ -106,7 +114,7 @@ function billToPdf(project: Project, bill: ProjectBill): jsPDF {
   doc.line(PDF_MARGIN_X, y, rightX, y);
   y += 20;
 
-  doc.setFont('helvetica', 'normal');
+  doc.setFont(PDF_FONT, 'normal');
   doc.setFontSize(10);
   const lineItem = (label: string, amount: number) => {
     doc.setTextColor(PDF_INK);
@@ -148,7 +156,7 @@ function billToPdf(project: Project, bill: ProjectBill): jsPDF {
   doc.setFillColor('#fdf2f8');
   doc.setDrawColor('#fbcfe8');
   doc.roundedRect(PDF_MARGIN_X, y - 18, rightX - PDF_MARGIN_X, 34, 6, 6, 'FD');
-  doc.setFont('helvetica', 'bold');
+  doc.setFont(PDF_FONT, 'bold');
   doc.setFontSize(12);
   doc.setTextColor(PDF_ACCENT);
   doc.text('TOTAL (upper bound)', PDF_MARGIN_X + 14, y + 3);
@@ -157,7 +165,7 @@ function billToPdf(project: Project, bill: ProjectBill): jsPDF {
   y += 44;
 
   // ── Session breakdown ────────────────────────────────────────────────
-  doc.setFont('helvetica', 'bold');
+  doc.setFont(PDF_FONT, 'bold');
   doc.setFontSize(9);
   doc.setTextColor(PDF_MUTED);
   doc.text('SESSIONS', PDF_MARGIN_X, y);
@@ -166,10 +174,29 @@ function billToPdf(project: Project, bill: ProjectBill): jsPDF {
   doc.line(PDF_MARGIN_X, y, rightX, y);
   y += 16;
 
-  doc.setFont('helvetica', 'normal');
+  doc.setFont(PDF_FONT, 'normal');
   doc.setFontSize(9);
   doc.setTextColor(PDF_INK);
+  // A project runs for up to seven days and can hold far more sessions than
+  // fit below the total box. Without a break they were simply drawn past the
+  // bottom edge and lost, taking the footer with them.
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const bottomLimit = pageHeight - 72;
   project.sessions.forEach((s, i) => {
+    if (y > bottomLimit) {
+      doc.addPage();
+      y = 60;
+      doc.setFont(PDF_FONT, 'bold');
+      doc.setFontSize(9);
+      doc.setTextColor(PDF_MUTED);
+      doc.text('SESSIONS (continued)', PDF_MARGIN_X, y);
+      y += 14;
+      doc.setDrawColor(PDF_LINE);
+      doc.line(PDF_MARGIN_X, y, rightX, y);
+      y += 16;
+      doc.setFont(PDF_FONT, 'normal');
+      doc.setTextColor(PDF_INK);
+    }
     const duration = s.endedAt ? formatDuration(s.endedAt - s.startedAt) : '-';
     doc.text(`#${i + 1}  ${s.sourceLang} → ${s.targetLang}`, PDF_MARGIN_X, y);
     doc.text(duration, rightX, y, { align: 'right' });
@@ -178,6 +205,10 @@ function billToPdf(project: Project, bill: ProjectBill): jsPDF {
 
   // ── Footer ────────────────────────────────────────────────────────────
   y += 16;
+  if (y > bottomLimit) {
+    doc.addPage();
+    y = 60;
+  }
   doc.setFontSize(8);
   doc.setTextColor(PDF_MUTED);
   const disclaimer =
@@ -189,9 +220,21 @@ function billToPdf(project: Project, bill: ProjectBill): jsPDF {
   return doc;
 }
 
-function downloadBill(project: Project) {
+async function downloadBill(project: Project) {
   if (!project.bill) return;
-  const doc = billToPdf(project, project.bill);
+  const doc = new jsPDF({ unit: 'pt', format: 'a4' });
+
+  // Imported here, not at module scope: the two base64 faces are ~115 KB, and
+  // nothing but this one click needs them. Awaiting a dynamic import inside a
+  // click handler is safe — jsPDF's own save() is what opens the download, and
+  // it is called below, not by the browser's gesture handling.
+  const { SARABUN_REGULAR_BASE64, SARABUN_BOLD_BASE64 } = await import('./billPdfFont');
+  doc.addFileToVFS('Sarabun-Regular.ttf', SARABUN_REGULAR_BASE64);
+  doc.addFont('Sarabun-Regular.ttf', PDF_FONT, 'normal');
+  doc.addFileToVFS('Sarabun-Bold.ttf', SARABUN_BOLD_BASE64);
+  doc.addFont('Sarabun-Bold.ttf', PDF_FONT, 'bold');
+
+  billToPdf(doc, project, project.bill);
   const filename = `bill_${project.name.replace(/\s+/g, '_')}_${new Date(project.createdAt)
     .toISOString()
     .slice(0, 10)}.pdf`;
@@ -546,7 +589,7 @@ export function BillModal({ project, onClose }: { project: Project; onClose: () 
             ปิด
           </button>
           <button
-            onClick={() => downloadBill(project)}
+            onClick={() => void downloadBill(project)}
             className="flex-1 py-2 bg-[#DE5C8E] hover:bg-[#c94577] text-white rounded-lg text-xs font-bold flex items-center justify-center gap-1.5"
           >
             <Download className="w-3.5 h-3.5" />
@@ -584,7 +627,7 @@ export function HistoryPanel({ projects, onClose }: { projects: Project[]; onClo
                   <span className="font-semibold text-xs text-slate-800 truncate">{p.name}</span>
                   {p.bill && (
                     <button
-                      onClick={() => downloadBill(p)}
+                      onClick={() => void downloadBill(p)}
                       className="p-1.5 text-slate-400 hover:text-[#DE5C8E] rounded-lg hover:bg-white transition-all shrink-0"
                       title="ดาวน์โหลดบิล"
                     >

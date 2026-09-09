@@ -22,6 +22,11 @@ export interface GeminiCaptureState {
   status: 'idle' | 'starting' | 'listening' | 'error';
   /** Fatal — the session is over (mic denied, connection unrecoverable). */
   error: string | null;
+  /** True when the chosen microphone could not be opened and the browser's
+   *  default was used instead. NOT an error: the session is recording. The
+   *  operator still has to be told, or they spend the meeting believing the
+   *  room microphone is live when it is the laptop's. */
+  deviceFallback?: boolean;
 }
 
 // Streams microphone audio over a WebSocket to our own server, which
@@ -74,6 +79,10 @@ export function useGeminiLiveCapture(opts: {
   const { active, deviceId, sourceLang, targetLang } = opts;
   const [state, setState] = useState<GeminiCaptureState>({ status: 'idle', error: null });
   const [partial, setPartial] = useState({ source: '', target: '' });
+  // Kept out of `state` on purpose: every setState on that object replaces
+  // status wholesale, and this notice has to survive the transitions that
+  // follow it (starting → listening) rather than being cleared by them.
+  const [deviceFallback, setDeviceFallback] = useState(false);
 
   // Latest-value refs for things that must not tear down the session when
   // they change. Languages are deliberately NOT in here: translationConfig
@@ -102,6 +111,11 @@ export function useGeminiLiveCapture(opts: {
   const flushImplRef = useRef<() => Promise<CaptionResult | null>>(async () => null);
 
   useEffect(() => {
+    // Cleared on every effect run, not only on stop: the operator may have
+    // picked a device that now exists, and a stale "using the default
+    // instead" notice would be a lie about the session about to start.
+    setDeviceFallback(false);
+
     if (!active) {
       setState({ status: 'idle', error: null });
       setPartial({ source: '', target: '' });
@@ -255,8 +269,28 @@ export function useGeminiLiveCapture(opts: {
           audio: deviceId ? { ...constraints, deviceId: { exact: deviceId } } : constraints
         });
       } catch {
-        fail('เปิดไมโครโฟนไม่สำเร็จ — ตรวจสอบสิทธิ์และอุปกรณ์ (could not open the microphone)');
-        return;
+        // `{ exact }` is a constraint the browser refuses outright rather than
+        // approximating, so a microphone unplugged since it was chosen stops
+        // the meeting from starting at all. Falling back to the default is
+        // always better than not recording: the operator picked a device, not
+        // a promise to record nothing without it.
+        //
+        // Only retried when a device WAS named. Without one, the same call
+        // with the same constraints was already refused — that is a
+        // permission problem, and repeating it would just prompt twice.
+        if (!deviceId) {
+          fail('เปิดไมโครโฟนไม่สำเร็จ — ตรวจสอบสิทธิ์และอุปกรณ์ (could not open the microphone)');
+          return;
+        }
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: constraints });
+          // Not fail(): this is a working session, so it must not tear itself
+          // down. The notice rides alongside the live state instead.
+          setDeviceFallback(true);
+        } catch {
+          fail('เปิดไมโครโฟนไม่สำเร็จ — ตรวจสอบสิทธิ์และอุปกรณ์ (could not open the microphone)');
+          return;
+        }
       }
       if (disposed) return teardown();
 
@@ -404,6 +438,7 @@ export function useGeminiLiveCapture(opts: {
 
   return {
     ...state,
+    deviceFallback,
     flush: async () => flushImplRef.current(),
     partialSource: partial.source,
     partialTarget: partial.target

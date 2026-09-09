@@ -867,7 +867,14 @@ export default function Admin() {
                       </option>
                     ))}
                   </select>
-                  {micLocked ? (
+                  {/* Ranked by urgency, not by state: a session recording on
+                      the WRONG microphone is the one thing the operator has to
+                      hear about immediately, even while the picker is locked. */}
+                  {capture.deviceFallback ? (
+                    <p className="mt-1 text-[11px] text-amber-600 font-semibold">
+                      เปิดไมโครโฟนที่เลือกไว้ไม่ได้ — กำลังอัดด้วยไมโครโฟนเริ่มต้นของเครื่องแทน
+                    </p>
+                  ) : micLocked ? (
                     <p className="mt-1 text-[11px] text-slate-400">
                       เปลี่ยนไมโครโฟนได้เมื่อจบ session แล้วเท่านั้น
                     </p>
