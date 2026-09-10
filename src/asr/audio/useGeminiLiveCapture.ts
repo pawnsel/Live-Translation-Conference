@@ -477,6 +477,13 @@ export function useGeminiLiveCapture(opts: {
     return () => {
       disposed = true;
       flushImplRef.current = async () => null;
+      // The buffers live and die with this effect run, so a reconnect (or a
+      // device/language change) used to drop whatever sentence was in flight
+      // — speech the operator had already watched arrive in the live line,
+      // gone from the transcript. Closing it first turns that into a caption.
+      // Safe against double-counting: a session that ended through flush()
+      // has empty buffers here, and emit() returns null on those.
+      emit();
       teardown();
     };
   }, [active, deviceId, sourceLang, targetLang, reconnectNonce]);

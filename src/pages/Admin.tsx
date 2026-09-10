@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
 import {
   Mic,
   MicOff,
@@ -40,6 +40,7 @@ import {
 import DictionaryManager from '../components/DictionaryManager';
 import { captionsReducer, initialCaptionState, selectCaptions, type Caption } from '../asr/captions';
 import { groupCaptionsIntoParagraphs } from '../asr/historyParagraphs';
+import { activeUtteranceSeq, buildCaptionRows } from '../asr/captionStack';
 import { useGeminiLiveCapture, type CaptionResult } from '../asr/audio/useGeminiLiveCapture';
 import { useAudioInputDevices } from '../asr/audio/useAudioInputDevices';
 import { deviceLabel, resolveDeviceId } from '../asr/audio/audioDevices';
@@ -89,6 +90,9 @@ function formatSrtTime(ms: number): string {
   return `${h}:${m}:${s},${msPart}`;
 }
 
+/** Rows in the rolling caption stack — one utterance each, newest on top. */
+const CAPTION_ROWS = 3;
+
 function textSizeClass(size: DisplayConfig['fontSize']): string {
   switch (size) {
     case 'small':
@@ -108,14 +112,14 @@ function textSizeClass(size: DisplayConfig['fontSize']): string {
 function boxTextSizeClass(size: DisplayConfig['fontSize']): string {
   switch (size) {
     case 'small':
-      return 'text-2xl sm:text-3xl';
+      return 'text-xl sm:text-2xl';
     case 'medium':
-      return 'text-3xl sm:text-4xl';
+      return 'text-2xl sm:text-3xl';
     case 'xlarge':
-      return 'text-5xl sm:text-6xl';
+      return 'text-4xl sm:text-5xl';
     case 'large':
     default:
-      return 'text-4xl sm:text-5xl';
+      return 'text-3xl sm:text-4xl';
   }
 }
 
@@ -198,6 +202,7 @@ export default function Admin() {
   const [config, setConfig] = useState<DisplayConfig>({
     fontSize: 'medium',
     showOriginal: false,
+    showPrevious: false,
     showLatency: false,
     captionTheme: 'light'
   });
@@ -649,6 +654,127 @@ export default function Admin() {
   const isEditingBox = editingSeq !== null && editingSeq === latestCaption?.seq;
   const isDarkCaption = config.captionTheme === 'dark';
 
+  // ── Rolling caption stack ────────────────────────────────────────────────
+  // Song-lyric behaviour: one row per utterance with the sentence being
+  // spoken on the BOTTOM line, finished ones climbing a row each time and
+  // fading as they go, oldest off the top.
+  //
+  // Everything hangs off ONE number: which utterance owns the bottom row. A
+  // live partial belongs to the utterance after the newest committed one —
+  // the capture hook hands out one seq per closed caption, in order, and an
+  // utterance with nothing at all in it never takes a number — so that seq is
+  // knowable before the caption exists. Giving the live row that identity is
+  // what makes a caption closing a NON-event for the stack: the row keeps its
+  // identity while its text firms up from partial to final. Deriving the rows
+  // from "is a partial in flight" instead is what made the stack sometimes
+  // stand still and sometimes jump — the two states disagree about how many
+  // rows history gets.
+  const newestSeq = allCaptions.length > 0 ? allCaptions[allCaptions.length - 1].seq : -1;
+  const activeSeq = activeUtteranceSeq(newestSeq, hasPartial);
+
+  const captionRows = useMemo(
+    () =>
+      buildCaptionRows({
+        lines: captions,
+        activeSeq,
+        liveText: capture.partialTarget,
+        hasPartial,
+        rows: CAPTION_ROWS
+      }),
+    [captions, activeSeq, hasPartial, capture.partialTarget]
+  );
+
+  // The slide is measured, not predicted. Each row is keyed by its utterance,
+  // so React MOVES the same node up the stack, and the animation is simply
+  // "you were there, you are here now, cover the difference". Nothing about
+  // the caption pipeline can talk it into a shift that did not happen, or out
+  // of one that did — which is what every earlier attempt at this got wrong.
+  const rowNodesRef = useRef(new Map<string, HTMLDivElement>());
+  const rowTopsRef = useRef(new Map<string, number>());
+  // The animation currently playing for each row, if any — so a shift that
+  // lands before the previous one finishes can be handled deliberately
+  // instead of by accident.
+  const rowAnimsRef = useRef(new Map<string, Animation>());
+  const [captionDebug] = useState(() => {
+    try {
+      return window.localStorage.getItem('captionStackDebug') === '1';
+    } catch {
+      return false;
+    }
+  });
+
+  // The translateY a row is rendering RIGHT NOW, mid-animation or not.
+  // getComputedStyle reports the live interpolated value regardless of how
+  // many keyframes are involved, so this is the one place both 2D and 3D
+  // transform matrices need reading (a translate3d keyframe on some engines
+  // computes to matrix3d instead of matrix).
+  const currentTranslateY = (node: HTMLElement): number => {
+    try {
+      const transform = getComputedStyle(node).transform;
+      if (!transform || transform === 'none' || typeof DOMMatrixReadOnly === 'undefined') return 0;
+      return new DOMMatrixReadOnly(transform).m42;
+    } catch {
+      return 0;
+    }
+  };
+
+  useLayoutEffect(() => {
+    const previousTops = rowTopsRef.current;
+    const nextTops = new Map<string, number>();
+    rowNodesRef.current.forEach((node, key) => nextTops.set(key, node.offsetTop));
+    rowTopsRef.current = nextTops;
+    if (previousTops.size === 0) return; // first paint: the stack arrived, it did not move
+
+    const moves: string[] = [];
+    nextTops.forEach((top, key) => {
+      const node = rowNodesRef.current.get(key);
+      if (!node || typeof node.animate !== 'function') return;
+      // A row that was already on screen slides from where it was; a row that
+      // is new to the stack rides in from just under the bottom edge.
+      const from = previousTops.get(key) ?? top + node.offsetHeight;
+      let delta = from - top;
+
+      // Rapid, back-to-back sentences close faster than one 220ms slide can
+      // finish, so the next shift for this row lands while its animation from
+      // the PREVIOUS shift is still running. `node.animate()` again here
+      // would start a second animation on the same property — WAAPI has the
+      // newer one replace the older wholesale, so the row would cut straight
+      // from wherever it visually was to this shift's theoretical start point,
+      // an instant jump that reads as a skip. Reading the live transform
+      // before cancelling makes the new animation continue from exactly where
+      // the eye last saw the row, no matter how many shifts have piled up.
+      const running = rowAnimsRef.current.get(key);
+      if (running?.playState === 'running') {
+        delta = currentTranslateY(node);
+        running.cancel();
+      }
+      if (delta === 0) return;
+
+      moves.push(`${key}: ${from}→${top}`);
+      const anim = node.animate(
+        [{ transform: `translateY(${delta}px)` }, { transform: 'translateY(0)' }],
+        { duration: 220, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' }
+      );
+      rowAnimsRef.current.set(key, anim);
+      anim.addEventListener('finish', () => {
+        if (rowAnimsRef.current.get(key) === anim) rowAnimsRef.current.delete(key);
+      });
+    });
+
+    // Switched on with `localStorage.captionStackDebug = '1'` (then reload).
+    // The stack has now been rebuilt several times off reports of it "not
+    // sliding sometimes", and guessing has cost more than measuring would
+    // have: this prints what the rows actually were, and what actually moved.
+    if (captionDebug) {
+      // eslint-disable-next-line no-console
+      console.debug(
+        '[caption-stack]',
+        captionRows.map((row) => `${row.key}:${JSON.stringify(row.text.slice(0, 24))}`).join(' | '),
+        moves.length > 0 ? `moved ${moves.join(', ')}` : 'no movement'
+      );
+    }
+  }, [captionRows, captionDebug]);
+
   // Read live off the project record so the popup fills itself in the moment
   // the summary lands, rather than holding a stale copy of the session.
   const summarySession = projects.currentProject?.sessions.find((s) => s.id === summarySessionId) ?? null;
@@ -998,6 +1124,15 @@ export default function Admin() {
                   <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
                     <input
                       type="checkbox"
+                      checked={config.showPrevious === true}
+                      onChange={(e) => setConfig((c) => ({ ...c, showPrevious: e.target.checked }))}
+                      className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
+                    />
+                    <span>แสดงคำแปลย้อนหลัง</span>
+                  </label>
+                  <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
+                    <input
+                      type="checkbox"
                       checked={config.showLatency !== false}
                       onChange={(e) => setConfig((c) => ({ ...c, showLatency: e.target.checked }))}
                       className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
@@ -1088,13 +1223,17 @@ export default function Admin() {
           )}
 
           {/* ─────────────────────────────────────────────────────────────
-              LIVE SUBTITLE — pinned to the top edge, at most two lines.
-              A caption that outgrows two lines starts a new block from the
-              word that no longer fitted, the way broadcast subtitles do.
+              LIVE SUBTITLE — pinned to the top edge. Two-line mode pages the
+              way broadcast subtitles do: a caption that outgrows the block
+              restarts from the word that no longer fitted. Rolling mode
+              instead keeps one line per sentence, newest on the bottom line
+              and older ones fading upwards out of the block. Either way
+              the box holds ONE fixed height for a given display setting:
+              nothing that happens while someone speaks may resize it.
           ────────────────────────────────────────────────────────────── */}
           <div className="shrink-0 px-3 pt-3 sm:px-6 sm:pt-4">
             <div
-              className={`relative w-full max-w-5xl mx-auto rounded-2xl border shadow-sm px-6 py-6 sm:px-10 sm:py-[28.8px] text-center transition-colors ${
+              className={`relative w-full max-w-5xl mx-auto rounded-2xl border shadow-sm px-6 py-6 sm:px-10 sm:py-[28.8px] text-left overflow-hidden transition-colors ${
                 isDarkCaption ? 'bg-black border-slate-700' : 'bg-white border-slate-200'
               }`}
             >
@@ -1125,8 +1264,119 @@ export default function Admin() {
                 </div>
               )}
 
-              {!latestCaption && !hasPartial ? (
-                <div className={isDarkCaption ? 'text-slate-500' : 'text-slate-400'}>
+              {/* Every slot below is ALWAYS mounted and every one of them is
+                  locked to its own line count, so the box is exactly as tall
+                  as the display settings demand and not one pixel more. The
+                  states that used to replace the content — the idle hint and
+                  the edit form — now sit on top of it instead, because a
+                  box that resized under a speaker would shove the whole page
+                  around mid-sentence. */}
+              {config.showOriginal && (
+                <SubtitleText
+                  text={boxSourceText}
+                  maxLines={1}
+                  className={`text-base sm:text-lg mb-2 ${
+                    isDarkCaption
+                      ? hasPartial ? 'text-slate-600' : 'text-slate-400'
+                      : hasPartial ? 'text-slate-300' : 'text-slate-400'
+                  }`}
+                />
+              )}
+              {config.showPrevious ? (
+                <div className="relative overflow-hidden">
+                  {/* Keyed by utterance, so a line that climbs is the SAME
+                      node in a new place — which is what lets the animation
+                      measure the move instead of guessing it. The fade belongs
+                      to the slot, not to the sentence: a line dims by
+                      climbing, the way a lyric does, and the transition makes
+                      that dimming travel with the slide. */}
+                  {captionRows.map((row, index) => {
+                    const isLive = index === CAPTION_ROWS - 1;
+                    return (
+                      <div
+                        key={row.key}
+                        ref={(node) => {
+                          const nodes = rowNodesRef.current;
+                          if (node) {
+                            nodes.set(row.key, node);
+                          } else {
+                            nodes.delete(row.key);
+                            // The row is gone for good once it falls off the
+                            // top of the stack — nothing will ever animate it
+                            // again, so its Animation handle would otherwise
+                            // just sit in the map for the rest of the session.
+                            rowAnimsRef.current.get(row.key)?.cancel();
+                            rowAnimsRef.current.delete(row.key);
+                          }
+                        }}
+                        // One line tall, in CSS, from the very first paint:
+                        // leading-snug is a 1.375 line-height, so 1.375em of
+                        // this element's own font size IS one line. Letting
+                        // the row measure its own height instead (the way the
+                        // paged caption does) leaves it briefly the wrong size
+                        // while that measurement lands — and a stack whose
+                        // geometry moves under the animation is a slide that
+                        // sometimes plays and sometimes does not.
+                        className={`${boxTextSizeClass(config.fontSize)} leading-snug overflow-hidden`}
+                        style={{
+                          height: '1.375em',
+                          opacity: 1 - (CAPTION_ROWS - 1 - index) * 0.35,
+                          transition: 'opacity 220ms ease-out'
+                        }}
+                      >
+                        <SubtitleText
+                          text={isLive ? row.text || 'กำลังแปล…' : row.text}
+                          maxLines={1}
+                          reserveLines={false}
+                          // The live line follows the speaker (newest words
+                          // win); a finished one is read from its start.
+                          overflow={isLive ? 'page' : 'clip'}
+                          className={`${boxTextSizeClass(config.fontSize)} leading-snug tracking-tight ${
+                            isLive && !row.text
+                              ? `font-normal ${isDarkCaption ? 'text-slate-600' : 'text-slate-300'}`
+                              : `font-bold ${isDarkCaption ? 'text-white' : 'text-black'}`
+                          }`}
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <SubtitleText
+                  text={boxTargetText || 'กำลังแปล…'}
+                  maxLines={2}
+                  className={`${boxTextSizeClass(config.fontSize)} leading-snug tracking-tight ${
+                    boxTargetText
+                      ? `font-bold ${isDarkCaption ? 'text-white' : 'text-black'}`
+                      : `font-normal ${isDarkCaption ? 'text-slate-600' : 'text-slate-300'}`
+                  }`}
+                />
+              )}
+              {/* The last MEASURED latency, kept on screen. Blanking it for
+                  the whole of the next sentence (the old `!hasPartial` rule)
+                  left it visible only in the gap between utterances — which
+                  in continuous speech is never, so it read as broken. */}
+              {config.showLatency && (
+                <span
+                  className={`mt-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-mono text-[10px] border ${
+                    latestCaption?.latencyMs ? '' : 'invisible'
+                  } ${
+                    isDarkCaption
+                      ? 'bg-white/5 text-slate-400 border-slate-700'
+                      : 'bg-slate-100 text-slate-500 border-slate-200'
+                  }`}
+                >
+                  <Zap className="w-3 h-3 text-amber-500" />
+                  <span>{latestCaption?.latencyMs ?? 0}ms</span>
+                </span>
+              )}
+
+              {!latestCaption && !hasPartial && (
+                <div
+                  className={`absolute inset-0 rounded-2xl flex flex-col items-center justify-center text-center px-6 ${
+                    isDarkCaption ? 'bg-black text-slate-500' : 'bg-white text-slate-400'
+                  }`}
+                >
                   <div className={`font-bold text-sm ${isDarkCaption ? 'text-slate-300' : 'text-slate-700'}`}>
                     พร้อมรับเสียงจากไมโครโฟน
                   </div>
@@ -1134,25 +1384,26 @@ export default function Admin() {
                     กดปุ่มไมโครโฟนวงกลมกลางจอ จากนั้นพูดใส่ไมโครโฟนเพื่อทำการแปลภาษาแบบเรียลไทม์
                   </p>
                 </div>
-              ) : isEditingBox ? (
-                <div className="space-y-3 text-left max-w-2xl mx-auto">
-                  <label className="text-xs font-bold text-slate-600 block">คำแปล:</label>
+              )}
+
+              {isEditingBox && (
+                <div
+                  className={`absolute inset-0 rounded-2xl flex flex-col justify-center gap-2 px-4 py-3 sm:px-8 overflow-y-auto ${
+                    isDarkCaption ? 'bg-black' : 'bg-white'
+                  }`}
+                >
+                  <label className={`text-xs font-bold ${isDarkCaption ? 'text-slate-300' : 'text-slate-600'}`}>
+                    คำแปล:
+                  </label>
                   <input
                     type="text"
                     autoFocus
                     value={editDraft}
                     onChange={(e) => setEditDraft(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && saveEdit()}
-                    className="w-full p-3 text-lg font-bold text-black text-center border border-slate-300 rounded-lg outline-none focus:border-[#DE5C8E]"
+                    className="w-full p-2 text-base font-bold text-black border border-slate-300 rounded-lg outline-none focus:border-[#DE5C8E]"
                   />
-                  <div className="flex items-center justify-center gap-2 pt-1">
-                    <button
-                      type="button"
-                      onClick={() => setEditingSeq(null)}
-                      className="px-3.5 py-1.5 text-xs text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium transition-all"
-                    >
-                      ยกเลิก
-                    </button>
+                  <div className="flex items-center gap-2">
                     <button
                       type="button"
                       onClick={saveEdit}
@@ -1161,51 +1412,15 @@ export default function Admin() {
                       <Check className="w-3.5 h-3.5" />
                       <span>บันทึก</span>
                     </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditingSeq(null)}
+                      className="px-3.5 py-1.5 text-xs text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium transition-all"
+                    >
+                      ยกเลิก
+                    </button>
                   </div>
                 </div>
-              ) : (
-                <>
-                  {config.showOriginal && boxSourceText && (
-                    <SubtitleText
-                      text={boxSourceText}
-                      maxLines={1}
-                      className={`text-base sm:text-lg mb-2 ${
-                        isDarkCaption
-                          ? hasPartial ? 'text-slate-600' : 'text-slate-400'
-                          : hasPartial ? 'text-slate-300' : 'text-slate-400'
-                      }`}
-                    />
-                  )}
-                  {boxTargetText ? (
-                    <SubtitleText
-                      text={boxTargetText}
-                      maxLines={2}
-                      className={`${boxTextSizeClass(config.fontSize)} font-bold leading-snug tracking-tight ${
-                        isDarkCaption ? 'text-white' : 'text-black'
-                      }`}
-                    />
-                  ) : (
-                    <p
-                      className={`${boxTextSizeClass(config.fontSize)} font-normal ${
-                        isDarkCaption ? 'text-slate-600' : 'text-slate-300'
-                      }`}
-                    >
-                      กำลังแปล…
-                    </p>
-                  )}
-                  {config.showLatency && !hasPartial && latestCaption?.latencyMs ? (
-                    <span
-                      className={`mt-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-mono text-[10px] border ${
-                        isDarkCaption
-                          ? 'bg-white/5 text-slate-400 border-slate-700'
-                          : 'bg-slate-100 text-slate-500 border-slate-200'
-                      }`}
-                    >
-                      <Zap className="w-3 h-3 text-amber-500" />
-                      <span>{latestCaption.latencyMs}ms</span>
-                    </span>
-                  ) : null}
-                </>
               )}
             </div>
           </div>
