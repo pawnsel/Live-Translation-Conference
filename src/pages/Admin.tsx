@@ -44,6 +44,9 @@ import { useGeminiLiveCapture, type CaptionResult } from '../asr/audio/useGemini
 import { useAudioInputDevices } from '../asr/audio/useAudioInputDevices';
 import { deviceLabel, resolveDeviceId } from '../asr/audio/audioDevices';
 import { loadMicDeviceId, saveMicDeviceId } from '../storage/micStore';
+import { autoStopReason, IDLE_STOP_MS, type AutoStopReason } from '../asr/audio/sessionLimits';
+import { SESSION_HEARTBEAT_MS } from '../data/staleSessions';
+import { forgetTabSession, loadTabSession, rememberTabSession } from '../storage/tabSession';
 import SubtitleText from '../components/SubtitleText';
 import { useProjects } from '../hooks/useProjects';
 import { useLiveProjectCost } from '../hooks/useLiveProjectCost';
@@ -56,6 +59,10 @@ import type { DisplayConfig, Project, ProjectSession, TranscriptItem } from '../
 // server, so this must stay comfortably above the server's own job budget
 // (SUMMARIZE_TIMEOUT_MS, 150s) or the client abandons work about to succeed.
 const REPORT_WAIT_TIMEOUT_MS = 180000;
+
+// How often the auto-stop limits are evaluated. Both limits are measured in
+// minutes, so checking every ten seconds is precise enough and costs nothing.
+const AUTO_STOP_CHECK_MS = 10_000;
 
 // Shown when the mock session somehow has no address on it — the guard in
 // App.tsx means this should not be reachable, but the header must render.
@@ -119,12 +126,44 @@ export default function Admin() {
   const { user, session, status, signOut } = useAuth();
   const navigate = useNavigate();
 
-  const projects = useProjects({ userId: status === 'approved' ? user?.id ?? null : null });
+  const [sessionId, setSessionId] = useState<string | null>(null);
+
+  // What this tab was recording before the page reloaded, read once at mount.
+  // A refresh leaves the session's heartbeat only seconds old, so the sweep
+  // correctly finds it fresh and it would sit marked "recording" for the
+  // whole staleness window — unable to be summarised, blocking a project
+  // switch. sessionStorage survives the reload and dies with the tab, which
+  // is precisely the fact needed: that session was mine, and it is over.
+  const [reclaimAsrSessionId, setReclaimAsrSessionId] = useState<string | null>(() =>
+    loadTabSession()
+  );
+
+  const projects = useProjects({
+    userId: status === 'approved' ? user?.id ?? null : null,
+    // Names the session this tab owns so the sweep can never close the
+    // meeting being recorded right here.
+    ownAsrSessionId: sessionId,
+    reclaimAsrSessionId
+  });
   const glossaryState = useGlossary({ projectId: projects.currentProject?.id ?? null });
   const glossary: GlossarySections | null = glossaryState.sections;
 
-  const [sessionId, setSessionId] = useState<string | null>(null);
   const [micActive, setMicActive] = useState(false);
+
+  // ── Auto-stop ─────────────────────────────────────────────────────────────
+  // A live session bills by wall clock — roughly $2.20 an hour — for as long
+  // as it stays open, and nothing used to close one. These two clocks are what
+  // stop a tab left open on a Friday evening from billing all weekend. The
+  // rules themselves live in asr/audio/sessionLimits.ts.
+  //
+  // Speech, not audio: an open microphone streams frames continuously from a
+  // silent room, so frames say nothing about whether anybody is talking. A
+  // partial or a closed caption is the only evidence of a person.
+  const sessionStartedAtRef = useRef<number | null>(null);
+  const lastSpeechAtRef = useRef<number>(Date.now());
+  /** Why the last session stopped itself, or null when the operator stopped
+   *  it. Cleared when the next session starts. */
+  const [autoStopped, setAutoStopped] = useState<AutoStopReason | null>(null);
 
   // ── Microphone choice ─────────────────────────────────────────────────────
   // A real meeting swaps interfaces between sessions, so the operator picks
@@ -225,6 +264,9 @@ export default function Admin() {
         latencyMs: result.latencyMs,
         isEdited: false
       };
+      // A closed sentence is the strongest evidence there is that somebody is
+      // in the room, so it holds the idle auto-stop off.
+      lastSpeechAtRef.current = Date.now();
       // Spelled out rather than spread: CaptionAction's 'add' has no `ts` or
       // `isEdited` — the reducer stamps its own timestamp — so spreading the
       // item would not typecheck.
@@ -279,6 +321,18 @@ export default function Admin() {
     setStartingSession(true);
     const id = `local_${Date.now()}`;
     setSessionId(id);
+    // Both auto-stop clocks start here. lastSpeechAt starts at "now" rather
+    // than at zero so a session nobody ever speaks into is still stopped, one
+    // idle window after it began.
+    sessionStartedAtRef.current = Date.now();
+    lastSpeechAtRef.current = Date.now();
+    setAutoStopped(null);
+    // Remembered before the attach round trip: if the tab is closed or
+    // refreshed while that request is in flight, the id still has to be
+    // reclaimable. Clearing the reclaim state at the same time stops the
+    // sweep from confusing the session just ended with the one starting.
+    rememberTabSession(id);
+    setReclaimAsrSessionId(null);
     dispatchCaption({ kind: 'reset' });
     setHiddenSeqs(new Set());
     setElapsedMs(0);
@@ -321,6 +375,11 @@ export default function Admin() {
     setEndingSession(false);
     setSessionId(null);
     setPaused(false);
+    // Stopped properly, so there is nothing left for a future reload to
+    // reclaim — and leaving it behind would make the next load try to close
+    // a session that is already closed.
+    forgetTabSession();
+    setReclaimAsrSessionId(null);
     // The last sentences must be on the record before the operator moves on —
     // finishing a project prices what the database holds.
     await projects.flushCaptions();
@@ -357,6 +416,47 @@ export default function Admin() {
     }, 1000);
     return () => clearInterval(id);
   }, [isSessionActive, paused]);
+
+  // "This tab is still here." Without it a session whose browser vanished —
+  // a refresh, a crash, a closed laptop — stays open in the database forever,
+  // and an open session is billed up to `now`: a mid-meeting refresh added
+  // real money to the project's estimate for every hour nobody noticed.
+  //
+  // Runs while a session exists, INCLUDING while paused: a paused session is
+  // still owned by this tab, and another tab must not decide it is dead.
+  useEffect(() => {
+    if (!sessionId) return;
+    void projects.touchSession(sessionId);
+    const id = setInterval(() => void projects.touchSession(sessionId), SESSION_HEARTBEAT_MS);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `projects` is
+    // rebuilt on every render; depending on it would restart the interval
+    // constantly. The session id is what actually decides what to write.
+  }, [sessionId]);
+
+  // Streaming partials are the earliest evidence of a person speaking —
+  // earlier than a closed caption, which needs a pause to finish. Read during
+  // render because that is when a new partial arrives.
+  if (capture.partialSource || capture.partialTarget) lastSpeechAtRef.current = Date.now();
+
+  useEffect(() => {
+    if (!isSessionActive) return;
+    const id = setInterval(() => {
+      const startedAt = sessionStartedAtRef.current;
+      if (startedAt === null) return;
+      const reason = autoStopReason({
+        startedAt,
+        lastSpeechAt: lastSpeechAtRef.current,
+        now: Date.now()
+      });
+      if (!reason) return;
+      // Set before the await so the banner explains the stop that is already
+      // under way, rather than appearing after the screen has gone quiet.
+      setAutoStopped(reason);
+      void stopSessionAndMic();
+    }, AUTO_STOP_CHECK_MS);
+    return () => clearInterval(id);
+  }, [isSessionActive]);
 
   // Running total for the header badge: finished sessions come off the project
   // record, the session recording right now comes out of the live caption
@@ -1156,6 +1256,26 @@ export default function Admin() {
                 <span>กดเพื่อเริ่มอัดเสียงและแปลสด</span>
               )}
             </div>
+
+            {/* Why the session stopped on its own. Shown until the next one
+                starts: a session that ends by itself while nobody is looking
+                would otherwise be indistinguishable from one that crashed. */}
+            {autoStopped && !isSessionActive && (
+              <div className="max-w-sm px-3 py-2 rounded-lg bg-amber-50 border border-amber-200 text-[11px] text-amber-800 text-center leading-relaxed">
+                {autoStopped === 'idle' ? (
+                  <>
+                    ปิด session อัตโนมัติ เพราะไม่มีเสียงพูดเข้ามานานเกิน{' '}
+                    {Math.round(IDLE_STOP_MS / 60_000)} นาที — บทสนทนาที่บันทึกไว้ยังอยู่ครบ
+                    กดเริ่ม session ใหม่เพื่อบันทึกต่อได้
+                  </>
+                ) : (
+                  <>
+                    ปิด session อัตโนมัติ เพราะใช้งานครบเวลาสูงสุดต่อหนึ่ง session แล้ว —
+                    บทสนทนาที่บันทึกไว้ยังอยู่ครบ กดเริ่ม session ใหม่เพื่อบันทึกต่อได้
+                  </>
+                )}
+              </div>
+            )}
 
             {isSessionActive && (
               <div

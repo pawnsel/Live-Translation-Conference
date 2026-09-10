@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { PROJECT_TTL_MS, useProjects } from './useProjects';
+import { PROJECT_TTL_MS, STALE_SWEEP_INTERVAL_MS, useProjects } from './useProjects';
+import { SESSION_STALE_MS } from '../data/staleSessions';
 import { PersistError } from '../data/persistError';
 import type { ProjectsRepo } from '../data/projectsRepo';
 import type { Project, ProjectSession, TranscriptItem } from '../types';
@@ -17,6 +18,11 @@ function session(overrides: Partial<ProjectSession> = {}): ProjectSession {
     targetLang: 'en',
     summarizeRuns: 0,
     itemCount: 0,
+    // A live session by default: its tab reported in a moment ago. Without
+    // this the orphan sweep in reload() would (correctly) close it, since an
+    // open session with no heartbeat is exactly what an abandoned tab leaves
+    // behind.
+    lastSeenAt: Date.now(),
     ...overrides
   };
 }
@@ -47,6 +53,8 @@ function fakeRepo(overrides: Partial<ProjectsRepo> = {}): ProjectsRepo {
     appendCaption: vi.fn().mockResolvedValue(undefined),
     editCaption: vi.fn().mockResolvedValue(undefined),
     markSummarizing: vi.fn().mockResolvedValue(undefined),
+    touchSession: vi.fn().mockResolvedValue(undefined),
+    closeStaleSession: vi.fn().mockResolvedValue(undefined),
     saveSummary: vi.fn().mockResolvedValue(undefined),
     finishProject: vi.fn().mockResolvedValue(undefined),
     ...overrides
@@ -474,5 +482,201 @@ describe('useProjects — auto-finish retry', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// A tab that vanishes cannot close its own session. Left open, it is billed
+// up to `now` — a refresh mid-meeting quietly added to the project's estimate
+// for as long as nobody noticed — and it shows as live, which blocks both its
+// own summary and any project switch.
+describe('useProjects — orphaned sessions', () => {
+  const STALE_ENOUGH = 10 * 60_000;
+
+  it('closes a session whose tab stopped reporting, at its last heartbeat', async () => {
+    const lastSeenAt = Date.now() - STALE_ENOUGH;
+    const repo = fakeRepo({
+      listProjects: vi
+        .fn()
+        .mockResolvedValue([project({ sessions: [session({ lastSeenAt, endedAt: undefined })] })])
+    });
+    const { result } = await renderLoaded(repo);
+
+    expect(repo.closeStaleSession).toHaveBeenCalledWith('sess-1', lastSeenAt);
+    // Applied in memory too, so the console stops showing a dead session as
+    // live without waiting for another round trip.
+    expect(result.current.activeProjects[0].sessions[0].endedAt).toBe(lastSeenAt);
+  });
+
+  it('leaves a session alone while its tab is still reporting', async () => {
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockResolvedValue([project({ sessions: [session()] })])
+    });
+    const { result } = await renderLoaded(repo);
+
+    expect(repo.closeStaleSession).not.toHaveBeenCalled();
+    expect(result.current.activeProjects[0].sessions[0].endedAt).toBeUndefined();
+  });
+
+  // The console runs in more than one tab, and a tab loading the console
+  // must never end the meeting another tab — or itself — is recording.
+  it('never closes the session this tab owns, however stale it looks', async () => {
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockResolvedValue([
+        project({ sessions: [session({ lastSeenAt: Date.now() - STALE_ENOUGH, endedAt: undefined })] })
+      ])
+    });
+    const view = renderHook(() => useProjects({ repo, userId: USER, ownAsrSessionId: 'local_1' }));
+    await waitFor(() => expect(view.result.current.loading).toBe(false));
+
+    expect(repo.closeStaleSession).not.toHaveBeenCalled();
+  });
+
+  // Bookkeeping must not hold up a console that already has what it needs to
+  // render, and a refused write must not raise the persistence banner.
+  it('shows the list even when closing the orphan fails', async () => {
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockResolvedValue([
+        project({ sessions: [session({ lastSeenAt: Date.now() - STALE_ENOUGH, endedAt: undefined })] })
+      ]),
+      closeStaleSession: vi.fn().mockRejectedValue(new Error('refused'))
+    });
+    const { result } = await renderLoaded(repo);
+
+    expect(result.current.activeProjects).toHaveLength(1);
+    expect(result.current.persistError).toBeNull();
+  });
+});
+
+describe('useProjects — heartbeat', () => {
+  it('stamps the session row for the session it is given', async () => {
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockResolvedValue([project({ sessions: [session()] })])
+    });
+    const { result } = await renderLoaded(repo);
+
+    await act(async () => {
+      await result.current.touchSession('local_1');
+    });
+
+    expect(repo.touchSession).toHaveBeenCalledWith('sess-1');
+  });
+
+  it('writes nothing for a session it does not know', async () => {
+    const repo = fakeRepo();
+    const { result } = await renderLoaded(repo);
+
+    await act(async () => {
+      await result.current.touchSession('local_unknown');
+    });
+
+    expect(repo.touchSession).not.toHaveBeenCalled();
+  });
+
+  // A missed beat is harmless — the next is thirty seconds away and the
+  // staleness window is four beats wide — so it must not raise the banner and
+  // trigger a resync in the middle of a meeting.
+  it('stays quiet when a beat is refused', async () => {
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockResolvedValue([project({ sessions: [session()] })]),
+      touchSession: vi.fn().mockRejectedValue(new Error('offline'))
+    });
+    const { result } = await renderLoaded(repo);
+
+    await act(async () => {
+      await result.current.touchSession('local_1');
+    });
+
+    expect(result.current.persistError).toBeNull();
+  });
+});
+
+// The bug this covers: the sweep used to run ONLY at load, but the staleness
+// window guarantees a just-refreshed session is NOT stale at that moment. So
+// the one case heartbeats were built for — refresh mid-meeting — could never
+// be caught, and the session sat marked "recording" forever.
+describe('useProjects — the sweep keeps running', () => {
+  it('closes a session that goes stale while the console is already open', async () => {
+    vi.useFakeTimers();
+    try {
+      const lastSeenAt = Date.now();
+      const repo = fakeRepo({
+        listProjects: vi.fn().mockResolvedValue([
+          // A fresh createdAt: the fixture's default is months old, and the
+          // 7-day expiry sweep would auto-finish the project part way through
+          // the window this test advances.
+          project({ createdAt: Date.now(), sessions: [session({ lastSeenAt, endedAt: undefined })] })
+        ])
+      });
+      const view = renderHook(() => useProjects({ repo, userId: USER }));
+      await vi.waitFor(() => expect(view.result.current.loading).toBe(false));
+
+      // Fresh at load, so the load-time sweep correctly leaves it alone.
+      expect(repo.closeStaleSession).not.toHaveBeenCalled();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(SESSION_STALE_MS + STALE_SWEEP_INTERVAL_MS);
+      });
+
+      expect(repo.closeStaleSession).toHaveBeenCalledWith('sess-1', lastSeenAt);
+      expect(view.result.current.activeProjects[0].sessions[0].endedAt).toBe(lastSeenAt);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('writes the closure once, not on every tick', async () => {
+    vi.useFakeTimers();
+    try {
+      const repo = fakeRepo({
+        listProjects: vi.fn().mockResolvedValue([
+          project({
+            createdAt: Date.now(),
+            sessions: [session({ lastSeenAt: Date.now() - SESSION_STALE_MS * 2, endedAt: undefined })]
+          })
+        ])
+      });
+      const view = renderHook(() => useProjects({ repo, userId: USER }));
+      await vi.waitFor(() => expect(view.result.current.loading).toBe(false));
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(STALE_SWEEP_INTERVAL_MS * 5);
+      });
+
+      expect(repo.closeStaleSession).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// A tab that refreshes knows its own session is dead, and says so through
+// sessionStorage. Without it the console would have to wait out the whole
+// staleness window before that session stopped looking live.
+describe('useProjects — reclaiming this tab’s own session after a reload', () => {
+  it('closes the reclaimed session at once, however fresh its heartbeat', async () => {
+    const lastSeenAt = Date.now() - 1_000;
+    const repo = fakeRepo({
+      listProjects: vi
+        .fn()
+        .mockResolvedValue([project({ sessions: [session({ lastSeenAt, endedAt: undefined })] })])
+    });
+    const view = renderHook(() =>
+      useProjects({ repo, userId: USER, reclaimAsrSessionId: 'local_1' })
+    );
+    await waitFor(() => expect(view.result.current.loading).toBe(false));
+
+    expect(repo.closeStaleSession).toHaveBeenCalledWith('sess-1', lastSeenAt);
+  });
+
+  it('leaves a session another tab is recording alone', async () => {
+    const repo = fakeRepo({
+      listProjects: vi.fn().mockResolvedValue([project({ sessions: [session()] })])
+    });
+    const view = renderHook(() =>
+      useProjects({ repo, userId: USER, reclaimAsrSessionId: 'someone_elses' })
+    );
+    await waitFor(() => expect(view.result.current.loading).toBe(false));
+
+    expect(repo.closeStaleSession).not.toHaveBeenCalled();
   });
 });
