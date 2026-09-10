@@ -5,12 +5,22 @@ import { PersistError, toPersistError, type PersistFailureReason } from '../data
 import { createProjectsRepo, type ProjectsRepo } from '../data/projectsRepo';
 import { createCaptionQueue } from '../data/captionQueue';
 import { supabase } from '../lib/supabase';
-import { ceilCents } from '../billing/geminiCost';
+import { ceilCents, SERVICE_FEE_USD } from '../billing/geminiCost';
 import { projectCost, projectTranscripts, type LiveBuffer } from '../billing/projectCost';
+import { staleSessions, withSessionsClosed } from '../data/staleSessions';
 
 export const MAX_ACTIVE_PROJECTS = 3;
 export const PROJECT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const EXPIRY_SWEEP_INTERVAL_MS = 60 * 1000;
+
+/** How often open sessions are re-checked for a heartbeat that stopped.
+ *
+ *  This interval is not an optimisation — it is what makes the heartbeat work
+ *  at all. The sweep used to run only when the console loaded, and a session
+ *  is never stale at that moment: the tab that refreshed left a beat seconds
+ *  old, so the reloaded page always found it fresh and nothing ever looked
+ *  again. The session stayed marked "recording" forever. */
+export const STALE_SWEEP_INTERVAL_MS = 30 * 1000;
 
 export function projectExpiresAt(project: Project): number {
   return project.createdAt + PROJECT_TTL_MS;
@@ -44,7 +54,8 @@ function buildBill(project: Project, live: LiveBuffer) {
     sessionCount: closedSessions.length,
     durationMs,
     wordCount: countWords(transcripts),
-    estimatedCost: ceilCents(cost.total),
+    estimatedCost: ceilCents(cost.total) + SERVICE_FEE_USD,
+    serviceFee: SERVICE_FEE_USD,
     costBreakdown: {
       liveMinutes: cost.liveMinutes,
       liveAudioCost: cost.liveAudioCost,
@@ -59,6 +70,15 @@ function buildBill(project: Project, live: LiveBuffer) {
 export interface UseProjectsOptions {
   /** Injected in tests. Defaults to the live Supabase-backed repo. */
   repo?: ProjectsRepo;
+  /** The ASR session THIS tab is recording, if any. Excluded from the
+   *  orphan sweep by id — the tab doing the sweeping is the one authority on
+   *  whether its own session is alive, and a heartbeat still in flight must
+   *  never let it close its own meeting. */
+  ownAsrSessionId?: string | null;
+  /** A session this tab owned BEFORE the page reloaded, read back out of
+   *  sessionStorage. Closed immediately rather than waiting out the staleness
+   *  window — the tab knows it is not recording it any more. */
+  reclaimAsrSessionId?: string | null;
   /** The signed-in, approved account. Null means "load nothing and hold
    *  nothing" — a signed-out console on a shared machine must not still be
    *  showing the last person's meetings. */
@@ -67,7 +87,12 @@ export interface UseProjectsOptions {
 
 const defaultRepo = () => createProjectsRepo(supabase as never);
 
-export function useProjects({ repo, userId = null }: UseProjectsOptions = {}) {
+export function useProjects({
+  repo,
+  userId = null,
+  ownAsrSessionId = null,
+  reclaimAsrSessionId = null
+}: UseProjectsOptions = {}) {
   const activeRepo = useMemo(() => repo ?? defaultRepo(), [repo]);
 
   const [projects, setProjects] = useState<Project[]>([]);
@@ -90,6 +115,63 @@ export function useProjects({ repo, userId = null }: UseProjectsOptions = {}) {
   // ── Loading ───────────────────────────────────────────────────────────────
   const loadSeq = useRef(0);
 
+  // Read through a ref so the sweep always sees the session this tab is
+  // recording RIGHT NOW, without `reload` being rebuilt (and re-fired) every
+  // time a session starts or stops.
+  const ownSessionRef = useRef(ownAsrSessionId);
+  ownSessionRef.current = ownAsrSessionId;
+  const reclaimSessionRef = useRef(reclaimAsrSessionId);
+  reclaimSessionRef.current = reclaimAsrSessionId;
+
+  // Latest projects, for the sweep timer — which must not depend on `projects`
+  // itself, or the interval would be torn down and rebuilt on every render.
+  const projectsRef = useRef<Project[]>([]);
+  projectsRef.current = projects;
+
+  // Sessions whose closing write has already been issued. Without it every
+  // tick would re-issue the same UPDATE for as long as the row took to come
+  // back closed.
+  const closedStaleIds = useRef<Set<string>>(new Set());
+
+  /** Closes any session nothing is recording any more, and returns the list
+   *  with those closures applied. Pure with respect to React state — the
+   *  caller decides what to do with the result — but it does fire the
+   *  database writes, so it must never be called from inside a state updater
+   *  (React may invoke one twice). */
+  const closeOrphanedSessions = useCallback(
+    (list: Project[]): Project[] => {
+      const orphans = staleSessions(
+        list,
+        Date.now(),
+        ownSessionRef.current,
+        reclaimSessionRef.current
+      ).filter((orphan) => !closedStaleIds.current.has(orphan.id));
+      if (orphans.length === 0) return list;
+
+      for (const orphan of orphans) {
+        // Marked before the write resolves, so a tick during the round trip
+        // cannot dispatch a duplicate.
+        closedStaleIds.current.add(orphan.id);
+        void activeRepo.closeStaleSession(orphan.id, orphan.endedAt).catch(() => {
+          // Un-marked so the next sweep is a real retry rather than a silent
+          // skip forever. Not routed through `run`: this is bookkeeping, and
+          // a refused write must not raise the banner mid-meeting.
+          closedStaleIds.current.delete(orphan.id);
+        });
+      }
+      return withSessionsClosed(list, orphans);
+    },
+    [activeRepo]
+  );
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const swept = closeOrphanedSessions(projectsRef.current);
+      if (swept !== projectsRef.current) setProjects(swept);
+    }, STALE_SWEEP_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [closeOrphanedSessions]);
+
   const reload = useCallback(async () => {
     const seq = ++loadSeq.current;
     if (!userId) {
@@ -100,14 +182,21 @@ export function useProjects({ repo, userId = null }: UseProjectsOptions = {}) {
     try {
       const loaded = await activeRepo.listProjects();
       if (seq !== loadSeq.current) return; // a newer load superseded this one
-      setProjects(loaded);
+
+      // Close any session nothing is recording any more before showing the
+      // list. An open session is billed up to `now` — so left alone it keeps
+      // adding to the project's estimate, shows as live (blocking its own
+      // summary and any project switch), and never ends. The timer above
+      // keeps checking after this; a session that is fresh right now goes
+      // stale a couple of minutes later, and nothing would look again.
+      setProjects(closeOrphanedSessions(loaded));
       setPersistError(null);
     } catch (error) {
       if (seq === loadSeq.current) fail(error);
     } finally {
       if (seq === loadSeq.current) setLoading(false);
     }
-  }, [activeRepo, userId, fail]);
+  }, [activeRepo, userId, fail, closeOrphanedSessions]);
 
   useEffect(() => {
     setLoading(true);
@@ -439,6 +528,24 @@ export function useProjects({ repo, userId = null }: UseProjectsOptions = {}) {
     [activeRepo, run, projects]
   );
 
+  /** Heartbeat for the session this tab is recording. Not routed through
+   *  `run`: a missed beat is harmless — the next one is thirty seconds away,
+   *  and the staleness window is four beats wide — whereas raising the
+   *  persistence banner (and resyncing) over one would be noise during a
+   *  meeting. */
+  const touchSession = useCallback(
+    async (asrSessionId: string) => {
+      const target = findSession(asrSessionId);
+      if (!target) return;
+      try {
+        await activeRepo.touchSession(target.id);
+      } catch {
+        // Deliberately silent — see above.
+      }
+    },
+    [activeRepo, projects]
+  );
+
   const saveSessionSummary = useCallback(
     async (asrSessionId: string, summary: string, reportItemCount: number) => {
       const target = findSession(asrSessionId);
@@ -510,6 +617,7 @@ export function useProjects({ repo, userId = null }: UseProjectsOptions = {}) {
     loadSessionTranscript,
     saveSessionSummary,
     markSessionSummarizing,
+    touchSession,
     summarizingIds,
     persistError,
     reload,

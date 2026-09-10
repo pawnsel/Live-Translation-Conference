@@ -1,5 +1,5 @@
 -- ===========================================================================
---  AI Live Translator — project, session, transcript and glossary schema
+--  Live Translation — project, session, transcript and glossary schema
 --  Run once in Supabase → SQL Editor, AFTER schema.sql.
 --  Safe to re-run: every statement is guarded.
 -- ===========================================================================
@@ -99,8 +99,28 @@ create table if not exists public.project_sessions (
   -- section 4. A column rather than a view because PostgREST cannot embed a
   -- view in a nested select from projects (no foreign keys on views).
   item_count        integer not null default 0,
+  -- Heartbeat from the tab that is recording, refreshed every ~30s. A tab
+  -- that vanishes — a refresh, a crash, a closed laptop — leaves ended_at
+  -- null forever, and an open session is billed up to `now`, so a mid-meeting
+  -- refresh used to add a hundred dollars to a project's estimate over a
+  -- weekend. The console closes a session whose heartbeat stopped, AT this
+  -- timestamp. See src/data/staleSessions.ts.
+  last_seen_at      timestamptz not null default now(),
   unique (project_id, asr_session_id)
 );
+
+-- Upgrade path for databases created before the heartbeat existed. Written as
+-- three steps rather than one `add column ... not null default now()` so old
+-- rows keep an honest last-seen time instead of all looking freshly alive.
+alter table public.project_sessions
+  add column if not exists last_seen_at timestamptz;
+update public.project_sessions
+   set last_seen_at = coalesce(ended_at, started_at)
+ where last_seen_at is null;
+alter table public.project_sessions
+  alter column last_seen_at set default now();
+alter table public.project_sessions
+  alter column last_seen_at set not null;
 
 create index if not exists project_sessions_project_idx
   on public.project_sessions (project_id, started_at);

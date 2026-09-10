@@ -22,6 +22,11 @@ export interface GeminiCaptureState {
   status: 'idle' | 'starting' | 'listening' | 'error';
   /** Fatal — the session is over (mic denied, connection unrecoverable). */
   error: string | null;
+  /** True when the chosen microphone could not be opened and the browser's
+   *  default was used instead. NOT an error: the session is recording. The
+   *  operator still has to be told, or they spend the meeting believing the
+   *  room microphone is live when it is the laptop's. */
+  deviceFallback?: boolean;
 }
 
 // Streams microphone audio over a WebSocket to our own server, which
@@ -34,6 +39,26 @@ export interface GeminiCaptureState {
 // after a quiet gap, so the caption list keeps its "one row per utterance"
 // shape.
 const QUIET_MS = 1200;
+
+/** How often the browser pushes its current access token to the proxy.
+ *
+ *  Comfortably under the proxy's own re-check interval (REVERIFY_INTERVAL_MS,
+ *  five minutes) so a refreshed token is always waiting before the next check.
+ *  supabase-js renews the session on its own well before the hour is up; this
+ *  only has to carry the result across a socket that was opened long ago. */
+export const AUTH_REFRESH_INTERVAL_MS = 4 * 60_000;
+
+/** Close codes the proxy uses to end a session deliberately. Reconnecting
+ *  through one of these would defeat the guard that sent it, so each is a
+ *  full stop with a reason the operator can act on.
+ *  Kept in step with CLOSE_REVOKED / CLOSE_MAX_DURATION in
+ *  server/geminiLiveBridge.ts. */
+const TERMINAL_CLOSE_REASONS: Record<number, string> = {
+  4403:
+    'สิทธิ์การใช้งานถูกเปลี่ยนแปลง หรือเซสชันหมดอายุ — กรุณาเข้าสู่ระบบใหม่แล้วเริ่ม session อีกครั้ง (access is no longer valid)',
+  4408:
+    'session นี้ยาวเกินเวลาสูงสุดที่ระบบอนุญาต จึงถูกปิดอัตโนมัติ — บทสนทนาที่บันทึกไว้ยังอยู่ครบ เริ่ม session ใหม่เพื่อบันทึกต่อได้ (maximum session length reached)'
+};
 // A speaker who never pauses would otherwise grow one caption forever.
 const MAX_CAPTION_CHARS = 600;
 // The model endpoints on trailing silence: cutting the audio off the
@@ -74,6 +99,10 @@ export function useGeminiLiveCapture(opts: {
   const { active, deviceId, sourceLang, targetLang } = opts;
   const [state, setState] = useState<GeminiCaptureState>({ status: 'idle', error: null });
   const [partial, setPartial] = useState({ source: '', target: '' });
+  // Kept out of `state` on purpose: every setState on that object replaces
+  // status wholesale, and this notice has to survive the transitions that
+  // follow it (starting → listening) rather than being cleared by them.
+  const [deviceFallback, setDeviceFallback] = useState(false);
 
   // Latest-value refs for things that must not tear down the session when
   // they change. Languages are deliberately NOT in here: translationConfig
@@ -102,6 +131,11 @@ export function useGeminiLiveCapture(opts: {
   const flushImplRef = useRef<() => Promise<CaptionResult | null>>(async () => null);
 
   useEffect(() => {
+    // Cleared on every effect run, not only on stop: the operator may have
+    // picked a device that now exists, and a stale "using the default
+    // instead" notice would be a lie about the session about to start.
+    setDeviceFallback(false);
+
     if (!active) {
       setState({ status: 'idle', error: null });
       setPartial({ source: '', target: '' });
@@ -117,6 +151,7 @@ export function useGeminiLiveCapture(opts: {
     let framerNode: AudioWorkletNode | null = null;
     let quietTimer: ReturnType<typeof setTimeout> | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let authRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
     let sourceBuf = '';
     let targetBuf = '';
@@ -147,6 +182,8 @@ export function useGeminiLiveCapture(opts: {
       quietTimer = null;
       if (reconnectTimer) clearTimeout(reconnectTimer);
       reconnectTimer = null;
+      if (authRefreshTimer) clearInterval(authRefreshTimer);
+      authRefreshTimer = null;
       framerNode?.port.close();
       framerNode?.disconnect();
       framerNode = null;
@@ -255,8 +292,28 @@ export function useGeminiLiveCapture(opts: {
           audio: deviceId ? { ...constraints, deviceId: { exact: deviceId } } : constraints
         });
       } catch {
-        fail('เปิดไมโครโฟนไม่สำเร็จ — ตรวจสอบสิทธิ์และอุปกรณ์ (could not open the microphone)');
-        return;
+        // `{ exact }` is a constraint the browser refuses outright rather than
+        // approximating, so a microphone unplugged since it was chosen stops
+        // the meeting from starting at all. Falling back to the default is
+        // always better than not recording: the operator picked a device, not
+        // a promise to record nothing without it.
+        //
+        // Only retried when a device WAS named. Without one, the same call
+        // with the same constraints was already refused — that is a
+        // permission problem, and repeating it would just prompt twice.
+        if (!deviceId) {
+          fail('เปิดไมโครโฟนไม่สำเร็จ — ตรวจสอบสิทธิ์และอุปกรณ์ (could not open the microphone)');
+          return;
+        }
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: constraints });
+          // Not fail(): this is a working session, so it must not tear itself
+          // down. The notice rides alongside the live state instead.
+          setDeviceFallback(true);
+        } catch {
+          fail('เปิดไมโครโฟนไม่สำเร็จ — ตรวจสอบสิทธิ์และอุปกรณ์ (could not open the microphone)');
+          return;
+        }
       }
       if (disposed) return teardown();
 
@@ -334,6 +391,17 @@ export function useGeminiLiveCapture(opts: {
     ]);
 
     ws.onopen = () => {
+      // The proxy re-checks this caller every few minutes for as long as the
+      // session lives, and the token it was handed at the handshake expires
+      // roughly an hour in. supabase-js keeps `accessTokenRef` current, so
+      // pushing it down the socket on a timer is all that stands between a
+      // three-hour meeting and being cut off at sixty minutes.
+      authRefreshTimer = setInterval(() => {
+        const current = accessTokenRef.current;
+        if (!current || ws?.readyState !== WebSocket.OPEN) return;
+        ws.send(JSON.stringify({ authRefresh: { accessToken: current } }));
+      }, AUTH_REFRESH_INTERVAL_MS);
+
       // Sent before the server opens its Gemini session: translationConfig
       // and customVocabulary are both setup-only there.
       ws?.send(
@@ -361,11 +429,22 @@ export function useGeminiLiveCapture(opts: {
     // An error is always followed by a close, so recovery is handled in one
     // place rather than racing two handlers.
     ws.onerror = () => {};
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       if (disposed) return;
       // Whatever was mid-sentence still belongs to the transcript — commit
       // it before the reconnect wipes this session's buffers.
       emit();
+
+      // A close the PROXY chose is a verdict, not a fault. Reconnecting
+      // through one would open a fresh billed session a second later and
+      // keep doing so forever, which is exactly what the server-side guard
+      // exists to prevent (server/geminiLiveBridge.ts).
+      const terminal = TERMINAL_CLOSE_REASONS[event?.code as number];
+      if (terminal) {
+        fail(terminal);
+        return;
+      }
+
       retriesRef.current += 1;
       teardown();
       setState({ status: 'starting', error: null });
@@ -404,6 +483,7 @@ export function useGeminiLiveCapture(opts: {
 
   return {
     ...state,
+    deviceFallback,
     flush: async () => flushImplRef.current(),
     partialSource: partial.source,
     partialTarget: partial.target

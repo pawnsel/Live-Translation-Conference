@@ -21,6 +21,7 @@ const sessionRow: SessionRow = {
   summary: null,
   report_item_count: null,
   summarize_runs: 0,
+  last_seen_at: '2026-01-01T00:10:00.000Z',
   item_count: 12
 };
 
@@ -63,6 +64,18 @@ const projectRow: ProjectRow = {
   asr_session_id: null,
   bill: null
 };
+
+describe('toSession heartbeat', () => {
+  it('maps the heartbeat to epoch ms', () => {
+    expect(toSession(sessionRow).lastSeenAt).toBe(Date.parse('2026-01-01T00:10:00.000Z'));
+  });
+
+  // Rows written before the column existed come back null. Left undefined
+  // rather than defaulted, so staleSessions can fall back to started_at.
+  it('leaves the heartbeat undefined for a row written before it existed', () => {
+    expect(toSession({ ...sessionRow, last_seen_at: null }).lastSeenAt).toBeUndefined();
+  });
+});
 
 describe('toProject', () => {
   it('maps the row and attaches its sessions oldest first', () => {

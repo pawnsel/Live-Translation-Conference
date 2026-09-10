@@ -5,6 +5,8 @@
 // constructed here, and both sides are typed structurally so `ws`'s
 // WebSocket satisfies them without this module importing `ws` at all.
 
+import type { Verifier } from './auth';
+
 export const CONNECTING = 0;
 export const OPEN = 1;
 
@@ -22,7 +24,47 @@ export interface BridgeOptions {
   targetLanguageCode: string;
   sourceLanguageCodes: string[];
   openUpstream: OpenUpstream;
+  /** The caller's token from the handshake. Replaced by whatever the client
+   *  pushes down the socket later — see the `authRefresh` frame below. */
+  accessToken: string | null;
+  /** The same check the handshake ran, re-run for the life of the session. */
+  verify: Verifier;
 }
+
+// ── Session guards ─────────────────────────────────────────────────────────
+//
+// Until these existed a live session was authorised exactly once, at the
+// handshake, and had no maximum length. Since the bridge swaps its own
+// upstream every ten minutes to keep a long meeting alive (see below), a tab
+// left streaming ran — and billed, at roughly $2.20 an hour — until somebody
+// noticed.
+
+/** How often the caller is re-checked while a session is open. */
+export const REVERIFY_INTERVAL_MS = 5 * 60_000;
+
+/**
+ * How long a token that will not verify is tolerated before the session is cut.
+ *
+ * This window is the whole reason re-verification is safe to turn on. A
+ * Supabase access token expires about an hour after it is issued, and
+ * createSupabaseVerifier reports an expired token with the SAME 401 it uses
+ * for a forged one — it cannot tell them apart. Closing on the first 401 would
+ * therefore end every meeting at the sixty-minute mark, which is precisely the
+ * three-hour meeting this system exists to translate.
+ *
+ * So a 401 starts a clock instead of ending the session, and the browser is
+ * given time to do what supabase-js does automatically: refresh, and push the
+ * new token down the socket it already has open.
+ */
+export const EXPIRED_TOKEN_GRACE_MS = 10 * 60_000;
+
+/** Hard ceiling on one session. Deliberately far longer than any real meeting;
+ *  this is a runaway guard, not a policy. */
+export const SESSION_MAX_MS = 6 * 60 * 60_000;
+
+/** Application close codes (4000-4999 is the range reserved for these). */
+export const CLOSE_REVOKED = 4403;
+export const CLOSE_MAX_DURATION = 4408;
 
 // customVocabulary can only be set in the setup message, so setup waits for
 // the client's glossary frame — but a client that never sends one must
@@ -122,6 +164,8 @@ export function createLiveBridge(client: SocketLike, opts: BridgeOptions): void 
   const closeBoth = (code?: number, reason?: string) => {
     clientGone = true;
     clearTimeout(glossaryTimer);
+    clearInterval(reverifyTimer);
+    clearTimeout(maxDurationTimer);
     if (client.readyState === OPEN || client.readyState === CONNECTING) {
       client.close(code, reason);
     }
@@ -167,6 +211,60 @@ export function createLiveBridge(client: SocketLike, opts: BridgeOptions): void 
   };
 
   const glossaryTimer = setTimeout(sendSetup, GLOSSARY_WAIT_MS);
+
+  // ── Session guards ──────────────────────────────────────────────────────
+  // The token the caller handed over at the handshake, replaced whenever the
+  // browser pushes a refreshed one.
+  let accessToken = opts.accessToken;
+  // When the current token first failed to verify, or null while it works.
+  let unusableSince: number | null = null;
+
+  const reverifyTimer = setInterval(() => {
+    if (clientGone) return;
+    void opts
+      .verify(accessToken)
+      .then((result) => {
+        // The session may have ended while the round trip was in flight.
+        if (clientGone) return;
+
+        if (result.kind === 'allow') {
+          // Cleared, not paused: a later expiry earns a fresh full window.
+          unusableSince = null;
+          return;
+        }
+
+        // Supabase is unreachable. Failing closed is right at the handshake,
+        // where no meeting exists yet; here it would mean an outage at the
+        // provider ends a conference that is happily recording. Ride it out.
+        if (result.status === 503) return;
+
+        // A definite verdict about the account itself — registered but not
+        // approved, or approved and then revoked. This is the case the whole
+        // guard exists for, so it takes effect at once.
+        if (result.status === 403) {
+          closeBoth(CLOSE_REVOKED, 'access revoked');
+          return;
+        }
+
+        // 401: expired or forged, and the verifier cannot say which. Give the
+        // browser its grace window to refresh (see EXPIRED_TOKEN_GRACE_MS).
+        const now = Date.now();
+        if (unusableSince === null) {
+          unusableSince = now;
+          return;
+        }
+        if (now - unusableSince >= EXPIRED_TOKEN_GRACE_MS) {
+          closeBoth(CLOSE_REVOKED, 'session token could not be renewed');
+        }
+      })
+      .catch(() => {
+        // Treated as an outage, not a verdict — same reasoning as 503.
+      });
+  }, REVERIFY_INTERVAL_MS);
+
+  const maxDurationTimer = setTimeout(() => {
+    closeBoth(CLOSE_MAX_DURATION, 'session reached its maximum length');
+  }, SESSION_MAX_MS);
 
   const attachUpstream = (socket: SocketLike) => {
     upstream = socket;
@@ -267,6 +365,32 @@ export function createLiveBridge(client: SocketLike, opts: BridgeOptions): void 
   attachUpstream(opts.openUpstream());
 
   client.on('message', (data: Buffer, isBinary: boolean) => {
+    // A refreshed access token, pushed down the socket the session already
+    // holds. Consumed here and never relayed — Gemini has no such message,
+    // and the token must not leave this process.
+    //
+    // Checked before the config branch and outside its `!setupSent` guard,
+    // because this arrives repeatedly for the whole life of the session.
+    if (!isBinary) {
+      try {
+        const parsed = JSON.parse(data.toString());
+        if (parsed?.authRefresh !== undefined) {
+          const next = parsed.authRefresh?.accessToken;
+          // A malformed refresh leaves the working token in place rather than
+          // replacing it with junk that would fail the next re-verify.
+          //
+          // Note what does NOT happen here: the grace clock is not reset.
+          // Only a verify that actually succeeds clears it. Resetting on the
+          // frame would let a client hold a session open forever by sending a
+          // fresh piece of garbage every few minutes.
+          if (typeof next === 'string' && next.trim()) accessToken = next.trim();
+          return;
+        }
+      } catch {
+        // Not JSON — fall through to the normal paths below.
+      }
+    }
+
     // The client's opening frame carries its glossary; it is consumed
     // here rather than relayed, since Gemini has no such message.
     if (!setupSent) {

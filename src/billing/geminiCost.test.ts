@@ -124,7 +124,28 @@ describe('summaryCost', () => {
     expect(summaryCost(long, 1, Date.now()).total).toBeGreaterThan(summaryCost(short, 1, Date.now()).total);
   });
 
-  it('is free for an empty transcript', () => {
-    expect(summaryCost([], 5, Date.now()).total).toBe(0);
+  // A run that was recorded is a run that was made. Whether this caller
+  // happens to be holding the transcript text is a fact about the browser's
+  // memory, not about the bill — the captions may simply not have been
+  // fetched yet (see useProjects: they load lazily, one session at a time).
+  // Pricing an empty transcript at zero used to make a summarised session
+  // report "สรุปการประชุม 0 ครั้ง", which is the one thing this module
+  // promises never to do: read low.
+  it('still charges recorded runs when the transcript text is not to hand', () => {
+    const cost = summaryCost([], 5, Date.now());
+    expect(cost.summaryRuns).toBe(5);
+    expect(cost.total).toBeGreaterThan(0);
+  });
+
+  // …but no more than the floor. With no text to measure, one chunk at the
+  // minimum output allowance is the least a call can have cost.
+  it('prices a text-less run at one minimum chunk', () => {
+    const floor = summaryCost([], 1, Date.now()).total;
+    expect(summaryCost(transcript, 1, Date.now()).total).toBeGreaterThan(floor);
+  });
+
+  it('is free when no run was ever recorded, transcript or not', () => {
+    expect(summaryCost([], 0, Date.now()).total).toBe(0);
+    expect(summaryCost([], 0, Date.now()).summaryRuns).toBe(0);
   });
 });

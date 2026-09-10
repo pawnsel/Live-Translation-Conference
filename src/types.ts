@@ -18,6 +18,9 @@ export interface DisplayConfig {
   fontFamily?: string;
   showOriginal?: boolean;
   showLatency?: boolean;
+  /** Color scheme of the live caption box. 'light' (black text on white) is
+   *  the default; 'dark' is white text on black, for a darker room/stage. */
+  captionTheme?: 'light' | 'dark';
 }
 
 export interface ProjectSession {
@@ -54,15 +57,27 @@ export interface ProjectSession {
    *  whether `summary` ended up filled in. Undefined on sessions recorded
    *  before costs were estimated. */
   summarizeRuns?: number;
+  /** Last time the tab recording this session said it was still there. The
+   *  console writes it every SESSION_HEARTBEAT_MS while recording; a session
+   *  whose heartbeat stops is closed at this timestamp rather than being left
+   *  open and billed forever (see data/staleSessions.ts). Absent on rows
+   *  written before heartbeats existed. */
+  lastSeenAt?: number;
 }
 
 export interface ProjectBill {
   sessionCount: number;
   durationMs: number;
   wordCount: number;
-  /** Upper bound on the Gemini spend for this project, in USD — see
-   *  src/billing/geminiCost.ts. Real spend lands at or below it. */
+  /** Upper bound on the Gemini spend for this project, in USD, PLUS
+   *  `serviceFee` — see src/billing/geminiCost.ts. Real spend lands at or
+   *  below it. */
   estimatedCost: number;
+  /** Flat service fee charged on top of the Gemini cost estimate, in USD.
+   *  Currently 0 (see SERVICE_FEE_USD) — reserved for when this console
+   *  bills a margin rather than passing through raw API cost. Absent on
+   *  projects billed before the fee existed. */
+  serviceFee?: number;
   /** Where that figure came from, so a bill can be read rather than
    *  trusted. Absent on projects billed before the breakdown existed. */
   costBreakdown?: {

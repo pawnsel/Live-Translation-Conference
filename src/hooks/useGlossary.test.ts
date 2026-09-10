@@ -32,6 +32,7 @@ function fakeRepo(overrides: Partial<GlossaryRepo> = {}): GlossaryRepo {
     subscribeList: vi.fn().mockResolvedValue(undefined),
     unsubscribeList: vi.fn().mockResolvedValue(undefined),
     addTerm: vi.fn().mockResolvedValue(undefined),
+    addTerms: vi.fn().mockResolvedValue(undefined),
     removeTerm: vi.fn().mockResolvedValue(undefined),
     ...overrides
   };
@@ -83,6 +84,51 @@ describe('useGlossary', () => {
 
     expect(repo.addTerm).toHaveBeenCalledWith('list-own', 'protected_terms', 'ภาควิชา', 'Department');
     expect(result.current.sections?.protected_terms).toEqual({ 'ภาควิชา': 'Department' });
+  });
+
+  it('imports a whole glossary in one write and shows every section at once', async () => {
+    const repo = fakeRepo();
+    const { result } = await renderLoaded(repo);
+
+    await act(async () => {
+      await result.current.addTerms({
+        ...emptyGlossary(),
+        protected_terms: { ภาควิชา: 'Department' },
+        en_th_corrections: { Kawin: 'กวิน' }
+      });
+    });
+
+    expect(repo.addTerms).toHaveBeenCalledWith('list-own', [
+      { section: 'protected_terms', term: 'ภาควิชา', translation: 'Department' },
+      { section: 'en_th_corrections', term: 'Kawin', translation: 'กวิน' }
+    ]);
+    expect(result.current.sections?.protected_terms).toEqual({ ภาควิชา: 'Department' });
+    expect(result.current.sections?.en_th_corrections).toEqual({ Kawin: 'กวิน' });
+  });
+
+  // The project's own list is overlaid last, so an imported term must win
+  // over the same term coming from a subscribed shared list.
+  it('lets an imported term override the shared list it collides with', async () => {
+    const repo = fakeRepo();
+    const { result } = await renderLoaded(repo);
+    expect(result.current.sections?.person_names).toEqual({ สมชาย: 'Somchai' });
+
+    await act(async () => {
+      await result.current.addTerms({ ...emptyGlossary(), person_names: { สมชาย: 'Dr. Somchai' } });
+    });
+
+    expect(result.current.sections?.person_names).toEqual({ สมชาย: 'Dr. Somchai' });
+  });
+
+  it('writes nothing when no project is open', async () => {
+    const repo = fakeRepo();
+    const { result } = await renderLoaded(repo, null);
+
+    await act(async () => {
+      await result.current.addTerms({ ...emptyGlossary(), person_names: { a: 'b' } });
+    });
+
+    expect(repo.addTerms).not.toHaveBeenCalled();
   });
 
   it('removes a term from the project list', async () => {

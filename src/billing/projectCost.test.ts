@@ -104,6 +104,30 @@ describe('projectCost', () => {
       const failed = project([session({ asrSessionId: 'a', transcripts: captions, summary: '' })]);
       expect(projectCost(failed, idle).summaryCost).toBeGreaterThan(0);
     });
+
+    // The bug this guards: captions load lazily, one session at a time, so a
+    // session the operator summarised can reach the bill with `transcripts`
+    // still undefined — after a page reload, or when a project switch
+    // resynced from the server. The run count lives on the record and must
+    // survive that; reading it off the in-memory transcript made the bill
+    // announce "สรุปการประชุม 0 ครั้ง" for a summary that had just run.
+    it('reports runs for a session whose captions are not loaded', () => {
+      const unloaded = project([
+        session({ asrSessionId: 'a', summarizeRuns: 1, summary: 'สรุป', itemCount: 12 })
+      ]);
+      expect(unloaded.sessions[0].transcripts).toBeUndefined();
+      expect(projectCost(unloaded, idle).summaryRuns).toBe(1);
+      expect(projectCost(unloaded, idle).summaryCost).toBeGreaterThan(0);
+    });
+
+    // Same fact seen from the other side: the live buffer is empty at the
+    // moment the project is finished, but the session it belongs to was
+    // summarised earlier in the meeting.
+    it('reports runs when the live buffer for that session is empty', () => {
+      const p = project([session({ asrSessionId: 'live', transcripts: captions, summarizeRuns: 1 })]);
+      const emptyBuffer: LiveBuffer = { transcripts: [], asrSessionId: 'live', now: NOW };
+      expect(projectCost(p, emptyBuffer).summaryRuns).toBe(1);
+    });
   });
 });
 

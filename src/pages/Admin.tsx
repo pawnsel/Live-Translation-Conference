@@ -41,6 +41,12 @@ import DictionaryManager from '../components/DictionaryManager';
 import { captionsReducer, initialCaptionState, selectCaptions, type Caption } from '../asr/captions';
 import { groupCaptionsIntoParagraphs } from '../asr/historyParagraphs';
 import { useGeminiLiveCapture, type CaptionResult } from '../asr/audio/useGeminiLiveCapture';
+import { useAudioInputDevices } from '../asr/audio/useAudioInputDevices';
+import { deviceLabel, resolveDeviceId } from '../asr/audio/audioDevices';
+import { loadMicDeviceId, saveMicDeviceId } from '../storage/micStore';
+import { autoStopReason, IDLE_STOP_MS, type AutoStopReason } from '../asr/audio/sessionLimits';
+import { SESSION_HEARTBEAT_MS } from '../data/staleSessions';
+import { forgetTabSession, loadTabSession, rememberTabSession } from '../storage/tabSession';
 import SubtitleText from '../components/SubtitleText';
 import { useProjects } from '../hooks/useProjects';
 import { useLiveProjectCost } from '../hooks/useLiveProjectCost';
@@ -54,6 +60,10 @@ import type { DisplayConfig, Project, ProjectSession, TranscriptItem } from '../
 // (SUMMARIZE_TIMEOUT_MS, 150s) or the client abandons work about to succeed.
 const REPORT_WAIT_TIMEOUT_MS = 180000;
 
+// How often the auto-stop limits are evaluated. Both limits are measured in
+// minutes, so checking every ten seconds is precise enough and costs nothing.
+const AUTO_STOP_CHECK_MS = 10_000;
+
 // Shown when the mock session somehow has no address on it — the guard in
 // App.tsx means this should not be reachable, but the header must render.
 const ANONYMOUS_USER_NAME = 'ผู้ใช้งาน';
@@ -62,6 +72,14 @@ const ANONYMOUS_USER_NAME = 'ผู้ใช้งาน';
 // the model is instructed to expect.
 const LANGS: Record<'th' | 'en', string> = { th: 'ไทย (Thai)', en: 'อังกฤษ (English)' };
 const other = (lang: string) => (lang === 'th' ? 'en' : 'th');
+
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const h = String(Math.floor(totalSeconds / 3600)).padStart(2, '0');
+  const m = String(Math.floor(totalSeconds / 60) % 60).padStart(2, '0');
+  const s = String(totalSeconds % 60).padStart(2, '0');
+  return `${h}:${m}:${s}`;
+}
 
 function formatSrtTime(ms: number): string {
   const h = String(Math.floor(ms / 3600000)).padStart(2, '0');
@@ -108,17 +126,81 @@ export default function Admin() {
   const { user, session, status, signOut } = useAuth();
   const navigate = useNavigate();
 
-  const projects = useProjects({ userId: status === 'approved' ? user?.id ?? null : null });
+  const [sessionId, setSessionId] = useState<string | null>(null);
+
+  // What this tab was recording before the page reloaded, read once at mount.
+  // A refresh leaves the session's heartbeat only seconds old, so the sweep
+  // correctly finds it fresh and it would sit marked "recording" for the
+  // whole staleness window — unable to be summarised, blocking a project
+  // switch. sessionStorage survives the reload and dies with the tab, which
+  // is precisely the fact needed: that session was mine, and it is over.
+  const [reclaimAsrSessionId, setReclaimAsrSessionId] = useState<string | null>(() =>
+    loadTabSession()
+  );
+
+  const projects = useProjects({
+    userId: status === 'approved' ? user?.id ?? null : null,
+    // Names the session this tab owns so the sweep can never close the
+    // meeting being recorded right here.
+    ownAsrSessionId: sessionId,
+    reclaimAsrSessionId
+  });
   const glossaryState = useGlossary({ projectId: projects.currentProject?.id ?? null });
   const glossary: GlossarySections | null = glossaryState.sections;
 
-  const [sessionId, setSessionId] = useState<string | null>(null);
   const [micActive, setMicActive] = useState(false);
+
+  // ── Auto-stop ─────────────────────────────────────────────────────────────
+  // A live session bills by wall clock — roughly $2.20 an hour — for as long
+  // as it stays open, and nothing used to close one. These two clocks are what
+  // stop a tab left open on a Friday evening from billing all weekend. The
+  // rules themselves live in asr/audio/sessionLimits.ts.
+  //
+  // Speech, not audio: an open microphone streams frames continuously from a
+  // silent room, so frames say nothing about whether anybody is talking. A
+  // partial or a closed caption is the only evidence of a person.
+  const sessionStartedAtRef = useRef<number | null>(null);
+  const lastSpeechAtRef = useRef<number>(Date.now());
+  /** Why the last session stopped itself, or null when the operator stopped
+   *  it. Cleared when the next session starts. */
+  const [autoStopped, setAutoStopped] = useState<AutoStopReason | null>(null);
+
+  // ── Microphone choice ─────────────────────────────────────────────────────
+  // A real meeting swaps interfaces between sessions, so the operator picks
+  // one here rather than in the OS. It is remembered per device, and it is
+  // frozen for the whole of a session — including while paused. Changing it
+  // flows into useGeminiLiveCapture's effect dependencies, which tears the
+  // pipeline down and reconnects; doing that mid-meeting would drop the
+  // sentence in flight and cost a fresh handshake. The picker below is
+  // disabled whenever a session is open, and this state is what enforces it.
+  const { devices: micDevices, refresh: refreshMicDevices } = useAudioInputDevices();
+  const [micDeviceId, setMicDeviceId] = useState<string | null>(() => loadMicDeviceId());
+  const effectiveMicDeviceId = resolveDeviceId(micDeviceId, micDevices);
+  // True once the machine has a list AND the remembered choice is not in it:
+  // the interface was unplugged, and this session will fall back to default.
+  const micDeviceMissing = micDeviceId !== null && micDevices.length > 0 && effectiveMicDeviceId === undefined;
+
+  const handleSelectMicDevice = (deviceId: string) => {
+    const next = deviceId === '' ? null : deviceId;
+    setMicDeviceId(next);
+    saveMicDeviceId(next);
+  };
   const [sourceLang, setSourceLangState] = useState<'th' | 'en'>('th');
   const [targetLang, setTargetLangState] = useState<'th' | 'en'>('en');
   const [paused, setPaused] = useState(false);
 
-  const [config, setConfig] = useState<DisplayConfig>({ fontSize: 'medium', showOriginal: false, showLatency: false });
+  // Real-time elapsed clock for the current session, hh:mm:ss — mirrors a
+  // voice-recorder timer: it runs while recording and freezes while paused,
+  // so the number always reads "how much has actually been recorded".
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const elapsedTickRef = useRef<number | null>(null);
+
+  const [config, setConfig] = useState<DisplayConfig>({
+    fontSize: 'medium',
+    showOriginal: false,
+    showLatency: false,
+    captionTheme: 'light'
+  });
   const [activeTab, setActiveTab] = useState<'languages' | 'dictionary'>('languages');
   const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
@@ -182,6 +264,9 @@ export default function Admin() {
         latencyMs: result.latencyMs,
         isEdited: false
       };
+      // A closed sentence is the strongest evidence there is that somebody is
+      // in the room, so it holds the idle auto-stop off.
+      lastSpeechAtRef.current = Date.now();
       // Spelled out rather than spread: CaptionAction's 'add' has no `ts` or
       // `isEdited` — the reducer stamps its own timestamp — so spreading the
       // item would not typecheck.
@@ -205,12 +290,22 @@ export default function Admin() {
   const capture = useGeminiLiveCapture({
     active: micActive,
     paused,
+    deviceId: effectiveMicDeviceId,
     sourceLang,
     targetLang,
     glossary: glossary ?? emptyGlossary(),
     onResult: handleCaptureResult,
     accessToken: session?.access_token ?? null
   });
+
+  // A browser hides microphone LABELS until the page has been granted
+  // permission at least once, so the very first enumeration comes back as a
+  // list of blank names. The first successful capture is that grant — read
+  // the list again there and the picker fills in with real product names,
+  // without ever prompting on its own just to populate a dropdown.
+  useEffect(() => {
+    if (capture.status === 'listening') void refreshMicDevices();
+  }, [capture.status, refreshMicDevices]);
 
   // ── Session + mic as one combined "Session" toggle, matching the original
   //    single Start/Stop button ─────────────────────────────────────────────
@@ -226,8 +321,21 @@ export default function Admin() {
     setStartingSession(true);
     const id = `local_${Date.now()}`;
     setSessionId(id);
+    // Both auto-stop clocks start here. lastSpeechAt starts at "now" rather
+    // than at zero so a session nobody ever speaks into is still stopped, one
+    // idle window after it began.
+    sessionStartedAtRef.current = Date.now();
+    lastSpeechAtRef.current = Date.now();
+    setAutoStopped(null);
+    // Remembered before the attach round trip: if the tab is closed or
+    // refreshed while that request is in flight, the id still has to be
+    // reclaimable. Clearing the reclaim state at the same time stops the
+    // sweep from confusing the session just ended with the one starting.
+    rememberTabSession(id);
+    setReclaimAsrSessionId(null);
     dispatchCaption({ kind: 'reset' });
     setHiddenSeqs(new Set());
+    setElapsedMs(0);
     const ok = await projects.attachAsrSession(id, sourceLang, targetLang);
     setStartingSession(false);
     if (!ok) {
@@ -267,6 +375,11 @@ export default function Admin() {
     setEndingSession(false);
     setSessionId(null);
     setPaused(false);
+    // Stopped properly, so there is nothing left for a future reload to
+    // reclaim — and leaving it behind would make the next load try to close
+    // a session that is already closed.
+    forgetTabSession();
+    setReclaimAsrSessionId(null);
     // The last sentences must be on the record before the operator moves on —
     // finishing a project prices what the database holds.
     await projects.flushCaptions();
@@ -275,6 +388,75 @@ export default function Admin() {
   };
 
   const isSessionActive = !!sessionId && micActive;
+
+  // Deliberately wider than isSessionActive, which is false during the two
+  // windows where a switch would do the most damage: after startSessionAndMic
+  // has attached a session but before the mic is up, and while
+  // stopSessionAndMic is flushing the last sentence. `paused` is not an
+  // escape either — a paused session still owns its websocket and its
+  // caption sequence.
+  const micLocked = sessionId !== null || micActive || startingSession || endingSession;
+
+  // Ticks the elapsed-time clock once a second while actually recording;
+  // freezes (clears the interval) the moment the session pauses or ends, so
+  // the displayed duration always matches time actually captured. The ref
+  // tracks the last tick's wall-clock time so a delta is added rather than
+  // a fixed 1000ms, keeping the clock accurate even if a tab is throttled.
+  useEffect(() => {
+    if (!isSessionActive || paused) {
+      elapsedTickRef.current = null;
+      return;
+    }
+    elapsedTickRef.current = Date.now();
+    const id = setInterval(() => {
+      const now = Date.now();
+      const last = elapsedTickRef.current ?? now;
+      elapsedTickRef.current = now;
+      setElapsedMs((prev) => prev + (now - last));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [isSessionActive, paused]);
+
+  // "This tab is still here." Without it a session whose browser vanished —
+  // a refresh, a crash, a closed laptop — stays open in the database forever,
+  // and an open session is billed up to `now`: a mid-meeting refresh added
+  // real money to the project's estimate for every hour nobody noticed.
+  //
+  // Runs while a session exists, INCLUDING while paused: a paused session is
+  // still owned by this tab, and another tab must not decide it is dead.
+  useEffect(() => {
+    if (!sessionId) return;
+    void projects.touchSession(sessionId);
+    const id = setInterval(() => void projects.touchSession(sessionId), SESSION_HEARTBEAT_MS);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `projects` is
+    // rebuilt on every render; depending on it would restart the interval
+    // constantly. The session id is what actually decides what to write.
+  }, [sessionId]);
+
+  // Streaming partials are the earliest evidence of a person speaking —
+  // earlier than a closed caption, which needs a pause to finish. Read during
+  // render because that is when a new partial arrives.
+  if (capture.partialSource || capture.partialTarget) lastSpeechAtRef.current = Date.now();
+
+  useEffect(() => {
+    if (!isSessionActive) return;
+    const id = setInterval(() => {
+      const startedAt = sessionStartedAtRef.current;
+      if (startedAt === null) return;
+      const reason = autoStopReason({
+        startedAt,
+        lastSpeechAt: lastSpeechAtRef.current,
+        now: Date.now()
+      });
+      if (!reason) return;
+      // Set before the await so the banner explains the stop that is already
+      // under way, rather than appearing after the screen has gone quiet.
+      setAutoStopped(reason);
+      void stopSessionAndMic();
+    }, AUTO_STOP_CHECK_MS);
+    return () => clearInterval(id);
+  }, [isSessionActive]);
 
   // Running total for the header badge: finished sessions come off the project
   // record, the session recording right now comes out of the live caption
@@ -349,6 +531,10 @@ export default function Admin() {
   // are maintained from the Supabase dashboard.
   const handleGlossaryAdd = (section: GlossarySection, term: string, equivalent: string) => {
     void glossaryState.addTerm(section, term, equivalent);
+  };
+
+  const handleGlossaryAddMany = (incoming: GlossarySections) => {
+    void glossaryState.addTerms(incoming);
   };
 
   const handleGlossaryRemove = (section: GlossarySection, term: string) => {
@@ -461,6 +647,7 @@ export default function Admin() {
   const boxSourceText = capture.partialSource || latestCaption?.sourceText || '';
   const boxTargetText = capture.partialTarget || latestCaption?.targetText || '';
   const isEditingBox = editingSeq !== null && editingSeq === latestCaption?.seq;
+  const isDarkCaption = config.captionTheme === 'dark';
 
   // Read live off the project record so the popup fills itself in the moment
   // the summary lands, rather than holding a stale copy of the session.
@@ -534,7 +721,7 @@ export default function Admin() {
               <Sparkles className="w-4.5 h-4.5" />
             </div>
             <div className="flex flex-col">
-              <span className="font-bold text-sm text-slate-900 tracking-tight leading-none">AI Live Translator</span>
+              <span className="font-bold text-sm text-slate-900 tracking-tight leading-none">Live Translation</span>
             </div>
           </div>
 
@@ -723,6 +910,81 @@ export default function Admin() {
                   </select>
                 </div>
 
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1.5">ธีมคำบรรยาย (Caption Theme)</label>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setConfig((c) => ({ ...c, captionTheme: 'light' }))}
+                      className={`flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all ${
+                        (config.captionTheme ?? 'light') === 'light'
+                          ? 'border-[#DE5C8E] ring-2 ring-pink-100 bg-white text-slate-800'
+                          : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-white'
+                      }`}
+                    >
+                      <span className="w-3.5 h-3.5 rounded-full bg-white border border-slate-300 text-black flex items-center justify-center text-[8px] font-black">A</span>
+                      <span>ตัวดำพื้นขาว</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfig((c) => ({ ...c, captionTheme: 'dark' }))}
+                      className={`flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all ${
+                        config.captionTheme === 'dark'
+                          ? 'border-[#DE5C8E] ring-2 ring-pink-100 bg-white text-slate-800'
+                          : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-white'
+                      }`}
+                    >
+                      <span className="w-3.5 h-3.5 rounded-full bg-black text-white flex items-center justify-center text-[8px] font-black">A</span>
+                      <span>ตัวขาวพื้นดำ</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Microphone picker. Locked for the whole of a session —
+                    pausing does not unlock it, because switching device
+                    reconnects the capture pipeline and would cut the meeting
+                    mid-sentence. */}
+                <div>
+                  <label htmlFor="mic-device" className="block text-xs font-bold text-slate-700 mb-1.5">
+                    ไมโครโฟนที่ใช้อัดเสียง (Microphone)
+                  </label>
+                  <select
+                    id="mic-device"
+                    value={micDeviceId ?? ''}
+                    onChange={(e) => handleSelectMicDevice(e.target.value)}
+                    disabled={micLocked}
+                    title={
+                      micLocked
+                        ? 'เปลี่ยนไมโครโฟนระหว่าง session ไม่ได้ — จบ session นี้ก่อน'
+                        : 'เลือกไมโครโฟนที่จะใช้อัดเสียงใน session ถัดไป'
+                    }
+                    className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <option value="">ไมโครโฟนเริ่มต้นของเบราว์เซอร์</option>
+                    {micDevices.map((device, index) => (
+                      <option key={device.deviceId} value={device.deviceId}>
+                        {deviceLabel(device, index)}
+                      </option>
+                    ))}
+                  </select>
+                  {/* Ranked by urgency, not by state: a session recording on
+                      the WRONG microphone is the one thing the operator has to
+                      hear about immediately, even while the picker is locked. */}
+                  {capture.deviceFallback ? (
+                    <p className="mt-1 text-[11px] text-amber-600 font-semibold">
+                      เปิดไมโครโฟนที่เลือกไว้ไม่ได้ — กำลังอัดด้วยไมโครโฟนเริ่มต้นของเครื่องแทน
+                    </p>
+                  ) : micLocked ? (
+                    <p className="mt-1 text-[11px] text-slate-400">
+                      เปลี่ยนไมโครโฟนได้เมื่อจบ session แล้วเท่านั้น
+                    </p>
+                  ) : micDeviceMissing ? (
+                    <p className="mt-1 text-[11px] text-amber-600">
+                      ไม่พบไมโครโฟนที่เคยเลือกไว้ — session ถัดไปจะใช้ไมโครโฟนเริ่มต้นแทน
+                    </p>
+                  ) : null}
+                </div>
+
                 <div className="pt-3 border-t border-slate-200 space-y-2.5">
                   <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
                     <input
@@ -754,6 +1016,7 @@ export default function Admin() {
                 onToggleList={(id) => void glossaryState.toggleList(id)}
                 disabled={false}
                 onAdd={handleGlossaryAdd}
+                onAddMany={handleGlossaryAddMany}
                 onRemove={handleGlossaryRemove}
                 isOwnTerm={glossaryState.isOwnTerm}
               />
@@ -830,19 +1093,31 @@ export default function Admin() {
               word that no longer fitted, the way broadcast subtitles do.
           ────────────────────────────────────────────────────────────── */}
           <div className="shrink-0 px-3 pt-3 sm:px-6 sm:pt-4">
-            <div className="relative w-full max-w-5xl mx-auto bg-white rounded-2xl border border-slate-200 shadow-sm px-6 py-5 sm:px-10 sm:py-6 text-center">
+            <div
+              className={`relative w-full max-w-5xl mx-auto rounded-2xl border shadow-sm px-6 py-6 sm:px-10 sm:py-[28.8px] text-center transition-colors ${
+                isDarkCaption ? 'bg-black border-slate-700' : 'bg-white border-slate-200'
+              }`}
+            >
               {latestCaption && !isEditingBox && !hasPartial && (
                 <div className="absolute top-2.5 right-2.5 flex items-center gap-1">
                   <button
                     onClick={() => handleCopyItem(latestCaption)}
-                    className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
+                    className={`p-1.5 rounded-md transition-all ${
+                      isDarkCaption
+                        ? 'text-slate-500 hover:text-white hover:bg-white/10'
+                        : 'text-slate-400 hover:text-slate-700 hover:bg-slate-100'
+                    }`}
                     title="คัดลอกข้อความ"
                   >
-                    {copiedSeq === latestCaption.seq ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                    {copiedSeq === latestCaption.seq ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
                   </button>
                   <button
                     onClick={() => startEditing(latestCaption)}
-                    className="p-1.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
+                    className={`p-1.5 rounded-md transition-all ${
+                      isDarkCaption
+                        ? 'text-slate-500 hover:text-white hover:bg-white/10'
+                        : 'text-slate-400 hover:text-slate-700 hover:bg-slate-100'
+                    }`}
                     title="แก้ไขคำแปล"
                   >
                     <Edit2 className="w-3.5 h-3.5" />
@@ -851,9 +1126,11 @@ export default function Admin() {
               )}
 
               {!latestCaption && !hasPartial ? (
-                <div className="text-slate-400">
-                  <div className="font-bold text-slate-700 text-sm">พร้อมรับเสียงจากไมโครโฟน</div>
-                  <p className="text-xs text-slate-400 leading-relaxed mt-1">
+                <div className={isDarkCaption ? 'text-slate-500' : 'text-slate-400'}>
+                  <div className={`font-bold text-sm ${isDarkCaption ? 'text-slate-300' : 'text-slate-700'}`}>
+                    พร้อมรับเสียงจากไมโครโฟน
+                  </div>
+                  <p className="text-xs leading-relaxed mt-1">
                     กดปุ่มไมโครโฟนวงกลมกลางจอ จากนั้นพูดใส่ไมโครโฟนเพื่อทำการแปลภาษาแบบเรียลไทม์
                   </p>
                 </div>
@@ -892,20 +1169,38 @@ export default function Admin() {
                     <SubtitleText
                       text={boxSourceText}
                       maxLines={1}
-                      className={`text-base sm:text-lg mb-2 ${hasPartial ? 'text-slate-300' : 'text-slate-400'}`}
+                      className={`text-base sm:text-lg mb-2 ${
+                        isDarkCaption
+                          ? hasPartial ? 'text-slate-600' : 'text-slate-400'
+                          : hasPartial ? 'text-slate-300' : 'text-slate-400'
+                      }`}
                     />
                   )}
                   {boxTargetText ? (
                     <SubtitleText
                       text={boxTargetText}
                       maxLines={2}
-                      className={`${boxTextSizeClass(config.fontSize)} font-bold leading-snug tracking-tight text-black`}
+                      className={`${boxTextSizeClass(config.fontSize)} font-bold leading-snug tracking-tight ${
+                        isDarkCaption ? 'text-white' : 'text-black'
+                      }`}
                     />
                   ) : (
-                    <p className={`${boxTextSizeClass(config.fontSize)} font-normal text-slate-300`}>กำลังแปล…</p>
+                    <p
+                      className={`${boxTextSizeClass(config.fontSize)} font-normal ${
+                        isDarkCaption ? 'text-slate-600' : 'text-slate-300'
+                      }`}
+                    >
+                      กำลังแปล…
+                    </p>
                   )}
                   {config.showLatency && !hasPartial && latestCaption?.latencyMs ? (
-                    <span className="mt-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 font-mono text-[10px] text-slate-500 border border-slate-200">
+                    <span
+                      className={`mt-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-mono text-[10px] border ${
+                        isDarkCaption
+                          ? 'bg-white/5 text-slate-400 border-slate-700'
+                          : 'bg-slate-100 text-slate-500 border-slate-200'
+                      }`}
+                    >
                       <Zap className="w-3 h-3 text-amber-500" />
                       <span>{latestCaption.latencyMs}ms</span>
                     </span>
@@ -961,6 +1256,36 @@ export default function Admin() {
                 <span>กดเพื่อเริ่มอัดเสียงและแปลสด</span>
               )}
             </div>
+
+            {/* Why the session stopped on its own. Shown until the next one
+                starts: a session that ends by itself while nobody is looking
+                would otherwise be indistinguishable from one that crashed. */}
+            {autoStopped && !isSessionActive && (
+              <div className="max-w-sm px-3 py-2 rounded-lg bg-amber-50 border border-amber-200 text-[11px] text-amber-800 text-center leading-relaxed">
+                {autoStopped === 'idle' ? (
+                  <>
+                    ปิด session อัตโนมัติ เพราะไม่มีเสียงพูดเข้ามานานเกิน{' '}
+                    {Math.round(IDLE_STOP_MS / 60_000)} นาที — บทสนทนาที่บันทึกไว้ยังอยู่ครบ
+                    กดเริ่ม session ใหม่เพื่อบันทึกต่อได้
+                  </>
+                ) : (
+                  <>
+                    ปิด session อัตโนมัติ เพราะใช้งานครบเวลาสูงสุดต่อหนึ่ง session แล้ว —
+                    บทสนทนาที่บันทึกไว้ยังอยู่ครบ กดเริ่ม session ใหม่เพื่อบันทึกต่อได้
+                  </>
+                )}
+              </div>
+            )}
+
+            {isSessionActive && (
+              <div
+                className="flex items-center gap-1.5 font-mono text-sm font-bold text-slate-700 tabular-nums"
+                title="เวลาที่บันทึกไปแล้วใน session นี้"
+              >
+                <span className={`w-2 h-2 rounded-full ${paused ? 'bg-amber-500' : 'bg-rose-500 animate-pulse'}`} />
+                <span>{formatElapsed(elapsedMs)}</span>
+              </div>
+            )}
 
             <div className="flex items-center gap-2">
               {sessionId && (

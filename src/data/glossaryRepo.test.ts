@@ -168,6 +168,49 @@ describe('glossaryRepo terms', () => {
     });
   });
 
+  // An import of a hundred names through addTerm would be a hundred round
+  // trips, and a failure halfway would leave the glossary half-written.
+  it('writes many terms in one upsert', async () => {
+    const fake = createFakeSupabase([{ data: null }]);
+    await createGlossaryRepo(fake.client).addTerms('list-own', [
+      { section: 'person_names', term: ' สมชาย ', translation: ' Somchai ' },
+      { section: 'en_th_corrections', term: 'Kawin', translation: 'กวิน' }
+    ]);
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0]).toMatchObject({
+      table: 'glossary_terms',
+      op: 'upsert',
+      payload: [
+        { list_id: 'list-own', section: 'person_names', term: 'สมชาย', translation: 'Somchai' },
+        { list_id: 'list-own', section: 'en_th_corrections', term: 'Kawin', translation: 'กวิน' }
+      ]
+    });
+  });
+
+  // Postgres rejects an ON CONFLICT statement whose payload names the same
+  // conflict target twice ("cannot affect row a second time"), so a file
+  // listing a term twice must not reach it as two rows.
+  it('keeps only the last value when a term repeats in one batch', async () => {
+    const fake = createFakeSupabase([{ data: null }]);
+    await createGlossaryRepo(fake.client).addTerms('list-own', [
+      { section: 'person_names', term: 'Kawin', translation: 'กวิน' },
+      { section: 'person_names', term: 'Kawin', translation: 'กวินทร์' },
+      // Same term, different section — a different conflict target, so both
+      // rows must survive.
+      { section: 'en_th_corrections', term: 'Kawin', translation: 'กวิน' }
+    ]);
+    expect(fake.calls[0].payload).toEqual([
+      { list_id: 'list-own', section: 'person_names', term: 'Kawin', translation: 'กวินทร์' },
+      { list_id: 'list-own', section: 'en_th_corrections', term: 'Kawin', translation: 'กวิน' }
+    ]);
+  });
+
+  it('issues no statement for an empty batch', async () => {
+    const fake = createFakeSupabase([{ data: null }]);
+    await createGlossaryRepo(fake.client).addTerms('list-own', []);
+    expect(fake.calls).toHaveLength(0);
+  });
+
   it('throws a classified error when a term write is refused', async () => {
     const fake = createFakeSupabase([{ error: { message: 'permission denied', code: '42501' } }]);
     await expect(

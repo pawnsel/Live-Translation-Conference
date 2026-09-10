@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createFakeSupabase } from './testing/fakeSupabase';
-import { createProjectsRepo, PROJECT_SELECT } from './projectsRepo';
+import { createProjectsRepo, PROJECT_SELECT, TRANSCRIPT_PAGE_SIZE } from './projectsRepo';
 
 const projectRow = {
   id: 'proj-1',
@@ -23,6 +23,7 @@ const projectRow = {
       summary: null,
       report_item_count: null,
       summarize_runs: 0,
+      last_seen_at: '2026-01-01T00:10:00.000Z',
       item_count: 2
     }
   ]
@@ -92,23 +93,90 @@ describe('projectsRepo.loadSessionTranscript', () => {
       op: 'select',
       filters: [
         { kind: 'eq', column: 'session_id', value: 'sess-1' },
-        { kind: 'order', column: 'seq', value: { ascending: true } }
+        { kind: 'order', column: 'seq', value: { ascending: true } },
+        { kind: 'range', column: '', value: [0, TRANSCRIPT_PAGE_SIZE - 1] }
       ]
     });
     expect(items).toHaveLength(1);
     expect(items[0].targetText).toBe('Hello');
     expect(items[0].ts).toBe(Date.parse('2026-01-01T00:06:00.000Z') / 1000);
   });
+
+  // PostgREST caps how many rows one request may return (Supabase ships that
+  // cap at 1000) and says nothing when it truncates — it just answers with a
+  // short array. A three-hour meeting runs to a couple of thousand captions,
+  // so without paging the tail of every long meeting silently vanishes from
+  // the summary, the export and the bill.
+  it('keeps asking until a page comes back empty', async () => {
+    const page = (from: number, count: number) =>
+      Array.from({ length: count }, (_, i) => ({ ...transcriptRow, seq: from + i }));
+    const fake = createFakeSupabase([
+      { data: page(0, TRANSCRIPT_PAGE_SIZE) },
+      { data: page(TRANSCRIPT_PAGE_SIZE, 7) },
+      { data: [] }
+    ]);
+
+    const items = await createProjectsRepo(fake.client).loadSessionTranscript('sess-1');
+
+    expect(items).toHaveLength(TRANSCRIPT_PAGE_SIZE + 7);
+    expect(items[items.length - 1].seq).toBe(TRANSCRIPT_PAGE_SIZE + 6);
+    expect(fake.calls).toHaveLength(3);
+    expect(fake.calls[0].filters).toContainEqual({
+      kind: 'range',
+      column: '',
+      value: [0, TRANSCRIPT_PAGE_SIZE - 1]
+    });
+    expect(fake.calls[1].filters).toContainEqual({
+      kind: 'range',
+      column: '',
+      value: [TRANSCRIPT_PAGE_SIZE, TRANSCRIPT_PAGE_SIZE * 2 - 1]
+    });
+  });
+
+  // The server's cap may be lower than the page we ask for. Advancing by the
+  // page SIZE would then skip every row between what came back and where the
+  // next request starts; advancing by what actually arrived cannot.
+  it('advances by the rows received, not the page size', async () => {
+    const serverCap = 2;
+    const page = (from: number) =>
+      Array.from({ length: serverCap }, (_, i) => ({ ...transcriptRow, seq: from + i }));
+    const fake = createFakeSupabase([{ data: page(0) }, { data: page(2) }, { data: [] }]);
+
+    const items = await createProjectsRepo(fake.client).loadSessionTranscript('sess-1');
+
+    expect(items.map((i) => i.seq)).toEqual([0, 1, 2, 3]);
+    expect(fake.calls[1].filters).toContainEqual({
+      kind: 'range',
+      column: '',
+      value: [2, TRANSCRIPT_PAGE_SIZE + 1]
+    });
+  });
+
+  // A short page cannot mean "that was the last one": the server's own cap
+  // may be lower than the page asked for, and a capped page is short too.
+  // Only an empty page proves the end, so one extra round trip is the price
+  // of never truncating a meeting.
+  it('confirms the end with an empty page rather than trusting a short one', async () => {
+    const fake = createFakeSupabase([{ data: [transcriptRow] }, { data: [] }]);
+    const items = await createProjectsRepo(fake.client).loadSessionTranscript('sess-1');
+    expect(items).toHaveLength(1);
+    expect(fake.calls).toHaveLength(2);
+  });
+
+  it('issues one request for a session that recorded nothing', async () => {
+    const fake = createFakeSupabase([{ data: [] }]);
+    expect(await createProjectsRepo(fake.client).loadSessionTranscript('sess-1')).toEqual([]);
+    expect(fake.calls).toHaveLength(1);
+  });
 });
 
 describe('projectsRepo.loadProjectTranscripts', () => {
   it('reads every session of a project in one statement, grouped by session', async () => {
     const second = { ...transcriptRow, session_id: 'sess-2', seq: 1, target_text: 'World' };
-    const fake = createFakeSupabase([{ data: [transcriptRow, second] }]);
+    const fake = createFakeSupabase([{ data: [transcriptRow, second] }, { data: [] }]);
 
     const grouped = await createProjectsRepo(fake.client).loadProjectTranscripts('proj-1');
 
-    expect(fake.calls).toHaveLength(1);
     expect(fake.calls[0]).toMatchObject({ table: 'transcript_items', op: 'select' });
     expect(Object.keys(grouped).sort()).toEqual(['sess-1', 'sess-2']);
     expect(grouped['sess-2'][0].targetText).toBe('World');
@@ -117,6 +185,29 @@ describe('projectsRepo.loadProjectTranscripts', () => {
   it('returns an empty map when the project has recorded nothing', async () => {
     const fake = createFakeSupabase([{ data: [] }]);
     expect(await createProjectsRepo(fake.client).loadProjectTranscripts('proj-1')).toEqual({});
+  });
+
+  // Same cap, same consequence, but worse: this one spans every session in
+  // the project, so a project holding three long meetings loses far more
+  // than one meeting's worth of tail.
+  it('pages through a project that holds more captions than one request returns', async () => {
+    const page = (session: string, from: number, count: number) =>
+      Array.from({ length: count }, (_, i) => ({ ...transcriptRow, session_id: session, seq: from + i }));
+    const fake = createFakeSupabase([
+      { data: page('sess-1', 0, TRANSCRIPT_PAGE_SIZE) },
+      { data: page('sess-2', 0, 3) },
+      { data: [] }
+    ]);
+
+    const grouped = await createProjectsRepo(fake.client).loadProjectTranscripts('proj-1');
+
+    expect(grouped['sess-1']).toHaveLength(TRANSCRIPT_PAGE_SIZE);
+    expect(grouped['sess-2']).toHaveLength(3);
+    expect(fake.calls[1].filters).toContainEqual({
+      kind: 'range',
+      column: '',
+      value: [TRANSCRIPT_PAGE_SIZE, TRANSCRIPT_PAGE_SIZE * 2 - 1]
+    });
   });
 });
 
@@ -165,6 +256,7 @@ const newSessionRow = {
   summary: null,
   report_item_count: null,
   summarize_runs: 0,
+  last_seen_at: '2026-01-01T00:10:00.000Z',
   item_count: 0
 };
 
@@ -352,6 +444,49 @@ describe('projectsRepo.markSummarizing', () => {
       payload: { summarize_runs: 3 },
       filters: [{ kind: 'eq', column: 'id', value: 'sess-1' }]
     });
+  });
+});
+
+// A tab that vanishes cannot close its own session, and an open session is
+// billed up to `now` — so a mid-meeting refresh used to keep adding to the
+// project's estimate for as long as nobody noticed.
+describe('projectsRepo heartbeat', () => {
+  it('stamps the session as still being recorded', async () => {
+    const fake = createFakeSupabase([{ data: null }]);
+    await createProjectsRepo(fake.client).touchSession('sess-1');
+
+    expect(fake.calls[0]).toMatchObject({
+      table: 'project_sessions',
+      op: 'update',
+      filters: [
+        { kind: 'eq', column: 'id', value: 'sess-1' },
+        // Never revive a session already closed: a heartbeat still in flight
+        // when the operator pressed stop would make it look live again.
+        { kind: 'is', column: 'ended_at', value: null }
+      ]
+    });
+    expect(Object.keys((fake.calls[0].payload ?? {}) as object)).toEqual(['last_seen_at']);
+  });
+
+  it('closes an orphan at the moment it was last seen, not now', async () => {
+    const fake = createFakeSupabase([{ data: null }]);
+    const lastSeen = Date.parse('2026-01-01T00:10:00.000Z');
+    await createProjectsRepo(fake.client).closeStaleSession('sess-1', lastSeen);
+
+    expect(fake.calls[0]).toMatchObject({
+      table: 'project_sessions',
+      op: 'update',
+      payload: { ended_at: '2026-01-01T00:10:00.000Z' }
+    });
+  });
+
+  // The guard that makes the sweep safe to run from any tab: if another tab
+  // closed the session first this matches nothing, rather than overwriting a
+  // real end time with an older one.
+  it('refuses to reclose a session that is already closed', async () => {
+    const fake = createFakeSupabase([{ data: null }]);
+    await createProjectsRepo(fake.client).closeStaleSession('sess-1', Date.now());
+    expect(fake.calls[0].filters).toContainEqual({ kind: 'is', column: 'ended_at', value: null });
   });
 });
 

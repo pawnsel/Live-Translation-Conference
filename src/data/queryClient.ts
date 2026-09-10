@@ -27,6 +27,9 @@ export interface QueryBuilder {
   is(column: string, value: unknown): QueryBuilder;
   order(column: string, options?: { ascending?: boolean }): QueryBuilder;
   limit(count: number): QueryBuilder;
+  /** Inclusive row window, both ends. The only way to read past PostgREST's
+   *  per-request row cap, which truncates silently. */
+  range(from: number, to: number): QueryBuilder;
   single(): QueryBuilder;
   maybeSingle(): QueryBuilder;
   // Deliberately not generic (unlike PromiseLike<T>.then): the recording
