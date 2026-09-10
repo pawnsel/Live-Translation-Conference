@@ -23,6 +23,7 @@ const projectRow = {
       summary: null,
       report_item_count: null,
       summarize_runs: 0,
+      last_seen_at: '2026-01-01T00:10:00.000Z',
       item_count: 2
     }
   ]
@@ -255,6 +256,7 @@ const newSessionRow = {
   summary: null,
   report_item_count: null,
   summarize_runs: 0,
+  last_seen_at: '2026-01-01T00:10:00.000Z',
   item_count: 0
 };
 
@@ -442,6 +444,49 @@ describe('projectsRepo.markSummarizing', () => {
       payload: { summarize_runs: 3 },
       filters: [{ kind: 'eq', column: 'id', value: 'sess-1' }]
     });
+  });
+});
+
+// A tab that vanishes cannot close its own session, and an open session is
+// billed up to `now` — so a mid-meeting refresh used to keep adding to the
+// project's estimate for as long as nobody noticed.
+describe('projectsRepo heartbeat', () => {
+  it('stamps the session as still being recorded', async () => {
+    const fake = createFakeSupabase([{ data: null }]);
+    await createProjectsRepo(fake.client).touchSession('sess-1');
+
+    expect(fake.calls[0]).toMatchObject({
+      table: 'project_sessions',
+      op: 'update',
+      filters: [
+        { kind: 'eq', column: 'id', value: 'sess-1' },
+        // Never revive a session already closed: a heartbeat still in flight
+        // when the operator pressed stop would make it look live again.
+        { kind: 'is', column: 'ended_at', value: null }
+      ]
+    });
+    expect(Object.keys((fake.calls[0].payload ?? {}) as object)).toEqual(['last_seen_at']);
+  });
+
+  it('closes an orphan at the moment it was last seen, not now', async () => {
+    const fake = createFakeSupabase([{ data: null }]);
+    const lastSeen = Date.parse('2026-01-01T00:10:00.000Z');
+    await createProjectsRepo(fake.client).closeStaleSession('sess-1', lastSeen);
+
+    expect(fake.calls[0]).toMatchObject({
+      table: 'project_sessions',
+      op: 'update',
+      payload: { ended_at: '2026-01-01T00:10:00.000Z' }
+    });
+  });
+
+  // The guard that makes the sweep safe to run from any tab: if another tab
+  // closed the session first this matches nothing, rather than overwriting a
+  // real end time with an older one.
+  it('refuses to reclose a session that is already closed', async () => {
+    const fake = createFakeSupabase([{ data: null }]);
+    await createProjectsRepo(fake.client).closeStaleSession('sess-1', Date.now());
+    expect(fake.calls[0].filters).toContainEqual({ kind: 'is', column: 'ended_at', value: null });
   });
 });
 

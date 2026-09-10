@@ -31,6 +31,7 @@ export interface SessionRow {
   report_item_count: number | null;
   summarize_runs: number;
   item_count: number;
+  last_seen_at: string | null;
 }
 
 export interface TranscriptRow {
@@ -66,7 +67,10 @@ export function toSession(row: SessionRow): ProjectSession {
     summary: row.summary === null ? undefined : row.summary,
     reportItemCount: row.report_item_count === null ? undefined : row.report_item_count,
     summarizeRuns: row.summarize_runs,
-    itemCount: row.item_count
+    itemCount: row.item_count,
+    // Null only on a row written before the column existed; staleSessions
+    // falls back to started_at there.
+    lastSeenAt: toMillisOrNull(row.last_seen_at)
     // `transcripts` is deliberately absent: undefined means "not fetched".
   };
 }

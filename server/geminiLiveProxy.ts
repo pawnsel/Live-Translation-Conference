@@ -84,6 +84,11 @@ export function registerGeminiLiveProxy(httpServer: HttpServer, opts: GeminiLive
       model: opts.model,
       targetLanguageCode: opts.targetLanguageCode,
       sourceLanguageCodes: opts.sourceLanguageCodes,
+      // Handed on so the bridge can keep checking this caller for the life of
+      // the session, not just at the handshake — a session is what actually
+      // spends money, and it can outlive both the token and the approval.
+      accessToken: bearerFromWebSocketProtocol(req.headers['sec-websocket-protocol']),
+      verify: opts.verify,
       openUpstream: () => new WebSocket(`${GEMINI_LIVE_WS_URL}?key=${opts.apiKey}`)
     });
   });

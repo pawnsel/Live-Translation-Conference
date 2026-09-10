@@ -57,6 +57,12 @@ export interface ProjectSession {
    *  whether `summary` ended up filled in. Undefined on sessions recorded
    *  before costs were estimated. */
   summarizeRuns?: number;
+  /** Last time the tab recording this session said it was still there. The
+   *  console writes it every SESSION_HEARTBEAT_MS while recording; a session
+   *  whose heartbeat stops is closed at this timestamp rather than being left
+   *  open and billed forever (see data/staleSessions.ts). Absent on rows
+   *  written before heartbeats existed. */
+  lastSeenAt?: number;
 }
 
 export interface ProjectBill {

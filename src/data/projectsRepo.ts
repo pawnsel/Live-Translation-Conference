@@ -27,7 +27,7 @@ import {
 export const PROJECT_SELECT = '*, project_sessions(*)';
 
 const SESSION_COLUMNS =
-  'id, project_id, asr_session_id, started_at, ended_at, source_lang, target_lang, summary, report_item_count, summarize_runs, item_count';
+  'id, project_id, asr_session_id, started_at, ended_at, source_lang, target_lang, summary, report_item_count, summarize_runs, item_count, last_seen_at';
 
 const TRANSCRIPT_COLUMNS =
   'session_id, seq, source_text, target_text, source_lang, target_lang, ts, latency_ms, is_edited';
@@ -83,6 +83,11 @@ export interface ProjectsRepo {
   appendCaption(sessionId: string, item: TranscriptItem): Promise<void>;
   editCaption(sessionId: string, seq: number, targetText: string): Promise<void>;
   markSummarizing(sessionId: string, runs: number): Promise<void>;
+  /** Heartbeat: "the tab recording this session is still here." */
+  touchSession(sessionId: string): Promise<void>;
+  /** Closes a session whose tab stopped reporting, at the moment it was last
+   *  seen. Guarded so it can never close one that is still running. */
+  closeStaleSession(sessionId: string, endedAt: number): Promise<void>;
   saveSummary(sessionId: string, summary: string, reportItemCount: number): Promise<void>;
   finishProject(
     projectId: string,
@@ -265,6 +270,32 @@ export function createProjectsRepo(client: QueryClient): ProjectsRepo {
       // to be right, not race-proof: one operator, one console.
       unwrap(
         await client.from('project_sessions').update({ summarize_runs: runs }).eq('id', sessionId)
+      );
+    },
+
+    async touchSession(sessionId) {
+      unwrap(
+        await client
+          .from('project_sessions')
+          .update({ last_seen_at: new Date().toISOString() })
+          .eq('id', sessionId)
+          // Never revive a session that has already been closed: a heartbeat
+          // still in flight when the operator pressed stop would otherwise
+          // make a finished session look live again.
+          .is('ended_at', null)
+      );
+    },
+
+    async closeStaleSession(sessionId, endedAt) {
+      unwrap(
+        await client
+          .from('project_sessions')
+          .update({ ended_at: new Date(endedAt).toISOString() })
+          .eq('id', sessionId)
+          // The guard that makes this safe to run from any tab: if another
+          // tab closed the session first, this matches zero rows instead of
+          // overwriting a real end time with an older one.
+          .is('ended_at', null)
       );
     },
 

@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useGeminiLiveCapture } from './useGeminiLiveCapture';
 import { emptyGlossary } from '../../glossary';
 import { reconnectDelayMs } from './reconnectPolicy';
+import { AUTH_REFRESH_INTERVAL_MS } from './useGeminiLiveCapture';
 
 // jsdom has no WebSocket, no AudioContext and no getUserMedia, so the whole
 // browser side is faked here. Each fake records the instances it created so a
@@ -15,7 +16,7 @@ class FakeWebSocket {
   readyState = 1;
   sent: string[] = [];
   onopen: (() => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((e?: { code?: number }) => void) | null = null;
   onerror: (() => void) | null = null;
   onmessage: ((e: { data: string }) => void) | null = null;
 
@@ -37,6 +38,11 @@ class FakeWebSocket {
   drop() {
     this.readyState = 3;
     this.onclose?.();
+  }
+  /** Simulates the proxy deliberately ending the session with a code. */
+  closeFromServer(code: number) {
+    this.readyState = 3;
+    this.onclose?.({ code } as CloseEvent);
   }
 }
 
@@ -285,5 +291,112 @@ describe('useGeminiLiveCapture microphone selection', () => {
     // again with the identical constraints would only prompt the operator
     // twice for the same denial.
     expect(getUserMedia).toHaveBeenCalledTimes(1);
+  });
+});
+
+// The proxy can now end a session on purpose — the account was revoked, or the
+// session hit its six-hour ceiling (server/geminiLiveBridge.ts). Reconnecting
+// through those would defeat the guard entirely: the client would just open a
+// fresh billed session a second later, forever.
+describe('useGeminiLiveCapture server-initiated close', () => {
+  it('reconnects after an ordinary drop', async () => {
+    renderCapture();
+    await settle();
+    await act(async () => {
+      FakeWebSocket.instances[0].drop();
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(reconnectDelayMs(1));
+    });
+    await settle();
+
+    expect(FakeWebSocket.instances.length).toBe(2);
+  });
+
+  it.each([
+    [4403, 'revoked access'],
+    [4408, 'the session length ceiling']
+  ])('stops for good when the proxy closes with %i (%s)', async (code) => {
+    const { result } = renderCapture();
+    await settle();
+
+    await act(async () => {
+      FakeWebSocket.instances[0].closeFromServer(code);
+    });
+    await settle();
+    await act(async () => {
+      vi.advanceTimersByTime(reconnectDelayMs(1) * 20);
+    });
+    await settle();
+
+    expect(FakeWebSocket.instances.length).toBe(1);
+    expect(result.current.status).toBe('error');
+    expect(result.current.error).toBeTruthy();
+  });
+
+  it('leaves no microphone or AudioContext running after a terminal close', async () => {
+    renderCapture();
+    await settle();
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => {
+      socket.setupComplete();
+    });
+    await settle();
+
+    await act(async () => {
+      socket.closeFromServer(4408);
+    });
+    await settle();
+
+    expect(tracks.filter((t) => !t.stopped).length).toBe(0);
+    expect(contexts.filter((c) => !c.closed).length).toBe(0);
+  });
+});
+
+// A Supabase access token expires about an hour in. The bridge re-checks the
+// caller every five minutes and cuts the session if the token stays unusable,
+// so the browser has to keep pushing the refreshed one down the socket it
+// already holds — otherwise every meeting would die at the sixty-minute mark.
+describe('useGeminiLiveCapture token refresh', () => {
+  it('pushes the current access token down the open socket periodically', async () => {
+    renderCapture();
+    await settle();
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => {
+      socket.setupComplete();
+    });
+    await settle();
+
+    const before = socket.sent.filter((s) => s.includes('authRefresh')).length;
+    expect(before).toBe(0);
+
+    await act(async () => {
+      vi.advanceTimersByTime(AUTH_REFRESH_INTERVAL_MS);
+    });
+    await settle();
+
+    const frames = socket.sent
+      .map((s) => JSON.parse(s))
+      .filter((f) => f.authRefresh !== undefined);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].authRefresh.accessToken).toBe('test-token');
+  });
+
+  it('stops pushing once the session ends', async () => {
+    const { unmount } = renderCapture();
+    await settle();
+    const socket = FakeWebSocket.instances[0];
+    await act(async () => {
+      socket.setupComplete();
+    });
+    await settle();
+
+    unmount();
+    await act(async () => {
+      vi.advanceTimersByTime(AUTH_REFRESH_INTERVAL_MS * 3);
+    });
+    await settle();
+
+    expect(socket.sent.filter((s) => s.includes('authRefresh'))).toHaveLength(0);
   });
 });
