@@ -1,5 +1,16 @@
-import { describe, expect, it } from 'vitest';
-import { createLiveBridge, CONNECTING, OPEN, type SocketLike } from './geminiLiveBridge';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  createLiveBridge,
+  CONNECTING,
+  OPEN,
+  REVERIFY_INTERVAL_MS,
+  EXPIRED_TOKEN_GRACE_MS,
+  SESSION_MAX_MS,
+  CLOSE_REVOKED,
+  CLOSE_MAX_DURATION,
+  type SocketLike
+} from './geminiLiveBridge';
+import type { AuthResult, Verifier } from './auth';
 
 /** Minimal SocketLike double: records what was sent, lets a test fire events. */
 export class FakeSocket implements SocketLike {
@@ -31,13 +42,19 @@ export class FakeSocket implements SocketLike {
 }
 
 /** Drives a bridge with a fake client and a queue of fake upstreams. */
-export function makeBridge(overrides: { targetLanguageCode?: string } = {}) {
+export function makeBridge(
+  overrides: { targetLanguageCode?: string; verify?: Verifier; accessToken?: string } = {}
+) {
   const client = new FakeSocket();
   const upstreams: FakeSocket[] = [];
   createLiveBridge(client, {
     model: 'test-model',
     targetLanguageCode: overrides.targetLanguageCode ?? 'en',
     sourceLanguageCodes: ['th-TH'],
+    accessToken: overrides.accessToken ?? 'token-1',
+    verify:
+      overrides.verify ??
+      (async () => ({ kind: 'allow', user: { id: 'u1', email: 'a@chula.ac.th' } })),
     openUpstream: () => {
       const up = new FakeSocket();
       up.readyState = CONNECTING;
@@ -46,6 +63,31 @@ export function makeBridge(overrides: { targetLanguageCode?: string } = {}) {
     }
   });
   return { client, upstreams };
+}
+
+/** A verifier that answers with whatever the test currently wants, and counts
+ *  the tokens it was asked about. */
+export function scriptedVerifier(initial: AuthResult) {
+  const seen: (string | null)[] = [];
+  let answer = initial;
+  const verify: Verifier = async (token) => {
+    seen.push(token);
+    return answer;
+  };
+  return {
+    verify,
+    seen,
+    set(next: AuthResult) {
+      answer = next;
+    }
+  };
+}
+
+const ALLOW: AuthResult = { kind: 'allow', user: { id: 'u1', email: 'a@chula.ac.th' } };
+
+/** Lets the bridge's awaited verify() calls settle between timer advances. */
+async function settle() {
+  for (let i = 0; i < 5; i++) await Promise.resolve();
 }
 
 /** Opens the newest upstream and completes its setup handshake. */
@@ -243,5 +285,170 @@ describe('upstream swap', () => {
 
     upstreams[5].emit('close', 1006, Buffer.from(''));
     expect(client.closed).not.toBeNull();
+  });
+});
+
+// A live session is what actually spends money on the Gemini key, and until
+// now it was checked exactly once, at the handshake. The bridge swaps its own
+// upstream every ten minutes to keep a long meeting going, so a session left
+// open — or one belonging to an account revoked mid-meeting — could stream
+// indefinitely.
+describe('createLiveBridge session guards', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('re-checks the caller periodically rather than only at the handshake', async () => {
+    const scripted = scriptedVerifier(ALLOW);
+    const { client } = makeBridge({ verify: scripted.verify });
+
+    await vi.advanceTimersByTimeAsync(REVERIFY_INTERVAL_MS);
+    await settle();
+    expect(scripted.seen.length).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(REVERIFY_INTERVAL_MS);
+    await settle();
+    expect(scripted.seen.length).toBe(2);
+    expect(client.closed).toBeNull();
+  });
+
+  it('cuts a session whose account was revoked', async () => {
+    const scripted = scriptedVerifier(ALLOW);
+    const { client } = makeBridge({ verify: scripted.verify });
+
+    scripted.set({ kind: 'deny', status: 403, reason: 'this account is revoked, not approved' });
+    await vi.advanceTimersByTimeAsync(REVERIFY_INTERVAL_MS);
+    await settle();
+
+    expect(client.closed?.code).toBe(CLOSE_REVOKED);
+  });
+
+  // The trap this guard exists for: Supabase access tokens expire after an
+  // hour, and the verifier reports an expired token with the same 401 it uses
+  // for a forged one. Closing on the first 401 would end EVERY meeting at the
+  // sixty-minute mark — the exact three-hour meetings this system is for.
+  it('does not cut a session the moment its token expires', async () => {
+    const scripted = scriptedVerifier(ALLOW);
+    const { client } = makeBridge({ verify: scripted.verify });
+
+    scripted.set({ kind: 'deny', status: 401, reason: 'invalid or expired session' });
+    await vi.advanceTimersByTimeAsync(REVERIFY_INTERVAL_MS);
+    await settle();
+
+    expect(client.closed).toBeNull();
+  });
+
+  it('cuts a session whose token stays unusable past the grace window', async () => {
+    const scripted = scriptedVerifier(ALLOW);
+    const { client } = makeBridge({ verify: scripted.verify });
+
+    scripted.set({ kind: 'deny', status: 401, reason: 'invalid or expired session' });
+    await vi.advanceTimersByTimeAsync(EXPIRED_TOKEN_GRACE_MS + REVERIFY_INTERVAL_MS);
+    await settle();
+
+    expect(client.closed?.code).toBe(CLOSE_REVOKED);
+  });
+
+  it('forgives the expiry once the client sends a token that works', async () => {
+    const scripted = scriptedVerifier(ALLOW);
+    const { client } = makeBridge({ verify: scripted.verify });
+
+    scripted.set({ kind: 'deny', status: 401, reason: 'invalid or expired session' });
+    await vi.advanceTimersByTimeAsync(REVERIFY_INTERVAL_MS);
+    await settle();
+
+    // supabase-js refreshed in the browser and the client pushed the new one
+    // down the socket it already has open.
+    client.emit('message', Buffer.from(JSON.stringify({ authRefresh: { accessToken: 'token-2' } })), false);
+    scripted.set(ALLOW);
+    await vi.advanceTimersByTimeAsync(REVERIFY_INTERVAL_MS);
+    await settle();
+
+    expect(scripted.seen.at(-1)).toBe('token-2');
+
+    // The grace clock must have been reset, not merely paused: a later expiry
+    // gets its own full window.
+    scripted.set({ kind: 'deny', status: 401, reason: 'invalid or expired session' });
+    await vi.advanceTimersByTimeAsync(REVERIFY_INTERVAL_MS);
+    await settle();
+    expect(client.closed).toBeNull();
+  });
+
+  // Failing closed is right at the handshake, where no meeting exists yet.
+  // Mid-meeting it would mean a Supabase blip ends a real conference.
+  it('never cuts a live session because Supabase is unreachable', async () => {
+    const scripted = scriptedVerifier(ALLOW);
+    const { client } = makeBridge({ verify: scripted.verify });
+
+    scripted.set({ kind: 'deny', status: 503, reason: 'could not reach the authentication service' });
+    await vi.advanceTimersByTimeAsync(EXPIRED_TOKEN_GRACE_MS * 3);
+    await settle();
+
+    expect(client.closed).toBeNull();
+  });
+
+  it('does not relay the auth refresh frame upstream', async () => {
+    const { client, upstreams } = makeBridge();
+    completeSetup(upstreams[0]);
+    const before = upstreams[0].sent.length;
+
+    client.emit('message', Buffer.from(JSON.stringify({ authRefresh: { accessToken: 'token-2' } })), false);
+
+    expect(upstreams[0].sent.length).toBe(before);
+  });
+
+  // Otherwise a client whose access was pulled could hold its billed session
+  // open indefinitely by sending a fresh piece of garbage every few minutes.
+  it('does not let a stream of refreshes extend the grace window', async () => {
+    const scripted = scriptedVerifier(ALLOW);
+    const { client } = makeBridge({ verify: scripted.verify });
+
+    scripted.set({ kind: 'deny', status: 401, reason: 'invalid or expired session' });
+    for (let tick = 0; tick < 4; tick++) {
+      client.emit(
+        'message',
+        Buffer.from(JSON.stringify({ authRefresh: { accessToken: `junk-${tick}` } })),
+        false
+      );
+      await vi.advanceTimersByTimeAsync(REVERIFY_INTERVAL_MS);
+      await settle();
+    }
+
+    expect(client.closed?.code).toBe(CLOSE_REVOKED);
+  });
+
+  it('ignores an auth refresh carrying no usable token', async () => {
+    const scripted = scriptedVerifier(ALLOW);
+    const { client } = makeBridge({ verify: scripted.verify, accessToken: 'token-1' });
+
+    client.emit('message', Buffer.from(JSON.stringify({ authRefresh: { accessToken: 42 } })), false);
+    await vi.advanceTimersByTimeAsync(REVERIFY_INTERVAL_MS);
+    await settle();
+
+    expect(scripted.seen.at(-1)).toBe('token-1');
+  });
+
+  // The runaway-cost guard: a tab left streaming overnight bills about $2.20
+  // an hour whether or not anybody is in the room.
+  it('closes a session that has run past the maximum duration', async () => {
+    const { client } = makeBridge();
+
+    await vi.advanceTimersByTimeAsync(SESSION_MAX_MS - 1000);
+    await settle();
+    expect(client.closed).toBeNull();
+
+    await vi.advanceTimersByTimeAsync(2000);
+    await settle();
+    expect(client.closed?.code).toBe(CLOSE_MAX_DURATION);
+  });
+
+  it('stops re-checking once the client has gone', async () => {
+    const scripted = scriptedVerifier(ALLOW);
+    const { client } = makeBridge({ verify: scripted.verify });
+
+    client.emit('close');
+    await vi.advanceTimersByTimeAsync(REVERIFY_INTERVAL_MS * 3);
+    await settle();
+
+    expect(scripted.seen.length).toBe(0);
   });
 });
