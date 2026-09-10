@@ -21,6 +21,8 @@ import {
   RefreshCw,
   ChevronDown,
   ChevronUp,
+  ChevronLeft,
+  ChevronRight,
   User,
   LogOut
 } from 'lucide-react';
@@ -45,6 +47,7 @@ import { useGeminiLiveCapture, type CaptionResult } from '../asr/audio/useGemini
 import { useAudioInputDevices } from '../asr/audio/useAudioInputDevices';
 import { deviceLabel, resolveDeviceId } from '../asr/audio/audioDevices';
 import { loadMicDeviceId, saveMicDeviceId } from '../storage/micStore';
+import { loadSidebarCollapsed, saveSidebarCollapsed } from '../storage/sidebarStore';
 import { autoStopReason, IDLE_STOP_MS, type AutoStopReason } from '../asr/audio/sessionLimits';
 import { SESSION_HEARTBEAT_MS } from '../data/staleSessions';
 import { forgetTabSession, loadTabSession, rememberTabSession } from '../storage/tabSession';
@@ -208,6 +211,14 @@ export default function Admin() {
   });
   const [activeTab, setActiveTab] = useState<'languages' | 'dictionary'>('languages');
   const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => loadSidebarCollapsed());
+  const toggleSidebarCollapsed = () => {
+    setSidebarCollapsed((prev) => {
+      const next = !prev;
+      saveSidebarCollapsed(next);
+      return next;
+    });
+  };
   const [showHistory, setShowHistory] = useState(false);
   const [showSessionHistory, setShowSessionHistory] = useState(false);
   // Which session's summary popup is open, by ProjectSession id. The session
@@ -955,218 +966,237 @@ export default function Admin() {
       ────────────────────────────────────────────────────────────── */}
       <div className="flex-1 flex overflow-hidden relative">
         <aside
-          className={`fixed inset-y-15 left-0 z-20 w-84 lg:w-96 bg-white border-r border-slate-200 flex flex-col transition-transform duration-200 lg:static lg:translate-x-0 ${
+          className={`fixed inset-y-15 left-0 z-20 w-84 bg-white border-r border-slate-200 flex flex-col transition-[transform,width] duration-200 lg:static lg:translate-x-0 lg:overflow-hidden ${
             mobileSettingsOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-full'
-          }`}
+          } ${sidebarCollapsed ? 'lg:w-0 lg:border-r-0' : 'lg:w-96'}`}
         >
-          <div className="grid grid-cols-2 p-1.5 bg-slate-50 border-b border-slate-200 text-xs gap-1 shrink-0">
-            <button
-              onClick={() => setActiveTab('languages')}
-              className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all ${
-                activeTab === 'languages' ? 'bg-white text-[#DE5C8E] shadow-xs' : 'text-slate-500 hover:text-slate-800'
-              }`}
-            >
-              <Languages className="w-4 h-4" />
-              <span className="whitespace-nowrap">ภาษาและการตั้งค่า</span>
-            </button>
-            <button
-              onClick={() => setActiveTab('dictionary')}
-              className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all ${
-                activeTab === 'dictionary' ? 'bg-white text-[#DE5C8E] shadow-xs' : 'text-slate-500 hover:text-slate-800'
-              }`}
-            >
-              <BookOpen className="w-4 h-4" />
-              <span className="whitespace-nowrap">พจนานุกรม</span>
-            </button>
-          </div>
+          {/* Holds the expanded width even while the <aside> animates down to
+              lg:w-0, so the panel is clipped away rather than reflowing its
+              controls into an ever-narrower column on the way out. */}
+          <div className="flex-1 flex flex-col min-h-0 lg:w-96">
+            <div className="grid grid-cols-2 p-1.5 bg-slate-50 border-b border-slate-200 text-xs gap-1 shrink-0">
+              <button
+                onClick={() => setActiveTab('languages')}
+                className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all ${
+                  activeTab === 'languages' ? 'bg-white text-[#DE5C8E] shadow-xs' : 'text-slate-500 hover:text-slate-800'
+                }`}
+              >
+                <Languages className="w-4 h-4" />
+                <span className="whitespace-nowrap">ภาษาและการตั้งค่า</span>
+              </button>
+              <button
+                onClick={() => setActiveTab('dictionary')}
+                className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all ${
+                  activeTab === 'dictionary' ? 'bg-white text-[#DE5C8E] shadow-xs' : 'text-slate-500 hover:text-slate-800'
+                }`}
+              >
+                <BookOpen className="w-4 h-4" />
+                <span className="whitespace-nowrap">พจนานุกรม</span>
+              </button>
+            </div>
 
-          <div className="flex-1 p-4 overflow-y-auto space-y-4">
-            {activeTab === 'languages' && (
-              <div className="space-y-4">
-                <div className="space-y-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-800">คู่ภาษาแปลสด (Thai ↔ English)</span>
-                    <button
-                      type="button"
-                      onClick={handleSwapLanguages}
-                      className="text-[11px] px-2.5 py-1 bg-white hover:bg-pink-50 text-[#DE5C8E] border border-pink-200 rounded-lg font-bold flex items-center gap-1 shadow-2xs transition-all"
-                      title="สลับภาษาผู้พูดและภาษาแปล"
-                    >
-                      <ArrowLeftRight className="w-3.5 h-3.5" />
-                      <span>สลับภาษา</span>
-                    </button>
+            <div className="flex-1 p-4 overflow-y-auto space-y-4">
+              {activeTab === 'languages' && (
+                <div className="space-y-4">
+                  <div className="space-y-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-slate-800">คู่ภาษาแปลสด (Thai ↔ English)</span>
+                      <button
+                        type="button"
+                        onClick={handleSwapLanguages}
+                        className="text-[11px] px-2.5 py-1 bg-white hover:bg-pink-50 text-[#DE5C8E] border border-pink-200 rounded-lg font-bold flex items-center gap-1 shadow-2xs transition-all"
+                        title="สลับภาษาผู้พูดและภาษาแปล"
+                      >
+                        <ArrowLeftRight className="w-3.5 h-3.5" />
+                        <span>สลับภาษา</span>
+                      </button>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">ภาษาของผู้พูด (Source Language)</label>
+                      <select
+                        value={sourceLang}
+                        onChange={(e) => setLanguage(e.target.value as 'th' | 'en')}
+                        className="w-full p-2.5 text-xs bg-white border border-slate-200 rounded-lg outline-none focus:border-[#DE5C8E] font-semibold text-slate-800"
+                      >
+                        <option value="th">{LANGS.th}</option>
+                        <option value="en">{LANGS.en}</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">ภาษาที่แปลเป็น (Target — อัตโนมัติ)</label>
+                      <select
+                        value={targetLang}
+                        onChange={(e) => setLanguage(other(e.target.value) as 'th' | 'en')}
+                        className="w-full p-2.5 text-xs bg-white border border-slate-200 rounded-lg outline-none focus:border-[#DE5C8E] font-semibold text-[#DE5C8E]"
+                      >
+                        <option value="en">แปลเป็นอังกฤษ (English)</option>
+                        <option value="th">แปลเป็นไทย (Thai)</option>
+                      </select>
+                    </div>
                   </div>
 
                   <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">ภาษาของผู้พูด (Source Language)</label>
+                    <label className="block text-xs font-bold text-slate-700 mb-1.5">ขนาดตัวอักษรข้อความแปล (Font Size)</label>
                     <select
-                      value={sourceLang}
-                      onChange={(e) => setLanguage(e.target.value as 'th' | 'en')}
-                      className="w-full p-2.5 text-xs bg-white border border-slate-200 rounded-lg outline-none focus:border-[#DE5C8E] font-semibold text-slate-800"
+                      value={config.fontSize}
+                      onChange={(e) => setConfig((c) => ({ ...c, fontSize: e.target.value as DisplayConfig['fontSize'] }))}
+                      className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium"
                     >
-                      <option value="th">{LANGS.th}</option>
-                      <option value="en">{LANGS.en}</option>
+                      <option value="small">ขนาดเล็ก (Small)</option>
+                      <option value="medium">ขนาดปานกลาง (Medium)</option>
+                      <option value="large">ขนาดใหญ่ (Large - แนะนำ)</option>
+                      <option value="xlarge">ขนาดใหญ่พิเศษ (Extra Large)</option>
                     </select>
                   </div>
 
                   <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">ภาษาที่แปลเป็น (Target — อัตโนมัติ)</label>
+                    <label className="block text-xs font-bold text-slate-700 mb-1.5">ธีมคำบรรยาย (Caption Theme)</label>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setConfig((c) => ({ ...c, captionTheme: 'light' }))}
+                        className={`flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all ${
+                          (config.captionTheme ?? 'light') === 'light'
+                            ? 'border-[#DE5C8E] ring-2 ring-pink-100 bg-white text-slate-800'
+                            : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-white'
+                        }`}
+                      >
+                        <span className="w-3.5 h-3.5 rounded-full bg-white border border-slate-300 text-black flex items-center justify-center text-[8px] font-black">A</span>
+                        <span>ตัวดำพื้นขาว</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfig((c) => ({ ...c, captionTheme: 'dark' }))}
+                        className={`flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all ${
+                          config.captionTheme === 'dark'
+                            ? 'border-[#DE5C8E] ring-2 ring-pink-100 bg-white text-slate-800'
+                            : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-white'
+                        }`}
+                      >
+                        <span className="w-3.5 h-3.5 rounded-full bg-black text-white flex items-center justify-center text-[8px] font-black">A</span>
+                        <span>ตัวขาวพื้นดำ</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Microphone picker. Locked for the whole of a session —
+                      pausing does not unlock it, because switching device
+                      reconnects the capture pipeline and would cut the meeting
+                      mid-sentence. */}
+                  <div>
+                    <label htmlFor="mic-device" className="block text-xs font-bold text-slate-700 mb-1.5">
+                      ไมโครโฟนที่ใช้อัดเสียง (Microphone)
+                    </label>
                     <select
-                      value={targetLang}
-                      onChange={(e) => setLanguage(other(e.target.value) as 'th' | 'en')}
-                      className="w-full p-2.5 text-xs bg-white border border-slate-200 rounded-lg outline-none focus:border-[#DE5C8E] font-semibold text-[#DE5C8E]"
+                      id="mic-device"
+                      value={micDeviceId ?? ''}
+                      onChange={(e) => handleSelectMicDevice(e.target.value)}
+                      disabled={micLocked}
+                      title={
+                        micLocked
+                          ? 'เปลี่ยนไมโครโฟนระหว่าง session ไม่ได้ — จบ session นี้ก่อน'
+                          : 'เลือกไมโครโฟนที่จะใช้อัดเสียงใน session ถัดไป'
+                      }
+                      className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium disabled:opacity-50 disabled:cursor-not-allowed"
                     >
-                      <option value="en">แปลเป็นอังกฤษ (English)</option>
-                      <option value="th">แปลเป็นไทย (Thai)</option>
+                      <option value="">ไมโครโฟนเริ่มต้นของเบราว์เซอร์</option>
+                      {micDevices.map((device, index) => (
+                        <option key={device.deviceId} value={device.deviceId}>
+                          {deviceLabel(device, index)}
+                        </option>
+                      ))}
                     </select>
+                    {/* Ranked by urgency, not by state: a session recording on
+                        the WRONG microphone is the one thing the operator has to
+                        hear about immediately, even while the picker is locked. */}
+                    {capture.deviceFallback ? (
+                      <p className="mt-1 text-[11px] text-amber-600 font-semibold">
+                        เปิดไมโครโฟนที่เลือกไว้ไม่ได้ — กำลังอัดด้วยไมโครโฟนเริ่มต้นของเครื่องแทน
+                      </p>
+                    ) : micLocked ? (
+                      <p className="mt-1 text-[11px] text-slate-400">
+                        เปลี่ยนไมโครโฟนได้เมื่อจบ session แล้วเท่านั้น
+                      </p>
+                    ) : micDeviceMissing ? (
+                      <p className="mt-1 text-[11px] text-amber-600">
+                        ไม่พบไมโครโฟนที่เคยเลือกไว้ — session ถัดไปจะใช้ไมโครโฟนเริ่มต้นแทน
+                      </p>
+                    ) : null}
+                  </div>
+
+                  <div className="pt-3 border-t border-slate-200 space-y-2.5">
+                    <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
+                      <input
+                        type="checkbox"
+                        checked={config.showOriginal !== false}
+                        onChange={(e) => setConfig((c) => ({ ...c, showOriginal: e.target.checked }))}
+                        className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
+                      />
+                      <span>แสดงประโยคต้นฉบับคู่กับคำแปล</span>
+                    </label>
+                    <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
+                      <input
+                        type="checkbox"
+                        checked={config.showPrevious === true}
+                        onChange={(e) => setConfig((c) => ({ ...c, showPrevious: e.target.checked }))}
+                        className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
+                      />
+                      <span>แสดงคำแปลย้อนหลัง</span>
+                    </label>
+                    <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
+                      <input
+                        type="checkbox"
+                        checked={config.showLatency !== false}
+                        onChange={(e) => setConfig((c) => ({ ...c, showLatency: e.target.checked }))}
+                        className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
+                      />
+                      <span>แสดงความเร็วการตอบสนอง (Latency ms)</span>
+                    </label>
                   </div>
                 </div>
+              )}
 
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1.5">ขนาดตัวอักษรข้อความแปล (Font Size)</label>
-                  <select
-                    value={config.fontSize}
-                    onChange={(e) => setConfig((c) => ({ ...c, fontSize: e.target.value as DisplayConfig['fontSize'] }))}
-                    className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium"
-                  >
-                    <option value="small">ขนาดเล็ก (Small)</option>
-                    <option value="medium">ขนาดปานกลาง (Medium)</option>
-                    <option value="large">ขนาดใหญ่ (Large - แนะนำ)</option>
-                    <option value="xlarge">ขนาดใหญ่พิเศษ (Extra Large)</option>
-                  </select>
-                </div>
+              {activeTab === 'dictionary' && (
+                <DictionaryManager
+                  sections={glossary}
+                  sharedLists={glossaryState.sharedLists}
+                  subscribedIds={glossaryState.subscribedIds}
+                  onToggleList={(id) => void glossaryState.toggleList(id)}
+                  disabled={false}
+                  onAdd={handleGlossaryAdd}
+                  onAddMany={handleGlossaryAddMany}
+                  onRemove={handleGlossaryRemove}
+                  isOwnTerm={glossaryState.isOwnTerm}
+                />
+              )}
+            </div>
 
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1.5">ธีมคำบรรยาย (Caption Theme)</label>
-                  <div className="grid grid-cols-2 gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => setConfig((c) => ({ ...c, captionTheme: 'light' }))}
-                      className={`flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all ${
-                        (config.captionTheme ?? 'light') === 'light'
-                          ? 'border-[#DE5C8E] ring-2 ring-pink-100 bg-white text-slate-800'
-                          : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-white'
-                      }`}
-                    >
-                      <span className="w-3.5 h-3.5 rounded-full bg-white border border-slate-300 text-black flex items-center justify-center text-[8px] font-black">A</span>
-                      <span>ตัวดำพื้นขาว</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setConfig((c) => ({ ...c, captionTheme: 'dark' }))}
-                      className={`flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all ${
-                        config.captionTheme === 'dark'
-                          ? 'border-[#DE5C8E] ring-2 ring-pink-100 bg-white text-slate-800'
-                          : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-white'
-                      }`}
-                    >
-                      <span className="w-3.5 h-3.5 rounded-full bg-black text-white flex items-center justify-center text-[8px] font-black">A</span>
-                      <span>ตัวขาวพื้นดำ</span>
-                    </button>
-                  </div>
-                </div>
-
-                {/* Microphone picker. Locked for the whole of a session —
-                    pausing does not unlock it, because switching device
-                    reconnects the capture pipeline and would cut the meeting
-                    mid-sentence. */}
-                <div>
-                  <label htmlFor="mic-device" className="block text-xs font-bold text-slate-700 mb-1.5">
-                    ไมโครโฟนที่ใช้อัดเสียง (Microphone)
-                  </label>
-                  <select
-                    id="mic-device"
-                    value={micDeviceId ?? ''}
-                    onChange={(e) => handleSelectMicDevice(e.target.value)}
-                    disabled={micLocked}
-                    title={
-                      micLocked
-                        ? 'เปลี่ยนไมโครโฟนระหว่าง session ไม่ได้ — จบ session นี้ก่อน'
-                        : 'เลือกไมโครโฟนที่จะใช้อัดเสียงใน session ถัดไป'
-                    }
-                    className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    <option value="">ไมโครโฟนเริ่มต้นของเบราว์เซอร์</option>
-                    {micDevices.map((device, index) => (
-                      <option key={device.deviceId} value={device.deviceId}>
-                        {deviceLabel(device, index)}
-                      </option>
-                    ))}
-                  </select>
-                  {/* Ranked by urgency, not by state: a session recording on
-                      the WRONG microphone is the one thing the operator has to
-                      hear about immediately, even while the picker is locked. */}
-                  {capture.deviceFallback ? (
-                    <p className="mt-1 text-[11px] text-amber-600 font-semibold">
-                      เปิดไมโครโฟนที่เลือกไว้ไม่ได้ — กำลังอัดด้วยไมโครโฟนเริ่มต้นของเครื่องแทน
-                    </p>
-                  ) : micLocked ? (
-                    <p className="mt-1 text-[11px] text-slate-400">
-                      เปลี่ยนไมโครโฟนได้เมื่อจบ session แล้วเท่านั้น
-                    </p>
-                  ) : micDeviceMissing ? (
-                    <p className="mt-1 text-[11px] text-amber-600">
-                      ไม่พบไมโครโฟนที่เคยเลือกไว้ — session ถัดไปจะใช้ไมโครโฟนเริ่มต้นแทน
-                    </p>
-                  ) : null}
-                </div>
-
-                <div className="pt-3 border-t border-slate-200 space-y-2.5">
-                  <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
-                    <input
-                      type="checkbox"
-                      checked={config.showOriginal !== false}
-                      onChange={(e) => setConfig((c) => ({ ...c, showOriginal: e.target.checked }))}
-                      className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
-                    />
-                    <span>แสดงประโยคต้นฉบับคู่กับคำแปล</span>
-                  </label>
-                  <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
-                    <input
-                      type="checkbox"
-                      checked={config.showPrevious === true}
-                      onChange={(e) => setConfig((c) => ({ ...c, showPrevious: e.target.checked }))}
-                      className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
-                    />
-                    <span>แสดงคำแปลย้อนหลัง</span>
-                  </label>
-                  <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
-                    <input
-                      type="checkbox"
-                      checked={config.showLatency !== false}
-                      onChange={(e) => setConfig((c) => ({ ...c, showLatency: e.target.checked }))}
-                      className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
-                    />
-                    <span>แสดงความเร็วการตอบสนอง (Latency ms)</span>
-                  </label>
-                </div>
-              </div>
-            )}
-
-            {activeTab === 'dictionary' && (
-              <DictionaryManager
-                sections={glossary}
-                sharedLists={glossaryState.sharedLists}
-                subscribedIds={glossaryState.subscribedIds}
-                onToggleList={(id) => void glossaryState.toggleList(id)}
-                disabled={false}
-                onAdd={handleGlossaryAdd}
-                onAddMany={handleGlossaryAddMany}
-                onRemove={handleGlossaryRemove}
-                isOwnTerm={glossaryState.isOwnTerm}
-              />
-            )}
-          </div>
-
-          <div className="p-3 border-t border-slate-200 lg:hidden">
-            <button
-              onClick={() => setMobileSettingsOpen(false)}
-              className="w-full py-2 bg-slate-100 text-slate-700 text-xs font-semibold rounded-lg"
-            >
-              ปิดหน้าต่างตั้งค่า
-            </button>
+            <div className="p-3 border-t border-slate-200 lg:hidden">
+              <button
+                onClick={() => setMobileSettingsOpen(false)}
+                className="w-full py-2 bg-slate-100 text-slate-700 text-xs font-semibold rounded-lg"
+              >
+                ปิดหน้าต่างตั้งค่า
+              </button>
+            </div>
           </div>
         </aside>
+
+        {/* Sibling of the <aside>, not a child: the aside clips its own
+            overflow, which would swallow a button straddling its edge. It
+            rides the same 200ms as the fold, so it stays on the seam. */}
+        <button
+          type="button"
+          onClick={toggleSidebarCollapsed}
+          title={sidebarCollapsed ? 'ขยายแถบตั้งค่า' : 'ย่อแถบตั้งค่า'}
+          className={`hidden lg:flex absolute top-1/2 -translate-x-1/2 -translate-y-1/2 z-30 w-6 h-6 items-center justify-center bg-white border border-slate-200 rounded-full shadow-sm text-slate-400 hover:text-[#DE5C8E] hover:border-pink-200 transition-[left,color,border-color] duration-200 ${
+            sidebarCollapsed ? 'left-3' : 'left-96'
+          }`}
+        >
+          {sidebarCollapsed ? <ChevronRight className="w-3.5 h-3.5" /> : <ChevronLeft className="w-3.5 h-3.5" />}
+        </button>
 
         {mobileSettingsOpen && (
           <div onClick={() => setMobileSettingsOpen(false)} className="fixed inset-0 bg-black/30 z-10 lg:hidden" />
@@ -1233,7 +1263,7 @@ export default function Admin() {
           ────────────────────────────────────────────────────────────── */}
           <div className="shrink-0 px-3 pt-3 sm:px-6 sm:pt-4">
             <div
-              className={`relative w-full max-w-5xl mx-auto rounded-2xl border shadow-sm px-6 py-6 sm:px-10 sm:py-[28.8px] text-left overflow-hidden transition-colors ${
+              className={`relative w-full rounded-2xl border shadow-sm px-6 py-6 sm:px-10 sm:py-[28.8px] text-left overflow-hidden transition-colors ${
                 isDarkCaption ? 'bg-black border-slate-700' : 'bg-white border-slate-200'
               }`}
             >

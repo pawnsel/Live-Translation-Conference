@@ -19,6 +19,7 @@ import {
 import { Project, ProjectBill, ProjectSession } from '../types';
 import { MAX_ACTIVE_PROJECTS, projectDaysLeft } from '../hooks/useProjects';
 import type { LiveProjectCost } from '../hooks/useLiveProjectCost';
+import { USD_TO_THB_RATE, usdToThb } from '../billing/currency';
 
 function formatDuration(ms: number): string {
   const totalSeconds = Math.max(0, Math.round(ms / 1000));
@@ -108,7 +109,7 @@ function billToPdf(doc: jsPDF, project: Project, bill: ProjectBill): jsPDF {
   doc.setTextColor(PDF_MUTED);
   doc.setFont(PDF_FONT, 'bold');
   doc.text('DESCRIPTION', PDF_MARGIN_X, y);
-  doc.text('AMOUNT (USD)', rightX, y, { align: 'right' });
+  doc.text('AMOUNT (THB)', rightX, y, { align: 'right' });
   y += 10;
   doc.setDrawColor(PDF_LINE);
   doc.line(PDF_MARGIN_X, y, rightX, y);
@@ -119,7 +120,7 @@ function billToPdf(doc: jsPDF, project: Project, bill: ProjectBill): jsPDF {
   const lineItem = (label: string, amount: number) => {
     doc.setTextColor(PDF_INK);
     doc.text(label, PDF_MARGIN_X, y);
-    doc.text(`$${amount.toFixed(4)}`, rightX, y, { align: 'right' });
+    doc.text(`฿${usdToThb(amount)}`, rightX, y, { align: 'right' });
     y += 20;
   };
 
@@ -143,13 +144,13 @@ function billToPdf(doc: jsPDF, project: Project, bill: ProjectBill): jsPDF {
   doc.setTextColor(PDF_MUTED);
   doc.text('Subtotal', PDF_MARGIN_X, y);
   doc.setTextColor(PDF_INK);
-  doc.text(`$${subtotal.toFixed(4)}`, rightX, y, { align: 'right' });
+  doc.text(`฿${usdToThb(subtotal)}`, rightX, y, { align: 'right' });
   y += 20;
 
   doc.setTextColor(PDF_MUTED);
   doc.text('Service fee', PDF_MARGIN_X, y);
   doc.setTextColor(PDF_INK);
-  doc.text(`$${(bill.serviceFee ?? 0).toFixed(2)}`, rightX, y, { align: 'right' });
+  doc.text(`฿${usdToThb(bill.serviceFee ?? 0)}`, rightX, y, { align: 'right' });
   y += 28;
 
   // ── Total, boxed ──────────────────────────────────────────────────────
@@ -161,7 +162,7 @@ function billToPdf(doc: jsPDF, project: Project, bill: ProjectBill): jsPDF {
   doc.setTextColor(PDF_ACCENT);
   doc.text('TOTAL (upper bound)', PDF_MARGIN_X + 14, y + 3);
   doc.setFontSize(14);
-  doc.text(`$${bill.estimatedCost.toFixed(2)}`, rightX - 14, y + 3, { align: 'right' });
+  doc.text(`฿${usdToThb(bill.estimatedCost)}`, rightX - 14, y + 3, { align: 'right' });
   y += 44;
 
   // ── Session breakdown ────────────────────────────────────────────────
@@ -213,7 +214,8 @@ function billToPdf(doc: jsPDF, project: Project, bill: ProjectBill): jsPDF {
   doc.setTextColor(PDF_MUTED);
   const disclaimer =
     'Estimated from published Gemini API rates, billed pessimistically (full session duration counted as audio). ' +
-    'Actual spend will not exceed this figure. This is not an official payment invoice.';
+    'Actual spend will not exceed this figure. This is not an official payment invoice. ' +
+    `Converted to THB at an approximate rate of 1 USD ~ ${USD_TO_THB_RATE} THB.`;
   const wrapped = doc.splitTextToSize(disclaimer, rightX - PDF_MARGIN_X);
   doc.text(wrapped, PDF_MARGIN_X, y);
 
@@ -491,14 +493,14 @@ export function LiveCostBadge({
       } ${className}`}
       title={[
         'ประมาณการค่าใช้จ่าย Gemini ของโปรเจกต์นี้ — คิดแบบเผื่อไว้ ค่าจริงจะไม่เกินตัวเลขนี้',
-        `เสียง ${cost.liveMinutes.toFixed(1)} นาที: $${cost.liveAudioCost.toFixed(4)}`,
-        `ข้อความคำแปล: $${cost.liveTextCost.toFixed(4)}`,
-        `สรุปการประชุม ${cost.summaryRuns} ครั้ง: $${cost.summaryCost.toFixed(4)}`,
+        `เสียง ${cost.liveMinutes.toFixed(1)} นาที: ฿${usdToThb(cost.liveAudioCost)}`,
+        `ข้อความคำแปล: ฿${usdToThb(cost.liveTextCost)}`,
+        `สรุปการประชุม ${cost.summaryRuns} ครั้ง: ฿${usdToThb(cost.summaryCost)}`,
         isRecording ? 'อัปเดตทุก ๆ ไม่กี่วินาทีระหว่างบันทึก' : ''
       ]
         .filter(Boolean)
         .join('\n')}
-      aria-label={`ค่าใช้จ่ายประมาณการ ไม่เกิน ${cost.displayCost.toFixed(2)} ดอลลาร์`}
+      aria-label={`ค่าใช้จ่ายประมาณการ ไม่เกิน ${usdToThb(cost.displayCost)} บาท`}
     >
       {isRecording ? (
         <span className="relative flex h-2 w-2 shrink-0">
@@ -506,9 +508,9 @@ export function LiveCostBadge({
           <span className="relative inline-flex rounded-full h-2 w-2 bg-[#DE5C8E]" />
         </span>
       ) : (
-        <CircleDollarSign className="w-3.5 h-3.5 shrink-0" />
+        <span>Estimated cost</span>
       )}
-      <span>≤ ${cost.displayCost.toFixed(2)}</span>
+      <span>: ฿{usdToThb(cost.displayCost)}</span>
     </span>
   );
 }
@@ -551,7 +553,7 @@ export function BillModal({ project, onClose }: { project: Project; onClose: () 
           </div>
           <div className="p-3 bg-pink-50 rounded-lg border border-pink-200">
             <div className="text-[#DE5C8E]">Estimated cost</div>
-            <div className="font-bold text-[#DE5C8E] text-base">≤ ${bill.estimatedCost.toFixed(2)}</div>
+            <div className="font-bold text-[#DE5C8E] text-base">≤ ฿{usdToThb(bill.estimatedCost)}</div>
           </div>
         </div>
 
@@ -559,26 +561,26 @@ export function BillModal({ project, onClose }: { project: Project; onClose: () 
           <div className="space-y-1 text-[11px] text-slate-500">
             <div className="flex justify-between gap-2">
               <span>เสียง Live ({bill.costBreakdown.liveMinutes.toFixed(1)} นาที)</span>
-              <span className="font-mono">${bill.costBreakdown.liveAudioCost.toFixed(4)}</span>
+              <span className="font-mono">฿{usdToThb(bill.costBreakdown.liveAudioCost)}</span>
             </div>
             <div className="flex justify-between gap-2">
               <span>ข้อความคำแปล</span>
-              <span className="font-mono">${bill.costBreakdown.liveTextCost.toFixed(4)}</span>
+              <span className="font-mono">฿{usdToThb(bill.costBreakdown.liveTextCost)}</span>
             </div>
             <div className="flex justify-between gap-2">
               <span>สรุปการประชุม ({bill.costBreakdown.summaryRuns} ครั้ง)</span>
-              <span className="font-mono">${bill.costBreakdown.summaryCost.toFixed(4)}</span>
+              <span className="font-mono">฿{usdToThb(bill.costBreakdown.summaryCost)}</span>
             </div>
             <div className="flex justify-between gap-2 pt-1 border-t border-slate-100">
               <span>ค่าบริการ (Service fee)</span>
-              <span className="font-mono">${(bill.serviceFee ?? 0).toFixed(2)}</span>
+              <span className="font-mono">฿{usdToThb(bill.serviceFee ?? 0)}</span>
             </div>
           </div>
         )}
 
         <p className="text-[11px] text-slate-400">
           ประมาณการจากอัตราค่าบริการ Gemini API แบบเผื่อไว้ (คิดเสียงเต็มช่วงเวลาที่บันทึก) — ค่าใช้จ่ายจริงจะไม่เกินยอดนี้
-          และยังไม่ใช่ระบบเรียกเก็บเงิน
+          และยังไม่ใช่ระบบเรียกเก็บเงิน (แปลงเป็นบาทโดยประมาณที่ 1 USD ≈ {USD_TO_THB_RATE} THB)
         </p>
 
         <div className="flex gap-2">
@@ -638,7 +640,7 @@ export function HistoryPanel({ projects, onClose }: { projects: Project[]; onClo
                 <div className="text-[11px] text-slate-400 flex items-center gap-1.5 flex-wrap">
                   <span>
                     {new Date(p.createdAt).toLocaleDateString()} · {p.bill?.sessionCount ?? p.sessions.length} sessions
-                    {p.bill && <> · ${p.bill.estimatedCost.toFixed(2)}</>}
+                    {p.bill && <> · ฿{usdToThb(p.bill.estimatedCost)}</>}
                   </span>
                   {p.autoFinished && (
                     <span className="px-1.5 py-0.5 rounded-md bg-amber-50 text-amber-700 border border-amber-200 font-semibold">
