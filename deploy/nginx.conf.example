@@ -1,0 +1,116 @@
+# =============================================================================
+#  Live Translation — reverse proxy
+#  Install as /etc/nginx/conf.d/live-translation.conf (or sites-available +
+#  a symlink), replace translate.example.ac.th, then:
+#      sudo nginx -t && sudo systemctl reload nginx
+# =============================================================================
+#
+#  HTTPS is not optional here. The app asks the browser for a microphone, and
+#  getUserMedia() is refused outright on a plain-HTTP origin that is not
+#  localhost — the page will load, sign-in will work, and recording will fail
+#  with a permissions error that looks like a bug in the app. If the
+#  organisation cannot issue a certificate for this host, see the SSH-tunnel
+#  fallback in DEPLOYMENT.md; it works precisely because it makes the origin
+#  localhost.
+
+# The WebSocket upgrade only happens when the client asks for it. Normal
+# requests must arrive at the app with Connection: close, not "upgrade".
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+upstream live_translation {
+    server 127.0.0.1:3000;
+    keepalive 32;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name translate.example.ac.th;
+
+    # Nothing is served over plain HTTP: see the note above about microphones.
+    return 301 https://$host$request_uri;
+}
+
+server {
+    # http2 as a listen parameter, not the separate `http2 on;` directive:
+    # that standalone form only exists from nginx 1.25.1 onward and fails
+    # config test with "unknown directive" on anything older. This form
+    # works on every version still in common use (and merely prints a
+    # deprecation notice, not an error, on the newest ones).
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name translate.example.ac.th;
+
+    ssl_certificate     /etc/ssl/certs/translate.example.ac.th.crt;
+    ssl_certificate_key /etc/ssl/private/translate.example.ac.th.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    # /api/gemini/summarize posts a whole meeting's transcript, and the app
+    # server accepts up to 5mb of it. nginx's default is 1m, which would turn
+    # a three-hour meeting's summary into a 413 at the worst possible moment.
+    client_max_body_size 5m;
+
+    access_log /var/log/nginx/live-translation.access.log;
+    error_log  /var/log/nginx/live-translation.error.log;
+
+    # -------------------------------------------------------------------
+    # The live caption socket.
+    # -------------------------------------------------------------------
+    # Separated from the location below only because of the timeouts. A
+    # session may legitimately run for hours, and proxy_read_timeout measures
+    # the gap between reads FROM THE APP, not connection age — during a quiet
+    # stretch of a meeting the app sends nothing downstream, because captions
+    # are only produced when somebody speaks. At nginx's default of 60s the
+    # socket would be closed after a minute of silence and the operator would
+    # see the session drop for no visible reason. The app stops an idle
+    # session itself after 15 minutes (IDLE_STOP_MS) and caps any session at
+    # 6 hours, so an hour here is comfortably past every case that matters.
+    location /ws/gemini-live-transcribe {
+        proxy_pass http://live_translation;
+        proxy_http_version 1.1;
+
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host       $host;
+        proxy_set_header X-Real-IP  $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # The access token rides in Sec-WebSocket-Protocol rather than the URL
+        # so it stays out of access logs. nginx forwards that header as-is;
+        # do not add a proxy_set_header for it, and do not strip it — the
+        # handshake is refused without it.
+
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+
+        # Audio frames are small and continuous; buffering them adds latency
+        # to every caption for no benefit.
+        proxy_buffering off;
+    }
+
+    # -------------------------------------------------------------------
+    # Everything else: the API and the single-page app.
+    # -------------------------------------------------------------------
+    location / {
+        proxy_pass http://live_translation;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection        "";
+
+        # Summarising a long meeting is a map-reduce over several Gemini
+        # calls, and the app gives the whole job 150s before it gives up.
+        # nginx must outlast that, or it returns 504 while the work is still
+        # running and the operator retries a job that was about to succeed.
+        proxy_read_timeout 180s;
+        proxy_send_timeout 180s;
+    }
+}

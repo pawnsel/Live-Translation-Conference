@@ -1,0 +1,26 @@
+# Everything the image builds for itself, plus everything that must never
+# travel inside it. Keeping .env out matters most: secrets belong in the
+# container's environment at run time, never baked into a layer.
+node_modules
+dist
+build
+coverage
+
+.env
+.env.*
+!.env.example
+
+.git
+.gitignore
+.worktrees
+.superpowers
+
+*.log
+logs
+.DS_Store
+
+# Docs are not needed to build or run the server. Test files are left in:
+# they cost a few kB in the builder stage, never reach the runtime stage, and
+# excluding them would break the build the day a source file imports a helper
+# that happens to live beside one.
+docs

@@ -1,0 +1,17 @@
+# Copy to deploy.conf (git-ignored) and fill in. Read by ./deploy.sh.
+# Holds no secrets — only where to deploy.
+
+# The server, as ssh would take it. Connect the VPN first.
+SSH_HOST="deployer@10.0.12.34"
+
+# Where the source and docker-compose.yml live on the server. Must be a
+# directory your SSH user can write to.
+REMOTE_DIR="/opt/live-translation"
+
+# Extra ssh flags, if the org needs them — a jump host, a non-standard port,
+# a specific key.
+# SSH_OPTS="-J bastion.example.ac.th -i ~/.ssh/org_ed25519"
+
+# Only used by --mode image: the server's architecture, not your laptop's.
+# `ssh $SSH_HOST uname -m` — x86_64 means linux/amd64, aarch64 means linux/arm64.
+# DOCKER_PLATFORM="linux/amd64"

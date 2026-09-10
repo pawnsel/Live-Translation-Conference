@@ -1,0 +1,86 @@
+# =============================================================================
+#  Live Translation — deployment on the organisation's server
+# =============================================================================
+#
+#  Reads .env from this directory (see .env.deploy.example). That file holds
+#  the Gemini key, so on the server it should be `chmod 600` and owned by the
+#  deploying user.
+#
+#    docker compose up -d --build     start / update
+#    docker compose logs -f app       follow the log
+#    docker compose down              stop
+# =============================================================================
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Compiled into the browser bundle — see the note at the top of the
+      # Dockerfile. Changing any of these needs `--build`, not a restart.
+      args:
+        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:?VITE_SUPABASE_URL must be set in .env}
+        VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY:?VITE_SUPABASE_ANON_KEY must be set in .env}
+        VITE_ALLOWED_EMAIL_DOMAIN: ${VITE_ALLOWED_EMAIL_DOMAIN:-}
+
+    image: live-translation:latest
+    container_name: live-translation
+
+    # 127.0.0.1 on the left is the important half: the container is reachable
+    # only from the host, so the reverse proxy in front of it is the only way
+    # in. Without it Docker punches a hole straight through the host firewall
+    # and publishes port 3000 to the whole network — including the plain-HTTP
+    # origin where browsers refuse to hand the page a microphone.
+    ports:
+      - "127.0.0.1:${APP_PORT:-3000}:3000"
+
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3000
+
+      # Server-side only. Never VITE_-prefixed: the whole security model of
+      # this app is that the browser talks to our WebSocket and our endpoints,
+      # and this key never leaves the server.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?GEMINI_API_KEY must be set in .env}
+
+      # The server verifies each caller against the approval table with these.
+      # It falls back to the VITE_ names, which are set below anyway, but
+      # being explicit here documents that the server needs them too.
+      SUPABASE_URL: ${SUPABASE_URL:-${VITE_SUPABASE_URL}}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-${VITE_SUPABASE_ANON_KEY}}
+
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
+      GEMINI_SUMMARY_MODEL: ${GEMINI_SUMMARY_MODEL:-}
+      GEMINI_LIVE_MODEL: ${GEMINI_LIVE_MODEL:-gemini-3.5-live-translate-preview}
+      GEMINI_LIVE_TARGET_LANG: ${GEMINI_LIVE_TARGET_LANG:-en}
+      GEMINI_LIVE_SOURCE_LANGS: ${GEMINI_LIVE_SOURCE_LANGS:-th-TH}
+
+    restart: unless-stopped
+
+    # A real init as PID 1, so orphaned processes are reaped and signals are
+    # forwarded even if the entrypoint ever grows a wrapper.
+    init: true
+
+    # Reuses the image's HEALTHCHECK; declared here only to make
+    # `docker compose ps` show health, and to give `--wait` something to wait
+    # on during a deploy.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    # A meeting's transcript lives in Supabase, not on this box, so the
+    # container is disposable — but its logs are the only record of why a
+    # session failed. Cap them so they cannot fill the server's disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
