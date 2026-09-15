@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="UTF-8" />
+<title>Stream output spike (throwaway)</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 24px; max-width: 900px; }
+  button { font-size: 16px; padding: 8px 14px; margin: 4px; }
+  #log { white-space: pre-wrap; background: #f4f4f5; padding: 12px; border-radius: 8px; font-size: 13px; }
+  .stage { position: fixed; inset: 0; background: #000; color: #fff; overflow: hidden; font-family: system-ui, sans-serif; }
+  .stage video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  .stage .bar { position: absolute; left: 10%; right: 10%; bottom: 4%; background: rgba(0,0,0,.7); padding: 16px 24px; border-radius: 16px; font-size: 28px; }
+  .stage .css-anim { position: absolute; top: 12px; left: 12px; width: 40px; height: 40px; background: #de5c8e; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<h1>Stream output spike — ทดสอบก่อนทำจริง (ทิ้งได้)</h1>
+<p>
+  1) กด <b>แชร์หน้าจอ</b> เลือกจอ projector &nbsp; 2) กด <b>เปิด PiP</b> หรือ <b>เปิด Popup</b>
+  &nbsp; 3) ใน OBS เพิ่ม Window Capture เลือกหน้าต่างนั้น แล้วทำตาม checklist ด้านล่าง
+</p>
+<button id="share">แชร์หน้าจอ</button>
+<button id="pip">เปิด PiP (Document Picture-in-Picture)</button>
+<button id="popup">เปิด Popup (window.open)</button>
+<h3>Checklist (ทำทั้ง PiP และ Popup, บน Mac และ Windows)</h3>
+<ol>
+  <li>OBS เห็นหน้าต่างนี้ในรายการ Window Capture ไหม? (Windows: ใช้ capture method "Windows 10 (1903 and up)")</li>
+  <li>สี่เหลี่ยมชมพูหมุน, ตัวเลขวิ่ง และภาพจอขยับใน OBS ไหม?</li>
+  <li><b>minimise หน้านี้ (console)</b> — ภาพใน OBS ยังขยับไหม? ตัวเลขยังวิ่งไหม (ช้าลงได้)?</li>
+  <li>เอาหน้าต่างอื่นมาบังหน้าต่าง Output มิด — OBS ยังขยับไหม? (PiP ควรบังไม่ได้)</li>
+  <li>ย่อ/ขยายหน้าต่าง Output — ตัวนับ "RO (Output window)" เพิ่มไหม? "RO (console)" เพิ่มไหม? ลองตอน console ถูก minimise ด้วย</li>
+  <li>แถบ "Chrome กำลังแชร์หน้าจอ" ไปโผล่จอไหน?</li>
+</ol>
+<div id="log"></div>
+<script>
+  const log = (m) => { document.getElementById('log').textContent += new Date().toLocaleTimeString() + '  ' + m + '\n'; };
+  let stream = null;
+  let ticks = 0;
+
+  document.getElementById('share').onclick = async () => {
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: false });
+      log('sharing: ' + stream.getVideoTracks()[0].label);
+      stream.getVideoTracks()[0].onended = () => log('share ended');
+    } catch (e) { log('share error: ' + e.name + ' — ' + e.message); }
+  };
+
+  function fill(win, kind) {
+    const doc = win.document;
+    doc.head.appendChild(document.querySelector('style').cloneNode(true));
+    doc.body.style.margin = '0';
+    const stage = doc.createElement('div');
+    stage.className = 'stage';
+    stage.innerHTML = '<video autoplay muted playsinline></video><div class="css-anim"></div><div class="bar">tick: <span class="n">0</span> · RO (Output window): <span class="ro-out">0</span> · RO (console): <span class="ro-in">0</span></div>';
+    doc.body.appendChild(stage);
+    const video = stage.querySelector('video');
+    video.srcObject = stream;
+    video.play().catch(() => {});
+
+    // Driven from the console's timer, like caption updates driven from the console's state.
+    const n = stage.querySelector('.n');
+    const timer = setInterval(() => { n.textContent = String(++ticks); }, 100);
+
+    // Same element observed by a ResizeObserver from each window.
+    let outCount = 0, inCount = 0;
+    new win.ResizeObserver(() => { stage.querySelector('.ro-out').textContent = String(++outCount); }).observe(stage);
+    new ResizeObserver(() => { stage.querySelector('.ro-in').textContent = String(++inCount); }).observe(stage);
+
+    win.addEventListener('pagehide', () => { clearInterval(timer); log(kind + ' closed'); });
+    log(kind + ' opened');
+  }
+
+  document.getElementById('pip').onclick = async () => {
+    if (!('documentPictureInPicture' in window)) { log('Document PiP not supported in this browser'); return; }
+    try {
+      const win = await documentPictureInPicture.requestWindow({ width: 960, height: 540 });
+      fill(win, 'PiP');
+    } catch (e) { log('PiP error: ' + e.name + ' — ' + e.message); }
+  };
+
+  document.getElementById('popup').onclick = () => {
+    const win = window.open('', 'spike-output', 'popup,width=960,height=540');
+    if (!win) { log('popup blocked'); return; }
+    fill(win, 'Popup');
+  };
+</script>
+</body>
+</html>
