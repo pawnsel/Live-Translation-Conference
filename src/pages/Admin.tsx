@@ -20,8 +20,10 @@ import {
   ChevronLeft,
   ChevronRight,
   User,
-  LogOut
+  LogOut,
+  MonitorUp
 } from 'lucide-react';
+import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth/AuthProvider';
 import { getAccessToken } from '../lib/supabase';
@@ -53,6 +55,12 @@ import { useLiveProjectCost } from '../hooks/useLiveProjectCost';
 import { emptyGlossary, type GlossarySection, type GlossarySections } from '../glossary';
 import { useGlossary } from '../hooks/useGlossary';
 import type { DisplayConfig, Project, ProjectSession, TranscriptItem } from '../types';
+import OutputStage from '../stream/OutputStage';
+import StreamPanel, { StreamStatusChip } from '../stream/StreamPanel';
+import { useScreenShare } from '../stream/useScreenShare';
+import { useOutputWindow } from '../stream/useOutputWindow';
+import type { BarPosition } from '../stream/outputLayout';
+import { loadOutputPrefs, saveOutputPrefs, type OutputPrefs } from '../storage/outputStore';
 
 // Bounded wait for a summary before giving up and showing the "AI summary
 // failed" state. A two-hour transcript is summarised chunk by chunk on the
@@ -183,7 +191,37 @@ export default function Admin() {
     showLatency: false,
     captionTheme: 'light'
   });
-  const [activeTab, setActiveTab] = useState<'languages' | 'dictionary'>('languages');
+
+  // ── Stream output ─────────────────────────────────────────────────────────
+  // The projector display and the window OBS captures. Both live as long as
+  // this console does and are independent of the translation session: set up
+  // before the meeting, untouched when a session ends. Signing out unmounts
+  // the console, and the hooks' cleanups stop the share and close the window.
+  const share = useScreenShare();
+  const output = useOutputWindow();
+  const [outputPrefs, setOutputPrefs] = useState<OutputPrefs>(() => loadOutputPrefs());
+  const updateOutputPrefs = useCallback((next: OutputPrefs) => {
+    setOutputPrefs(next);
+    saveOutputPrefs(next);
+  }, []);
+  const moveOutputBar = useCallback(
+    (position: BarPosition) => updateOutputPrefs({ ...outputPrefs, ...position }),
+    [outputPrefs, updateOutputPrefs]
+  );
+
+  // Reloading or closing the console takes the Output window with it, and
+  // OBS with it goes to black mid-broadcast. Ask first.
+  useEffect(() => {
+    if (!output.isOpen) return;
+    const warn = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [output.isOpen]);
+
+  const [activeTab, setActiveTab] = useState<'languages' | 'dictionary' | 'stream'>('languages');
   const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => loadSidebarCollapsed());
   const toggleSidebarCollapsed = () => {
@@ -644,15 +682,34 @@ export default function Admin() {
     [boxSourceText, boxTargetText, hasPartial, captionRows, latestCaption]
   );
 
+  // The broadcast image, drawn into the Output window. Rendered from every
+  // screen below — including the project picker — so switching projects
+  // mid-event does not blank the stream.
+  const outputPortal = output.container
+    ? createPortal(
+        <OutputStage
+          stream={share.stream}
+          config={config}
+          caption={captionView}
+          prefs={outputPrefs}
+          onMove={moveOutputBar}
+        />,
+        output.container
+      )
+    : null;
+
   // Read live off the project record so the popup fills itself in the moment
   // the summary lands, rather than holding a stale copy of the session.
   const summarySession = projects.currentProject?.sessions.find((s) => s.id === summarySessionId) ?? null;
 
   if (projects.loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-500 text-sm">
-        กำลังโหลดโปรเจกต์…
-      </div>
+      <>
+        {outputPortal}
+        <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-500 text-sm">
+          กำลังโหลดโปรเจกต์…
+        </div>
+      </>
     );
   }
 
@@ -660,6 +717,7 @@ export default function Admin() {
   if (!projects.currentProject) {
     return (
       <>
+        {outputPortal}
         <ProjectPicker
           activeProjects={projects.activeProjects}
           canCreateProject={projects.canCreateProject}
@@ -675,6 +733,7 @@ export default function Admin() {
 
   return (
     <div className="flex flex-col h-screen w-full bg-slate-100 text-slate-800 font-sans overflow-hidden">
+      {outputPortal}
       {showHistory && <HistoryPanel projects={projects.endedProjects} onClose={() => setShowHistory(false)} />}
       {finishedProject && <BillModal project={finishedProject} onClose={() => setFinishedProject(null)} />}
       {showSessionHistory && (
@@ -737,6 +796,7 @@ export default function Admin() {
               <ClipboardList className="w-4 h-4" />
             </button>
             <LiveCostBadge cost={liveCost} isRecording={isSessionActive} />
+            <StreamStatusChip share={share} output={output} />
           </div>
         </div>
 
@@ -832,7 +892,7 @@ export default function Admin() {
               lg:w-0, so the panel is clipped away rather than reflowing its
               controls into an ever-narrower column on the way out. */}
           <div className="flex-1 flex flex-col min-h-0 lg:w-96">
-            <div className="grid grid-cols-2 p-1.5 bg-slate-50 border-b border-slate-200 text-xs gap-1 shrink-0">
+            <div className="grid grid-cols-3 p-1.5 bg-slate-50 border-b border-slate-200 text-xs gap-1 shrink-0">
               <button
                 onClick={() => setActiveTab('languages')}
                 className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all ${
@@ -850,6 +910,15 @@ export default function Admin() {
               >
                 <BookOpen className="w-4 h-4" />
                 <span className="whitespace-nowrap">พจนานุกรม</span>
+              </button>
+              <button
+                onClick={() => setActiveTab('stream')}
+                className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all ${
+                  activeTab === 'stream' ? 'bg-white text-[#DE5C8E] shadow-xs' : 'text-slate-500 hover:text-slate-800'
+                }`}
+              >
+                <MonitorUp className="w-4 h-4" />
+                <span className="whitespace-nowrap">สตรีม</span>
               </button>
             </div>
 
@@ -1022,6 +1091,10 @@ export default function Admin() {
                   onRemove={handleGlossaryRemove}
                   isOwnTerm={glossaryState.isOwnTerm}
                 />
+              )}
+
+              {activeTab === 'stream' && (
+                <StreamPanel share={share} output={output} prefs={outputPrefs} onPrefsChange={updateOutputPrefs} />
               )}
             </div>
 
