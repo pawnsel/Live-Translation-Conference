@@ -4,13 +4,10 @@ import {
   MicOff,
   Languages,
   BookOpen,
-  Copy,
-  Check,
   Download,
   Trash2,
   Sparkles,
   Zap,
-  Edit2,
   Menu,
   ShieldAlert,
   ArrowLeftRight,
@@ -244,9 +241,6 @@ export default function Admin() {
   // and from TXT export, but it is still included in the AI summary and
   // the permanent project record.
   const [hiddenSeqs, setHiddenSeqs] = useState<Set<number>>(new Set());
-  const [editingSeq, setEditingSeq] = useState<number | null>(null);
-  const [editDraft, setEditDraft] = useState('');
-  const [copiedSeq, setCopiedSeq] = useState<number | null>(null);
   // History reads as prose, so per-caption controls cannot sit inline without
   // pushing the text around. The caption under the cursor is highlighted and
   // its actions appear in one toolbar pinned to the top of the scroller.
@@ -551,25 +545,6 @@ export default function Admin() {
   };
 
   // ── Caption item actions ─────────────────────────────────────────────────
-  const handleCopyItem = (item: Caption) => {
-    navigator.clipboard.writeText(`${item.sourceText}\n${item.targetText}`);
-    setCopiedSeq(item.seq);
-    setTimeout(() => setCopiedSeq(null), 1500);
-  };
-
-  const startEditing = (item: Caption) => {
-    setEditingSeq(item.seq);
-    setEditDraft(item.targetText);
-  };
-
-  const saveEdit = () => {
-    if (editingSeq === null) return;
-    const nextText = editDraft.trim();
-    dispatchCaption({ kind: 'edit', seq: editingSeq, targetText: nextText });
-    if (sessionId) void projects.editCaption(sessionId, editingSeq, nextText);
-    setEditingSeq(null);
-  };
-
   const hideItem = (seq: number) => {
     setHiddenSeqs((prev) => new Set(prev).add(seq));
   };
@@ -581,15 +556,13 @@ export default function Admin() {
     }
   };
 
-  // Auto-scroll the feed as new captions arrive, unless the operator is
-  // actively editing one (a scroll jump under an open editor is disorienting).
+  // Auto-scroll the feed as new captions arrive.
   useEffect(() => {
-    if (editingSeq !== null) return;
     const el = transcriptScrollRef.current;
     if (!el) return;
     const id = setTimeout(() => el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }), 80);
     return () => clearTimeout(id);
-  }, [captions.length, editingSeq]);
+  }, [captions.length]);
 
   // ── Export ───────────────────────────────────────────────────────────────
   const exportTranscript = () => {
@@ -642,7 +615,6 @@ export default function Admin() {
   const hasPartial = !!(capture.partialSource || capture.partialTarget);
   const boxSourceText = capture.partialSource || latestCaption?.sourceText || '';
   const boxTargetText = capture.partialTarget || latestCaption?.targetText || '';
-  const isEditingBox = editingSeq !== null && editingSeq === latestCaption?.seq;
   const isDarkCaption = config.captionTheme === 'dark';
 
   // ── Rolling caption stack ────────────────────────────────────────────────
@@ -1229,40 +1201,12 @@ export default function Admin() {
                 isDarkCaption ? 'bg-black border-slate-700' : 'bg-white border-slate-200'
               }`}
             >
-              {latestCaption && !isEditingBox && !hasPartial && (
-                <div className="absolute top-2.5 right-2.5 flex items-center gap-1">
-                  <button
-                    onClick={() => handleCopyItem(latestCaption)}
-                    className={`p-1.5 rounded-md transition-all ${
-                      isDarkCaption
-                        ? 'text-slate-500 hover:text-white hover:bg-white/10'
-                        : 'text-slate-400 hover:text-slate-700 hover:bg-slate-100'
-                    }`}
-                    title="คัดลอกข้อความ"
-                  >
-                    {copiedSeq === latestCaption.seq ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
-                  </button>
-                  <button
-                    onClick={() => startEditing(latestCaption)}
-                    className={`p-1.5 rounded-md transition-all ${
-                      isDarkCaption
-                        ? 'text-slate-500 hover:text-white hover:bg-white/10'
-                        : 'text-slate-400 hover:text-slate-700 hover:bg-slate-100'
-                    }`}
-                    title="แก้ไขคำแปล"
-                  >
-                    <Edit2 className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              )}
-
               {/* Every slot below is ALWAYS mounted and every one of them is
                   locked to its own line count, so the box is exactly as tall
                   as the display settings demand and not one pixel more. The
-                  states that used to replace the content — the idle hint and
-                  the edit form — now sit on top of it instead, because a
-                  box that resized under a speaker would shove the whole page
-                  around mid-sentence. */}
+                  idle hint, which used to replace the content, now sits on
+                  top of it instead, because a box that resized under a
+                  speaker would shove the whole page around mid-sentence. */}
               {config.showOriginal && (
                 <SubtitleText
                   text={boxSourceText}
@@ -1378,42 +1322,6 @@ export default function Admin() {
                 </div>
               )}
 
-              {isEditingBox && (
-                <div
-                  className={`absolute inset-0 rounded-2xl flex flex-col justify-center gap-2 px-4 py-3 sm:px-8 overflow-y-auto ${
-                    isDarkCaption ? 'bg-black' : 'bg-white'
-                  }`}
-                >
-                  <label className={`text-xs font-bold ${isDarkCaption ? 'text-slate-300' : 'text-slate-600'}`}>
-                    คำแปล:
-                  </label>
-                  <input
-                    type="text"
-                    autoFocus
-                    value={editDraft}
-                    onChange={(e) => setEditDraft(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && saveEdit()}
-                    className="w-full p-2 text-base font-bold text-black border border-slate-300 rounded-lg outline-none focus:border-[#DE5C8E]"
-                  />
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={saveEdit}
-                      className="px-3.5 py-1.5 text-xs text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg font-semibold flex items-center gap-1.5 shadow-xs transition-all"
-                    >
-                      <Check className="w-3.5 h-3.5" />
-                      <span>บันทึก</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setEditingSeq(null)}
-                      className="px-3.5 py-1.5 text-xs text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium transition-all"
-                    >
-                      ยกเลิก
-                    </button>
-                  </div>
-                </div>
-              )}
             </div>
           </div>
 
@@ -1538,9 +1446,9 @@ export default function Admin() {
           {/* ─────────────────────────────────────────────────────────────
               HISTORY — collapsed by default so the subtitle box above stays
               the primary view. Captions run together as paragraphs of
-              continuous speech rather than one card per utterance; the full
-              edit/hide/copy tooling still reaches every caption, through the
-              toolbar that follows the cursor.
+              continuous speech rather than one card per utterance; hiding
+              still reaches every caption, through the toolbar that follows
+              the cursor.
           ────────────────────────────────────────────────────────────── */}
           {captions.length > 0 && (
             <div className="border-t border-slate-200 bg-white shrink-0">
@@ -1561,7 +1469,7 @@ export default function Admin() {
                       prose at the top of the scroller. Inline controls would
                       reflow the paragraph every time the cursor moved. */}
                   <div className="sticky top-0 z-10 h-0 flex justify-end pointer-events-none">
-                    {hoveredItem && editingSeq === null && (
+                    {hoveredItem && (
                       <div className="pointer-events-auto flex items-center gap-1 bg-white/95 backdrop-blur-sm border border-slate-200 rounded-lg shadow-sm px-1.5 py-1">
                         <span className="font-mono text-[10px] text-slate-400 px-0.5">
                           {new Date(hoveredItem.ts * 1000).toLocaleTimeString()}
@@ -1572,24 +1480,6 @@ export default function Admin() {
                             <span>{hoveredItem.latencyMs}ms</span>
                           </span>
                         ) : null}
-                        <button
-                          onClick={() => handleCopyItem(hoveredItem)}
-                          className="p-1 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
-                          title="คัดลอกข้อความ"
-                        >
-                          {copiedSeq === hoveredItem.seq ? (
-                            <Check className="w-3.5 h-3.5 text-emerald-600" />
-                          ) : (
-                            <Copy className="w-3.5 h-3.5" />
-                          )}
-                        </button>
-                        <button
-                          onClick={() => startEditing(hoveredItem)}
-                          className="p-1 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
-                          title="แก้ไขคำแปล"
-                        >
-                          <Edit2 className="w-3.5 h-3.5" />
-                        </button>
                         <button
                           onClick={() => hideItem(hoveredItem.seq)}
                           className="p-1 text-slate-400 hover:text-rose-600 rounded-md hover:bg-rose-50 transition-all"
@@ -1617,62 +1507,10 @@ export default function Admin() {
                           </p>
                         )}
 
-                        {/* A div rather than a p: an open editor is a block
-                            element and cannot legally nest inside a paragraph. */}
                         <div
                           className={`${textSizeClass(config.fontSize)} font-bold text-black leading-relaxed tracking-tight`}
                         >
                           {paragraph.items.map((item) => {
-                            // Editing the latest caption happens in the box
-                            // above, not duplicated here.
-                            const isEditing = editingSeq === item.seq && item.seq !== latestCaption?.seq;
-                            if (isEditing) {
-                              return (
-                                <div
-                                  key={item.seq}
-                                  className="my-2 p-3.5 bg-amber-50/90 border border-amber-300 ring-2 ring-amber-200 rounded-xl space-y-2.5"
-                                >
-                                  {/* Original text has no re-transcription command in
-                                      this pipeline — it's corrected by re-speaking, not typed. */}
-                                  <div>
-                                    <label className="text-xs font-bold text-slate-600 block mb-1">
-                                      ประโยคต้นฉบับ (แก้ไขไม่ได้):
-                                    </label>
-                                    <p className="w-full p-2.5 text-xs font-normal bg-slate-100 border border-slate-200 rounded-lg text-slate-500">
-                                      {item.sourceText}
-                                    </p>
-                                  </div>
-                                  <div>
-                                    <label className="text-xs font-bold text-slate-600 block mb-1">คำแปล:</label>
-                                    <input
-                                      type="text"
-                                      autoFocus
-                                      value={editDraft}
-                                      onChange={(e) => setEditDraft(e.target.value)}
-                                      onKeyDown={(e) => e.key === 'Enter' && saveEdit()}
-                                      className="w-full p-2.5 text-xs bg-white border border-slate-300 rounded-lg font-bold text-black outline-none focus:border-[#DE5C8E]"
-                                    />
-                                  </div>
-                                  <div className="flex items-center justify-end gap-2 pt-1">
-                                    <button
-                                      type="button"
-                                      onClick={() => setEditingSeq(null)}
-                                      className="px-3.5 py-1.5 text-xs text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium transition-all"
-                                    >
-                                      ยกเลิก
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={saveEdit}
-                                      className="px-3.5 py-1.5 text-xs text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg font-semibold flex items-center gap-1.5 shadow-xs transition-all"
-                                    >
-                                      <Check className="w-3.5 h-3.5" />
-                                      <span>บันทึก</span>
-                                    </button>
-                                  </div>
-                                </div>
-                              );
-                            }
                             return (
                               <span
                                 key={item.seq}
