@@ -87,6 +87,13 @@
 | `src/pages/Login.tsx` / `Register.tsx` / `AuthCallback.tsx` | เข้าสู่ระบบ, สมัคร (ส่งคำขอ), ปลายทาง OAuth |
 | `supabase/schema.sql` | ตาราง `access_requests` + RLS (อนุมัติได้จาก dashboard เท่านั้น) |
 | `supabase/schema-projects.sql` | ตาราง projects/project_sessions/transcript_items + glossary lists/terms + RLS ที่ผูกกับ `owner_id = auth.uid()` |
+| `src/components/LiveCaptionBox.tsx` | กล่องคำแปลสด ใช้ร่วมกันระหว่าง console และหน้าต่าง Output (`captionStyle.ts` = สี/ขนาด, `useCaptionStackAnimation.ts` = animation) |
+| `src/stream/useScreenShare.ts` | แชร์หน้าจอ projector + สถานะ + แยกกรณี macOS ไม่ให้สิทธิ์ |
+| `src/stream/useOutputWindow.ts` | เปิด/ปิดหน้าต่าง Output (Document PiP หรือ popup) และคัดลอก stylesheet |
+| `src/stream/OutputStage.tsx` | ภาพที่ถ่ายทอด 1920×1080: สไลด์ + แถบคำแปลที่ลากได้ |
+| `src/stream/outputLayout.ts` | คณิตศาสตร์ของ stage (scale, clamp, drag, snap) — pure ทั้งไฟล์ |
+| `src/stream/StreamPanel.tsx` | แท็บสตรีม, ป้ายสถานะบน header, คู่มือตั้งค่า OBS |
+| `src/storage/outputStore.ts` | ตำแหน่ง/ความกว้าง/ล็อกของแถบคำแปล ต่อเครื่อง |
 
 รายละเอียดการติดตั้งฝั่ง Supabase อยู่ใน `docs/supabase-auth-setup.md`
 ส่วนงานที่ยังเหลือของระบบ auth อยู่ใน `docs/auth-roadmap.md`
@@ -110,9 +117,33 @@
 
 ## 2. ฟังก์ชันหลักของระบบ (Core System Features)
 
-### 2.1 กล่อง Subtitle เดียว สำหรับ crop ไป OBS
+### 2.1 กล่อง Subtitle เดียว และหน้าต่าง Output สำหรับ OBS
 พื้นที่แสดงคำแปลหลักเป็น **กล่องเดียว** แสดงทีละข้อความ (เหมือน subtitle บน
-YouTube) ประวัติทั้งหมด (แก้ไข/คัดลอก/ซ่อน) อยู่ใน panel พับเก็บด้านล่าง
+YouTube) วาดโดย `src/components/LiveCaptionBox.tsx` ประวัติทั้งหมดอยู่ใน panel
+พับเก็บด้านล่าง
+
+แท็บ **สตรีม** ในแถบข้างใช้ถ่ายทอดสด โดย OBS จับหน้าต่างเดียว:
+
+1. **แชร์หน้าจอ** (`src/stream/useScreenShare.ts`) — เลือกจอ projector ที่เปิดสไลด์
+   หรือคลิป YouTube ภาพเปลี่ยนตามจอจริง สลับสไลด์หรือเปิดคลิปได้โดยไม่ต้องแชร์ใหม่
+2. **หน้าต่าง Output** (`src/stream/useOutputWindow.ts`) — Document
+   Picture-in-Picture (อยู่บนสุดเสมอ ย่อไม่ได้) หรือ popup ถ้าเบราว์เซอร์ไม่รองรับ
+   console วาดลงหน้าต่างนี้ด้วย React portal จึงใช้ state ชุดเดียวกัน ไม่มีการ sync
+   และไม่แตะเซิร์ฟเวอร์
+3. **Stage 1920×1080** (`src/stream/OutputStage.tsx`) — สไลด์เต็มพื้นที่ + แถบคำแปล
+   ที่หน้าตาตรงกับกล่องใน console ทุกอย่าง (ขนาดตัวอักษร ธีม แสดงต้นฉบับ) แต่ไม่มี
+   ป้าย latency และข้อความ "กำลังแปล…" ลากแถบย้ายตำแหน่งได้ในหน้าต่าง Output
+   ปรับความกว้างและล็อกตำแหน่งได้จากแท็บสตรีม ค่าเก็บต่อเครื่อง
+   (`src/storage/outputStore.ts`)
+
+ธีมคำบรรยายมีสามแบบ: ตัวดำพื้นขาว, ตัวขาวพื้นดำ และ **โปร่งแสง** (พื้นดำ 70%
+เห็นสไลด์ด้านหลัง)
+
+**ข้อจำกัดที่ต้องรู้:** Chrome หยุดวาดหน้าต่างที่ถูก minimise — ห้าม minimise
+หน้าต่าง Output ระหว่างถ่ายทอด (console minimise ได้) การแชร์จอและหน้าต่าง Output
+ไม่ผูกกับ session แปลภาษา จบ session แล้วยังเปิดอยู่ ถ้า refresh console หน้าต่าง
+Output จะปิดตาม ระบบจึงถามยืนยันก่อน checklist ทดสอบบนเครื่องจริงอยู่ที่
+`docs/stream-output-checklist.md`
 
 ### 2.2 ข้อความไหลสดระหว่างพูด (Live Partial)
 ระหว่างที่ยังพูดไม่จบประโยค คำแปลที่ Gemini ทยอยส่งกลับมาจะแสดงในกล่อง
