@@ -29,7 +29,7 @@ const section = 'space-y-2.5 bg-slate-50 p-3.5 rounded-xl border border-slate-20
 const primaryButton =
   'w-full flex items-center justify-center gap-1.5 py-2.5 px-3 rounded-lg text-xs font-bold bg-[#DE5C8E] hover:bg-[#c94577] text-white transition-all';
 const secondaryButton =
-  'flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg text-xs font-semibold border border-slate-200 bg-white text-slate-600 hover:text-slate-900 transition-all';
+  'flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg text-xs font-semibold border border-slate-200 bg-white text-slate-600 hover:text-slate-900 transition-all shrink-0 whitespace-nowrap';
 const warning = 'flex gap-2 text-[11px] leading-relaxed text-amber-800 bg-amber-50 border border-amber-200 rounded-lg p-2.5';
 
 /** The สตรีม tab: share the projector display, open the window OBS captures,
