@@ -13,7 +13,6 @@ import {
   Edit2,
   Menu,
   ShieldAlert,
-  FileText,
   ArrowLeftRight,
   Pause,
   Play,
@@ -83,14 +82,6 @@ function formatElapsed(ms: number): string {
   const m = String(Math.floor(totalSeconds / 60) % 60).padStart(2, '0');
   const s = String(totalSeconds % 60).padStart(2, '0');
   return `${h}:${m}:${s}`;
-}
-
-function formatSrtTime(ms: number): string {
-  const h = String(Math.floor(ms / 3600000)).padStart(2, '0');
-  const m = String(Math.floor(ms / 60000) % 60).padStart(2, '0');
-  const s = String(Math.floor(ms / 1000) % 60).padStart(2, '0');
-  const msPart = String(Math.floor(ms % 1000)).padStart(3, '0');
-  return `${h}:${m}:${s},${msPart}`;
 }
 
 /** Rows in the rolling caption stack — one utterance each, newest on top. */
@@ -248,7 +239,7 @@ export default function Admin() {
   // Captions have no "delete" concept anymore (there is no server to delete
   // them from) — "delete" stays a local-only hide so an operator can tidy
   // the visible history. Hiding removes a caption from the on-screen view
-  // and from TXT/SRT export, but it is still included in the AI summary and
+  // and from TXT export, but it is still included in the AI summary and
   // the permanent project record.
   const [hiddenSeqs, setHiddenSeqs] = useState<Set<number>>(new Set());
   const [editingSeq, setEditingSeq] = useState<number | null>(null);
@@ -599,35 +590,22 @@ export default function Admin() {
   }, [captions.length, editingSeq]);
 
   // ── Export ───────────────────────────────────────────────────────────────
-  const exportTranscript = (type: 'txt' | 'srt') => {
+  const exportTranscript = () => {
     if (captions.length === 0) return;
     const dateStr = new Date().toISOString().slice(0, 10);
-    let content = '';
-
-    if (type === 'txt') {
-      content = `=== Live Translation Transcript (${dateStr}) ===\n${sourceLang} -> ${targetLang}\n\n`;
-      content += captions
-        .map(
-          (c, i) =>
-            `[${i + 1}] ${new Date(c.ts * 1000).toLocaleTimeString()}${c.isEdited ? ' (edited)' : ''} [${c.latencyMs || '-'}ms]\nOriginal: ${c.sourceText}\nTranslated: ${c.targetText}\n`
-        )
-        .join('\n');
-    } else {
-      const startBase = captions[0].ts * 1000;
-      content = captions
-        .map((c, idx) => {
-          const startTime = Math.max(0, c.ts * 1000 - startBase);
-          const endTime = startTime + 3500;
-          return `${idx + 1}\n${formatSrtTime(startTime)} --> ${formatSrtTime(endTime)}\n${c.targetText}\n`;
-        })
-        .join('\n');
-    }
+    let content = `=== Live Translation Transcript (${dateStr}) ===\n${sourceLang} -> ${targetLang}\n\n`;
+    content += captions
+      .map(
+        (c, i) =>
+          `[${i + 1}] ${new Date(c.ts * 1000).toLocaleTimeString()}${c.isEdited ? ' (edited)' : ''} [${c.latencyMs || '-'}ms]\nOriginal: ${c.sourceText}\nTranslated: ${c.targetText}\n`
+      )
+      .join('\n');
 
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `transcript_${dateStr}.${type}`;
+    a.download = `transcript_${dateStr}.txt`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -1001,15 +979,6 @@ export default function Admin() {
                   <div className="space-y-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200">
                     <div className="flex items-center justify-between">
                       <span className="text-xs font-bold text-slate-800">คู่ภาษาแปลสด (Thai ↔ English)</span>
-                      <button
-                        type="button"
-                        onClick={handleSwapLanguages}
-                        className="text-[11px] px-2.5 py-1 bg-white hover:bg-pink-50 text-[#DE5C8E] border border-pink-200 rounded-lg font-bold flex items-center gap-1 shadow-2xs transition-all"
-                        title="สลับภาษาผู้พูดและภาษาแปล"
-                      >
-                        <ArrowLeftRight className="w-3.5 h-3.5" />
-                        <span>สลับภาษา</span>
-                      </button>
                     </div>
 
                     <div>
@@ -1544,22 +1513,23 @@ export default function Admin() {
                 </button>
               )}
               <button
-                onClick={() => exportTranscript('txt')}
+                type="button"
+                onClick={handleSwapLanguages}
+                className="px-2.5 py-1.5 text-xs text-[#DE5C8E] bg-white hover:bg-pink-50 border border-pink-200 rounded-lg font-semibold transition-all flex items-center gap-1.5 shadow-2xs"
+                title="สลับภาษาผู้พูดและภาษาแปล"
+              >
+                <span className="uppercase">{sourceLang}</span>
+                <ArrowLeftRight className="w-3.5 h-3.5" />
+                <span className="uppercase">{targetLang}</span>
+              </button>
+              <button
+                onClick={exportTranscript}
                 disabled={captions.length === 0}
                 className="px-2.5 py-1.5 text-xs text-slate-700 hover:text-slate-900 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg font-semibold transition-all disabled:opacity-40 flex items-center gap-1.5 shadow-2xs"
                 title="ส่งออกข้อความ TXT"
               >
                 <Download className="w-3.5 h-3.5 text-slate-500" />
                 <span>TXT</span>
-              </button>
-              <button
-                onClick={() => exportTranscript('srt')}
-                disabled={captions.length === 0}
-                className="px-2.5 py-1.5 text-xs text-slate-700 hover:text-slate-900 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg font-semibold transition-all disabled:opacity-40 flex items-center gap-1.5 shadow-2xs"
-                title="ส่งออกคำบรรยาย SRT"
-              >
-                <FileText className="w-3.5 h-3.5 text-slate-500" />
-                <span>SRT</span>
               </button>
               <button
                 onClick={clearTranscripts}
