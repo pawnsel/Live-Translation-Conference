@@ -1,19 +1,15 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
 import {
   Mic,
   MicOff,
   Languages,
   BookOpen,
-  Copy,
-  Check,
   Download,
   Trash2,
   Sparkles,
   Zap,
-  Edit2,
   Menu,
   ShieldAlert,
-  FileText,
   ArrowLeftRight,
   Pause,
   Play,
@@ -21,6 +17,8 @@ import {
   RefreshCw,
   ChevronDown,
   ChevronUp,
+  ChevronLeft,
+  ChevronRight,
   User,
   LogOut
 } from 'lucide-react';
@@ -40,10 +38,12 @@ import {
 import DictionaryManager from '../components/DictionaryManager';
 import { captionsReducer, initialCaptionState, selectCaptions, type Caption } from '../asr/captions';
 import { groupCaptionsIntoParagraphs } from '../asr/historyParagraphs';
+import { activeUtteranceSeq, buildCaptionRows } from '../asr/captionStack';
 import { useGeminiLiveCapture, type CaptionResult } from '../asr/audio/useGeminiLiveCapture';
 import { useAudioInputDevices } from '../asr/audio/useAudioInputDevices';
 import { deviceLabel, resolveDeviceId } from '../asr/audio/audioDevices';
 import { loadMicDeviceId, saveMicDeviceId } from '../storage/micStore';
+import { loadSidebarCollapsed, saveSidebarCollapsed } from '../storage/sidebarStore';
 import { autoStopReason, IDLE_STOP_MS, type AutoStopReason } from '../asr/audio/sessionLimits';
 import { SESSION_HEARTBEAT_MS } from '../data/staleSessions';
 import { forgetTabSession, loadTabSession, rememberTabSession } from '../storage/tabSession';
@@ -81,13 +81,8 @@ function formatElapsed(ms: number): string {
   return `${h}:${m}:${s}`;
 }
 
-function formatSrtTime(ms: number): string {
-  const h = String(Math.floor(ms / 3600000)).padStart(2, '0');
-  const m = String(Math.floor(ms / 60000) % 60).padStart(2, '0');
-  const s = String(Math.floor(ms / 1000) % 60).padStart(2, '0');
-  const msPart = String(Math.floor(ms % 1000)).padStart(3, '0');
-  return `${h}:${m}:${s},${msPart}`;
-}
+/** Rows in the rolling caption stack — one utterance each, newest on top. */
+const CAPTION_ROWS = 3;
 
 function textSizeClass(size: DisplayConfig['fontSize']): string {
   switch (size) {
@@ -108,14 +103,14 @@ function textSizeClass(size: DisplayConfig['fontSize']): string {
 function boxTextSizeClass(size: DisplayConfig['fontSize']): string {
   switch (size) {
     case 'small':
-      return 'text-2xl sm:text-3xl';
+      return 'text-xl sm:text-2xl';
     case 'medium':
-      return 'text-3xl sm:text-4xl';
+      return 'text-2xl sm:text-3xl';
     case 'xlarge':
-      return 'text-5xl sm:text-6xl';
+      return 'text-4xl sm:text-5xl';
     case 'large':
     default:
-      return 'text-4xl sm:text-5xl';
+      return 'text-3xl sm:text-4xl';
   }
 }
 
@@ -198,11 +193,22 @@ export default function Admin() {
   const [config, setConfig] = useState<DisplayConfig>({
     fontSize: 'medium',
     showOriginal: false,
+    // The rolling caption stack is disabled: its settings toggle was removed,
+    // so this is the only place that decides it and it stays off.
+    showPrevious: false,
     showLatency: false,
     captionTheme: 'light'
   });
   const [activeTab, setActiveTab] = useState<'languages' | 'dictionary'>('languages');
   const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => loadSidebarCollapsed());
+  const toggleSidebarCollapsed = () => {
+    setSidebarCollapsed((prev) => {
+      const next = !prev;
+      saveSidebarCollapsed(next);
+      return next;
+    });
+  };
   const [showHistory, setShowHistory] = useState(false);
   const [showSessionHistory, setShowSessionHistory] = useState(false);
   // Which session's summary popup is open, by ProjectSession id. The session
@@ -232,12 +238,9 @@ export default function Admin() {
   // Captions have no "delete" concept anymore (there is no server to delete
   // them from) — "delete" stays a local-only hide so an operator can tidy
   // the visible history. Hiding removes a caption from the on-screen view
-  // and from TXT/SRT export, but it is still included in the AI summary and
+  // and from TXT export, but it is still included in the AI summary and
   // the permanent project record.
   const [hiddenSeqs, setHiddenSeqs] = useState<Set<number>>(new Set());
-  const [editingSeq, setEditingSeq] = useState<number | null>(null);
-  const [editDraft, setEditDraft] = useState('');
-  const [copiedSeq, setCopiedSeq] = useState<number | null>(null);
   // History reads as prose, so per-caption controls cannot sit inline without
   // pushing the text around. The caption under the cursor is highlighted and
   // its actions appear in one toolbar pinned to the top of the scroller.
@@ -542,25 +545,6 @@ export default function Admin() {
   };
 
   // ── Caption item actions ─────────────────────────────────────────────────
-  const handleCopyItem = (item: Caption) => {
-    navigator.clipboard.writeText(`${item.sourceText}\n${item.targetText}`);
-    setCopiedSeq(item.seq);
-    setTimeout(() => setCopiedSeq(null), 1500);
-  };
-
-  const startEditing = (item: Caption) => {
-    setEditingSeq(item.seq);
-    setEditDraft(item.targetText);
-  };
-
-  const saveEdit = () => {
-    if (editingSeq === null) return;
-    const nextText = editDraft.trim();
-    dispatchCaption({ kind: 'edit', seq: editingSeq, targetText: nextText });
-    if (sessionId) void projects.editCaption(sessionId, editingSeq, nextText);
-    setEditingSeq(null);
-  };
-
   const hideItem = (seq: number) => {
     setHiddenSeqs((prev) => new Set(prev).add(seq));
   };
@@ -572,46 +556,31 @@ export default function Admin() {
     }
   };
 
-  // Auto-scroll the feed as new captions arrive, unless the operator is
-  // actively editing one (a scroll jump under an open editor is disorienting).
+  // Auto-scroll the feed as new captions arrive.
   useEffect(() => {
-    if (editingSeq !== null) return;
     const el = transcriptScrollRef.current;
     if (!el) return;
     const id = setTimeout(() => el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }), 80);
     return () => clearTimeout(id);
-  }, [captions.length, editingSeq]);
+  }, [captions.length]);
 
   // ── Export ───────────────────────────────────────────────────────────────
-  const exportTranscript = (type: 'txt' | 'srt') => {
+  const exportTranscript = () => {
     if (captions.length === 0) return;
     const dateStr = new Date().toISOString().slice(0, 10);
-    let content = '';
-
-    if (type === 'txt') {
-      content = `=== Live Translation Transcript (${dateStr}) ===\n${sourceLang} -> ${targetLang}\n\n`;
-      content += captions
-        .map(
-          (c, i) =>
-            `[${i + 1}] ${new Date(c.ts * 1000).toLocaleTimeString()}${c.isEdited ? ' (edited)' : ''} [${c.latencyMs || '-'}ms]\nOriginal: ${c.sourceText}\nTranslated: ${c.targetText}\n`
-        )
-        .join('\n');
-    } else {
-      const startBase = captions[0].ts * 1000;
-      content = captions
-        .map((c, idx) => {
-          const startTime = Math.max(0, c.ts * 1000 - startBase);
-          const endTime = startTime + 3500;
-          return `${idx + 1}\n${formatSrtTime(startTime)} --> ${formatSrtTime(endTime)}\n${c.targetText}\n`;
-        })
-        .join('\n');
-    }
+    let content = `=== Live Translation Transcript (${dateStr}) ===\n${sourceLang} -> ${targetLang}\n\n`;
+    content += captions
+      .map(
+        (c, i) =>
+          `[${i + 1}] ${new Date(c.ts * 1000).toLocaleTimeString()}${c.isEdited ? ' (edited)' : ''} [${c.latencyMs || '-'}ms]\nOriginal: ${c.sourceText}\nTranslated: ${c.targetText}\n`
+      )
+      .join('\n');
 
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `transcript_${dateStr}.${type}`;
+    a.download = `transcript_${dateStr}.txt`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -646,8 +615,128 @@ export default function Admin() {
   const hasPartial = !!(capture.partialSource || capture.partialTarget);
   const boxSourceText = capture.partialSource || latestCaption?.sourceText || '';
   const boxTargetText = capture.partialTarget || latestCaption?.targetText || '';
-  const isEditingBox = editingSeq !== null && editingSeq === latestCaption?.seq;
   const isDarkCaption = config.captionTheme === 'dark';
+
+  // ── Rolling caption stack ────────────────────────────────────────────────
+  // Song-lyric behaviour: one row per utterance with the sentence being
+  // spoken on the BOTTOM line, finished ones climbing a row each time and
+  // fading as they go, oldest off the top.
+  //
+  // Everything hangs off ONE number: which utterance owns the bottom row. A
+  // live partial belongs to the utterance after the newest committed one —
+  // the capture hook hands out one seq per closed caption, in order, and an
+  // utterance with nothing at all in it never takes a number — so that seq is
+  // knowable before the caption exists. Giving the live row that identity is
+  // what makes a caption closing a NON-event for the stack: the row keeps its
+  // identity while its text firms up from partial to final. Deriving the rows
+  // from "is a partial in flight" instead is what made the stack sometimes
+  // stand still and sometimes jump — the two states disagree about how many
+  // rows history gets.
+  const newestSeq = allCaptions.length > 0 ? allCaptions[allCaptions.length - 1].seq : -1;
+  const activeSeq = activeUtteranceSeq(newestSeq, hasPartial);
+
+  const captionRows = useMemo(
+    () =>
+      buildCaptionRows({
+        lines: captions,
+        activeSeq,
+        liveText: capture.partialTarget,
+        hasPartial,
+        rows: CAPTION_ROWS
+      }),
+    [captions, activeSeq, hasPartial, capture.partialTarget]
+  );
+
+  // The slide is measured, not predicted. Each row is keyed by its utterance,
+  // so React MOVES the same node up the stack, and the animation is simply
+  // "you were there, you are here now, cover the difference". Nothing about
+  // the caption pipeline can talk it into a shift that did not happen, or out
+  // of one that did — which is what every earlier attempt at this got wrong.
+  const rowNodesRef = useRef(new Map<string, HTMLDivElement>());
+  const rowTopsRef = useRef(new Map<string, number>());
+  // The animation currently playing for each row, if any — so a shift that
+  // lands before the previous one finishes can be handled deliberately
+  // instead of by accident.
+  const rowAnimsRef = useRef(new Map<string, Animation>());
+  const [captionDebug] = useState(() => {
+    try {
+      return window.localStorage.getItem('captionStackDebug') === '1';
+    } catch {
+      return false;
+    }
+  });
+
+  // The translateY a row is rendering RIGHT NOW, mid-animation or not.
+  // getComputedStyle reports the live interpolated value regardless of how
+  // many keyframes are involved, so this is the one place both 2D and 3D
+  // transform matrices need reading (a translate3d keyframe on some engines
+  // computes to matrix3d instead of matrix).
+  const currentTranslateY = (node: HTMLElement): number => {
+    try {
+      const transform = getComputedStyle(node).transform;
+      if (!transform || transform === 'none' || typeof DOMMatrixReadOnly === 'undefined') return 0;
+      return new DOMMatrixReadOnly(transform).m42;
+    } catch {
+      return 0;
+    }
+  };
+
+  useLayoutEffect(() => {
+    const previousTops = rowTopsRef.current;
+    const nextTops = new Map<string, number>();
+    rowNodesRef.current.forEach((node, key) => nextTops.set(key, node.offsetTop));
+    rowTopsRef.current = nextTops;
+    if (previousTops.size === 0) return; // first paint: the stack arrived, it did not move
+
+    const moves: string[] = [];
+    nextTops.forEach((top, key) => {
+      const node = rowNodesRef.current.get(key);
+      if (!node || typeof node.animate !== 'function') return;
+      // A row that was already on screen slides from where it was; a row that
+      // is new to the stack rides in from just under the bottom edge.
+      const from = previousTops.get(key) ?? top + node.offsetHeight;
+      let delta = from - top;
+
+      // Rapid, back-to-back sentences close faster than one 220ms slide can
+      // finish, so the next shift for this row lands while its animation from
+      // the PREVIOUS shift is still running. `node.animate()` again here
+      // would start a second animation on the same property — WAAPI has the
+      // newer one replace the older wholesale, so the row would cut straight
+      // from wherever it visually was to this shift's theoretical start point,
+      // an instant jump that reads as a skip. Reading the live transform
+      // before cancelling makes the new animation continue from exactly where
+      // the eye last saw the row, no matter how many shifts have piled up.
+      const running = rowAnimsRef.current.get(key);
+      if (running?.playState === 'running') {
+        delta = currentTranslateY(node);
+        running.cancel();
+      }
+      if (delta === 0) return;
+
+      moves.push(`${key}: ${from}→${top}`);
+      const anim = node.animate(
+        [{ transform: `translateY(${delta}px)` }, { transform: 'translateY(0)' }],
+        { duration: 220, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' }
+      );
+      rowAnimsRef.current.set(key, anim);
+      anim.addEventListener('finish', () => {
+        if (rowAnimsRef.current.get(key) === anim) rowAnimsRef.current.delete(key);
+      });
+    });
+
+    // Switched on with `localStorage.captionStackDebug = '1'` (then reload).
+    // The stack has now been rebuilt several times off reports of it "not
+    // sliding sometimes", and guessing has cost more than measuring would
+    // have: this prints what the rows actually were, and what actually moved.
+    if (captionDebug) {
+      // eslint-disable-next-line no-console
+      console.debug(
+        '[caption-stack]',
+        captionRows.map((row) => `${row.key}:${JSON.stringify(row.text.slice(0, 24))}`).join(' | '),
+        moves.length > 0 ? `moved ${moves.join(', ')}` : 'no movement'
+      );
+    }
+  }, [captionRows, captionDebug]);
 
   // Read live off the project record so the popup fills itself in the moment
   // the summary lands, rather than holding a stale copy of the session.
@@ -829,209 +918,219 @@ export default function Admin() {
       ────────────────────────────────────────────────────────────── */}
       <div className="flex-1 flex overflow-hidden relative">
         <aside
-          className={`fixed inset-y-15 left-0 z-20 w-84 lg:w-96 bg-white border-r border-slate-200 flex flex-col transition-transform duration-200 lg:static lg:translate-x-0 ${
+          className={`fixed inset-y-15 left-0 z-20 w-84 bg-white border-r border-slate-200 flex flex-col transition-[transform,width] duration-200 lg:static lg:translate-x-0 lg:overflow-hidden ${
             mobileSettingsOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-full'
-          }`}
+          } ${sidebarCollapsed ? 'lg:w-0 lg:border-r-0' : 'lg:w-96'}`}
         >
-          <div className="grid grid-cols-2 p-1.5 bg-slate-50 border-b border-slate-200 text-xs gap-1 shrink-0">
-            <button
-              onClick={() => setActiveTab('languages')}
-              className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all ${
-                activeTab === 'languages' ? 'bg-white text-[#DE5C8E] shadow-xs' : 'text-slate-500 hover:text-slate-800'
-              }`}
-            >
-              <Languages className="w-4 h-4" />
-              <span className="whitespace-nowrap">ภาษาและการตั้งค่า</span>
-            </button>
-            <button
-              onClick={() => setActiveTab('dictionary')}
-              className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all ${
-                activeTab === 'dictionary' ? 'bg-white text-[#DE5C8E] shadow-xs' : 'text-slate-500 hover:text-slate-800'
-              }`}
-            >
-              <BookOpen className="w-4 h-4" />
-              <span className="whitespace-nowrap">พจนานุกรม</span>
-            </button>
-          </div>
+          {/* Holds the expanded width even while the <aside> animates down to
+              lg:w-0, so the panel is clipped away rather than reflowing its
+              controls into an ever-narrower column on the way out. */}
+          <div className="flex-1 flex flex-col min-h-0 lg:w-96">
+            <div className="grid grid-cols-2 p-1.5 bg-slate-50 border-b border-slate-200 text-xs gap-1 shrink-0">
+              <button
+                onClick={() => setActiveTab('languages')}
+                className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all ${
+                  activeTab === 'languages' ? 'bg-white text-[#DE5C8E] shadow-xs' : 'text-slate-500 hover:text-slate-800'
+                }`}
+              >
+                <Languages className="w-4 h-4" />
+                <span className="whitespace-nowrap">ภาษาและการตั้งค่า</span>
+              </button>
+              <button
+                onClick={() => setActiveTab('dictionary')}
+                className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all ${
+                  activeTab === 'dictionary' ? 'bg-white text-[#DE5C8E] shadow-xs' : 'text-slate-500 hover:text-slate-800'
+                }`}
+              >
+                <BookOpen className="w-4 h-4" />
+                <span className="whitespace-nowrap">พจนานุกรม</span>
+              </button>
+            </div>
 
-          <div className="flex-1 p-4 overflow-y-auto space-y-4">
-            {activeTab === 'languages' && (
-              <div className="space-y-4">
-                <div className="space-y-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-800">คู่ภาษาแปลสด (Thai ↔ English)</span>
-                    <button
-                      type="button"
-                      onClick={handleSwapLanguages}
-                      className="text-[11px] px-2.5 py-1 bg-white hover:bg-pink-50 text-[#DE5C8E] border border-pink-200 rounded-lg font-bold flex items-center gap-1 shadow-2xs transition-all"
-                      title="สลับภาษาผู้พูดและภาษาแปล"
-                    >
-                      <ArrowLeftRight className="w-3.5 h-3.5" />
-                      <span>สลับภาษา</span>
-                    </button>
+            <div className="flex-1 p-4 overflow-y-auto space-y-4">
+              {activeTab === 'languages' && (
+                <div className="space-y-4">
+                  <div className="space-y-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-slate-800">คู่ภาษาแปลสด (Thai ↔ English)</span>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">ภาษาของผู้พูด (Source Language)</label>
+                      <select
+                        value={sourceLang}
+                        onChange={(e) => setLanguage(e.target.value as 'th' | 'en')}
+                        className="w-full p-2.5 text-xs bg-white border border-slate-200 rounded-lg outline-none focus:border-[#DE5C8E] font-semibold text-slate-800"
+                      >
+                        <option value="th">{LANGS.th}</option>
+                        <option value="en">{LANGS.en}</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">ภาษาที่แปลเป็น (Target — อัตโนมัติ)</label>
+                      <select
+                        value={targetLang}
+                        onChange={(e) => setLanguage(other(e.target.value) as 'th' | 'en')}
+                        className="w-full p-2.5 text-xs bg-white border border-slate-200 rounded-lg outline-none focus:border-[#DE5C8E] font-semibold text-[#DE5C8E]"
+                      >
+                        <option value="en">แปลเป็นอังกฤษ (English)</option>
+                        <option value="th">แปลเป็นไทย (Thai)</option>
+                      </select>
+                    </div>
                   </div>
 
                   <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">ภาษาของผู้พูด (Source Language)</label>
+                    <label className="block text-xs font-bold text-slate-700 mb-1.5">ขนาดตัวอักษรข้อความแปล (Font Size)</label>
                     <select
-                      value={sourceLang}
-                      onChange={(e) => setLanguage(e.target.value as 'th' | 'en')}
-                      className="w-full p-2.5 text-xs bg-white border border-slate-200 rounded-lg outline-none focus:border-[#DE5C8E] font-semibold text-slate-800"
+                      value={config.fontSize}
+                      onChange={(e) => setConfig((c) => ({ ...c, fontSize: e.target.value as DisplayConfig['fontSize'] }))}
+                      className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium"
                     >
-                      <option value="th">{LANGS.th}</option>
-                      <option value="en">{LANGS.en}</option>
+                      <option value="small">ขนาดเล็ก (Small)</option>
+                      <option value="medium">ขนาดปานกลาง (Medium)</option>
+                      <option value="large">ขนาดใหญ่ (Large - แนะนำ)</option>
+                      <option value="xlarge">ขนาดใหญ่พิเศษ (Extra Large)</option>
                     </select>
                   </div>
 
                   <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">ภาษาที่แปลเป็น (Target — อัตโนมัติ)</label>
+                    <label className="block text-xs font-bold text-slate-700 mb-1.5">ธีมคำบรรยาย (Caption Theme)</label>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setConfig((c) => ({ ...c, captionTheme: 'light' }))}
+                        className={`flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all ${
+                          (config.captionTheme ?? 'light') === 'light'
+                            ? 'border-[#DE5C8E] ring-2 ring-pink-100 bg-white text-slate-800'
+                            : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-white'
+                        }`}
+                      >
+                        <span className="w-3.5 h-3.5 rounded-full bg-white border border-slate-300 text-black flex items-center justify-center text-[8px] font-black">A</span>
+                        <span>ตัวดำพื้นขาว</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfig((c) => ({ ...c, captionTheme: 'dark' }))}
+                        className={`flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all ${
+                          config.captionTheme === 'dark'
+                            ? 'border-[#DE5C8E] ring-2 ring-pink-100 bg-white text-slate-800'
+                            : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-white'
+                        }`}
+                      >
+                        <span className="w-3.5 h-3.5 rounded-full bg-black text-white flex items-center justify-center text-[8px] font-black">A</span>
+                        <span>ตัวขาวพื้นดำ</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Microphone picker. Locked for the whole of a session —
+                      pausing does not unlock it, because switching device
+                      reconnects the capture pipeline and would cut the meeting
+                      mid-sentence. */}
+                  <div>
+                    <label htmlFor="mic-device" className="block text-xs font-bold text-slate-700 mb-1.5">
+                      ไมโครโฟนที่ใช้อัดเสียง (Microphone)
+                    </label>
                     <select
-                      value={targetLang}
-                      onChange={(e) => setLanguage(other(e.target.value) as 'th' | 'en')}
-                      className="w-full p-2.5 text-xs bg-white border border-slate-200 rounded-lg outline-none focus:border-[#DE5C8E] font-semibold text-[#DE5C8E]"
+                      id="mic-device"
+                      value={micDeviceId ?? ''}
+                      onChange={(e) => handleSelectMicDevice(e.target.value)}
+                      disabled={micLocked}
+                      title={
+                        micLocked
+                          ? 'เปลี่ยนไมโครโฟนระหว่าง session ไม่ได้ — จบ session นี้ก่อน'
+                          : 'เลือกไมโครโฟนที่จะใช้อัดเสียงใน session ถัดไป'
+                      }
+                      className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium disabled:opacity-50 disabled:cursor-not-allowed"
                     >
-                      <option value="en">แปลเป็นอังกฤษ (English)</option>
-                      <option value="th">แปลเป็นไทย (Thai)</option>
+                      <option value="">ไมโครโฟนเริ่มต้นของเบราว์เซอร์</option>
+                      {micDevices.map((device, index) => (
+                        <option key={device.deviceId} value={device.deviceId}>
+                          {deviceLabel(device, index)}
+                        </option>
+                      ))}
                     </select>
+                    {/* Ranked by urgency, not by state: a session recording on
+                        the WRONG microphone is the one thing the operator has to
+                        hear about immediately, even while the picker is locked. */}
+                    {capture.deviceFallback ? (
+                      <p className="mt-1 text-[11px] text-amber-600 font-semibold">
+                        เปิดไมโครโฟนที่เลือกไว้ไม่ได้ — กำลังอัดด้วยไมโครโฟนเริ่มต้นของเครื่องแทน
+                      </p>
+                    ) : micLocked ? (
+                      <p className="mt-1 text-[11px] text-slate-400">
+                        เปลี่ยนไมโครโฟนได้เมื่อจบ session แล้วเท่านั้น
+                      </p>
+                    ) : micDeviceMissing ? (
+                      <p className="mt-1 text-[11px] text-amber-600">
+                        ไม่พบไมโครโฟนที่เคยเลือกไว้ — session ถัดไปจะใช้ไมโครโฟนเริ่มต้นแทน
+                      </p>
+                    ) : null}
+                  </div>
+
+                  <div className="pt-3 border-t border-slate-200 space-y-2.5">
+                    <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
+                      <input
+                        type="checkbox"
+                        checked={config.showOriginal !== false}
+                        onChange={(e) => setConfig((c) => ({ ...c, showOriginal: e.target.checked }))}
+                        className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
+                      />
+                      <span>แสดงประโยคต้นฉบับคู่กับคำแปล</span>
+                    </label>
+                    <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
+                      <input
+                        type="checkbox"
+                        checked={config.showLatency !== false}
+                        onChange={(e) => setConfig((c) => ({ ...c, showLatency: e.target.checked }))}
+                        className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
+                      />
+                      <span>แสดงความเร็วการตอบสนอง (Latency ms)</span>
+                    </label>
                   </div>
                 </div>
+              )}
 
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1.5">ขนาดตัวอักษรข้อความแปล (Font Size)</label>
-                  <select
-                    value={config.fontSize}
-                    onChange={(e) => setConfig((c) => ({ ...c, fontSize: e.target.value as DisplayConfig['fontSize'] }))}
-                    className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium"
-                  >
-                    <option value="small">ขนาดเล็ก (Small)</option>
-                    <option value="medium">ขนาดปานกลาง (Medium)</option>
-                    <option value="large">ขนาดใหญ่ (Large - แนะนำ)</option>
-                    <option value="xlarge">ขนาดใหญ่พิเศษ (Extra Large)</option>
-                  </select>
-                </div>
+              {activeTab === 'dictionary' && (
+                <DictionaryManager
+                  sections={glossary}
+                  sharedLists={glossaryState.sharedLists}
+                  subscribedIds={glossaryState.subscribedIds}
+                  onToggleList={(id) => void glossaryState.toggleList(id)}
+                  disabled={false}
+                  onAdd={handleGlossaryAdd}
+                  onAddMany={handleGlossaryAddMany}
+                  onRemove={handleGlossaryRemove}
+                  isOwnTerm={glossaryState.isOwnTerm}
+                />
+              )}
+            </div>
 
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1.5">ธีมคำบรรยาย (Caption Theme)</label>
-                  <div className="grid grid-cols-2 gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => setConfig((c) => ({ ...c, captionTheme: 'light' }))}
-                      className={`flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all ${
-                        (config.captionTheme ?? 'light') === 'light'
-                          ? 'border-[#DE5C8E] ring-2 ring-pink-100 bg-white text-slate-800'
-                          : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-white'
-                      }`}
-                    >
-                      <span className="w-3.5 h-3.5 rounded-full bg-white border border-slate-300 text-black flex items-center justify-center text-[8px] font-black">A</span>
-                      <span>ตัวดำพื้นขาว</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setConfig((c) => ({ ...c, captionTheme: 'dark' }))}
-                      className={`flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all ${
-                        config.captionTheme === 'dark'
-                          ? 'border-[#DE5C8E] ring-2 ring-pink-100 bg-white text-slate-800'
-                          : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-white'
-                      }`}
-                    >
-                      <span className="w-3.5 h-3.5 rounded-full bg-black text-white flex items-center justify-center text-[8px] font-black">A</span>
-                      <span>ตัวขาวพื้นดำ</span>
-                    </button>
-                  </div>
-                </div>
-
-                {/* Microphone picker. Locked for the whole of a session —
-                    pausing does not unlock it, because switching device
-                    reconnects the capture pipeline and would cut the meeting
-                    mid-sentence. */}
-                <div>
-                  <label htmlFor="mic-device" className="block text-xs font-bold text-slate-700 mb-1.5">
-                    ไมโครโฟนที่ใช้อัดเสียง (Microphone)
-                  </label>
-                  <select
-                    id="mic-device"
-                    value={micDeviceId ?? ''}
-                    onChange={(e) => handleSelectMicDevice(e.target.value)}
-                    disabled={micLocked}
-                    title={
-                      micLocked
-                        ? 'เปลี่ยนไมโครโฟนระหว่าง session ไม่ได้ — จบ session นี้ก่อน'
-                        : 'เลือกไมโครโฟนที่จะใช้อัดเสียงใน session ถัดไป'
-                    }
-                    className="w-full p-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-none focus:bg-white focus:border-[#DE5C8E] font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    <option value="">ไมโครโฟนเริ่มต้นของเบราว์เซอร์</option>
-                    {micDevices.map((device, index) => (
-                      <option key={device.deviceId} value={device.deviceId}>
-                        {deviceLabel(device, index)}
-                      </option>
-                    ))}
-                  </select>
-                  {/* Ranked by urgency, not by state: a session recording on
-                      the WRONG microphone is the one thing the operator has to
-                      hear about immediately, even while the picker is locked. */}
-                  {capture.deviceFallback ? (
-                    <p className="mt-1 text-[11px] text-amber-600 font-semibold">
-                      เปิดไมโครโฟนที่เลือกไว้ไม่ได้ — กำลังอัดด้วยไมโครโฟนเริ่มต้นของเครื่องแทน
-                    </p>
-                  ) : micLocked ? (
-                    <p className="mt-1 text-[11px] text-slate-400">
-                      เปลี่ยนไมโครโฟนได้เมื่อจบ session แล้วเท่านั้น
-                    </p>
-                  ) : micDeviceMissing ? (
-                    <p className="mt-1 text-[11px] text-amber-600">
-                      ไม่พบไมโครโฟนที่เคยเลือกไว้ — session ถัดไปจะใช้ไมโครโฟนเริ่มต้นแทน
-                    </p>
-                  ) : null}
-                </div>
-
-                <div className="pt-3 border-t border-slate-200 space-y-2.5">
-                  <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
-                    <input
-                      type="checkbox"
-                      checked={config.showOriginal !== false}
-                      onChange={(e) => setConfig((c) => ({ ...c, showOriginal: e.target.checked }))}
-                      className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
-                    />
-                    <span>แสดงประโยคต้นฉบับคู่กับคำแปล</span>
-                  </label>
-                  <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
-                    <input
-                      type="checkbox"
-                      checked={config.showLatency !== false}
-                      onChange={(e) => setConfig((c) => ({ ...c, showLatency: e.target.checked }))}
-                      className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
-                    />
-                    <span>แสดงความเร็วการตอบสนอง (Latency ms)</span>
-                  </label>
-                </div>
-              </div>
-            )}
-
-            {activeTab === 'dictionary' && (
-              <DictionaryManager
-                sections={glossary}
-                sharedLists={glossaryState.sharedLists}
-                subscribedIds={glossaryState.subscribedIds}
-                onToggleList={(id) => void glossaryState.toggleList(id)}
-                disabled={false}
-                onAdd={handleGlossaryAdd}
-                onAddMany={handleGlossaryAddMany}
-                onRemove={handleGlossaryRemove}
-                isOwnTerm={glossaryState.isOwnTerm}
-              />
-            )}
-          </div>
-
-          <div className="p-3 border-t border-slate-200 lg:hidden">
-            <button
-              onClick={() => setMobileSettingsOpen(false)}
-              className="w-full py-2 bg-slate-100 text-slate-700 text-xs font-semibold rounded-lg"
-            >
-              ปิดหน้าต่างตั้งค่า
-            </button>
+            <div className="p-3 border-t border-slate-200 lg:hidden">
+              <button
+                onClick={() => setMobileSettingsOpen(false)}
+                className="w-full py-2 bg-slate-100 text-slate-700 text-xs font-semibold rounded-lg"
+              >
+                ปิดหน้าต่างตั้งค่า
+              </button>
+            </div>
           </div>
         </aside>
+
+        {/* Sibling of the <aside>, not a child: the aside clips its own
+            overflow, which would swallow a button straddling its edge. It
+            rides the same 200ms as the fold, so it stays on the seam. */}
+        <button
+          type="button"
+          onClick={toggleSidebarCollapsed}
+          title={sidebarCollapsed ? 'ขยายแถบตั้งค่า' : 'ย่อแถบตั้งค่า'}
+          className={`hidden lg:flex absolute top-1/2 -translate-x-1/2 -translate-y-1/2 z-30 w-6 h-6 items-center justify-center bg-white border border-slate-200 rounded-full shadow-sm text-slate-400 hover:text-[#DE5C8E] hover:border-pink-200 transition-[left,color,border-color] duration-200 ${
+            sidebarCollapsed ? 'left-3' : 'left-96'
+          }`}
+        >
+          {sidebarCollapsed ? <ChevronRight className="w-3.5 h-3.5" /> : <ChevronLeft className="w-3.5 h-3.5" />}
+        </button>
 
         {mobileSettingsOpen && (
           <div onClick={() => setMobileSettingsOpen(false)} className="fixed inset-0 bg-black/30 z-10 lg:hidden" />
@@ -1088,45 +1187,132 @@ export default function Admin() {
           )}
 
           {/* ─────────────────────────────────────────────────────────────
-              LIVE SUBTITLE — pinned to the top edge, at most two lines.
-              A caption that outgrows two lines starts a new block from the
-              word that no longer fitted, the way broadcast subtitles do.
+              LIVE SUBTITLE — pinned to the top edge. Two-line mode pages the
+              way broadcast subtitles do: a caption that outgrows the block
+              restarts from the word that no longer fitted. Rolling mode
+              instead keeps one line per sentence, newest on the bottom line
+              and older ones fading upwards out of the block. Either way
+              the box holds ONE fixed height for a given display setting:
+              nothing that happens while someone speaks may resize it.
           ────────────────────────────────────────────────────────────── */}
           <div className="shrink-0 px-3 pt-3 sm:px-6 sm:pt-4">
             <div
-              className={`relative w-full max-w-5xl mx-auto rounded-2xl border shadow-sm px-6 py-6 sm:px-10 sm:py-[28.8px] text-center transition-colors ${
+              className={`relative w-full rounded-2xl border shadow-sm px-6 py-6 sm:px-10 sm:py-[28.8px] text-left overflow-hidden transition-colors ${
                 isDarkCaption ? 'bg-black border-slate-700' : 'bg-white border-slate-200'
               }`}
             >
-              {latestCaption && !isEditingBox && !hasPartial && (
-                <div className="absolute top-2.5 right-2.5 flex items-center gap-1">
-                  <button
-                    onClick={() => handleCopyItem(latestCaption)}
-                    className={`p-1.5 rounded-md transition-all ${
-                      isDarkCaption
-                        ? 'text-slate-500 hover:text-white hover:bg-white/10'
-                        : 'text-slate-400 hover:text-slate-700 hover:bg-slate-100'
-                    }`}
-                    title="คัดลอกข้อความ"
-                  >
-                    {copiedSeq === latestCaption.seq ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
-                  </button>
-                  <button
-                    onClick={() => startEditing(latestCaption)}
-                    className={`p-1.5 rounded-md transition-all ${
-                      isDarkCaption
-                        ? 'text-slate-500 hover:text-white hover:bg-white/10'
-                        : 'text-slate-400 hover:text-slate-700 hover:bg-slate-100'
-                    }`}
-                    title="แก้ไขคำแปล"
-                  >
-                    <Edit2 className="w-3.5 h-3.5" />
-                  </button>
+              {/* Every slot below is ALWAYS mounted and every one of them is
+                  locked to its own line count, so the box is exactly as tall
+                  as the display settings demand and not one pixel more. The
+                  idle hint, which used to replace the content, now sits on
+                  top of it instead, because a box that resized under a
+                  speaker would shove the whole page around mid-sentence. */}
+              {config.showOriginal && (
+                <SubtitleText
+                  text={boxSourceText}
+                  maxLines={1}
+                  className={`text-base sm:text-lg mb-2 ${
+                    isDarkCaption
+                      ? hasPartial ? 'text-slate-600' : 'text-slate-400'
+                      : hasPartial ? 'text-slate-300' : 'text-slate-400'
+                  }`}
+                />
+              )}
+              {config.showPrevious ? (
+                <div className="relative overflow-hidden">
+                  {/* Keyed by utterance, so a line that climbs is the SAME
+                      node in a new place — which is what lets the animation
+                      measure the move instead of guessing it. The fade belongs
+                      to the slot, not to the sentence: a line dims by
+                      climbing, the way a lyric does, and the transition makes
+                      that dimming travel with the slide. */}
+                  {captionRows.map((row, index) => {
+                    const isLive = index === CAPTION_ROWS - 1;
+                    return (
+                      <div
+                        key={row.key}
+                        ref={(node) => {
+                          const nodes = rowNodesRef.current;
+                          if (node) {
+                            nodes.set(row.key, node);
+                          } else {
+                            nodes.delete(row.key);
+                            // The row is gone for good once it falls off the
+                            // top of the stack — nothing will ever animate it
+                            // again, so its Animation handle would otherwise
+                            // just sit in the map for the rest of the session.
+                            rowAnimsRef.current.get(row.key)?.cancel();
+                            rowAnimsRef.current.delete(row.key);
+                          }
+                        }}
+                        // One line tall, in CSS, from the very first paint:
+                        // leading-snug is a 1.375 line-height, so 1.375em of
+                        // this element's own font size IS one line. Letting
+                        // the row measure its own height instead (the way the
+                        // paged caption does) leaves it briefly the wrong size
+                        // while that measurement lands — and a stack whose
+                        // geometry moves under the animation is a slide that
+                        // sometimes plays and sometimes does not.
+                        className={`${boxTextSizeClass(config.fontSize)} leading-snug overflow-hidden`}
+                        style={{
+                          height: '1.375em',
+                          opacity: 1 - (CAPTION_ROWS - 1 - index) * 0.35,
+                          transition: 'opacity 220ms ease-out'
+                        }}
+                      >
+                        <SubtitleText
+                          text={isLive ? row.text || 'กำลังแปล…' : row.text}
+                          maxLines={1}
+                          reserveLines={false}
+                          // The live line follows the speaker (newest words
+                          // win); a finished one is read from its start.
+                          overflow={isLive ? 'page' : 'clip'}
+                          className={`${boxTextSizeClass(config.fontSize)} leading-snug tracking-tight ${
+                            isLive && !row.text
+                              ? `font-normal ${isDarkCaption ? 'text-slate-600' : 'text-slate-300'}`
+                              : `font-bold ${isDarkCaption ? 'text-white' : 'text-black'}`
+                          }`}
+                        />
+                      </div>
+                    );
+                  })}
                 </div>
+              ) : (
+                <SubtitleText
+                  text={boxTargetText || 'กำลังแปล…'}
+                  maxLines={2}
+                  className={`${boxTextSizeClass(config.fontSize)} leading-snug tracking-tight ${
+                    boxTargetText
+                      ? `font-bold ${isDarkCaption ? 'text-white' : 'text-black'}`
+                      : `font-normal ${isDarkCaption ? 'text-slate-600' : 'text-slate-300'}`
+                  }`}
+                />
+              )}
+              {/* The last MEASURED latency, kept on screen. Blanking it for
+                  the whole of the next sentence (the old `!hasPartial` rule)
+                  left it visible only in the gap between utterances — which
+                  in continuous speech is never, so it read as broken. */}
+              {config.showLatency && (
+                <span
+                  className={`mt-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-mono text-[10px] border ${
+                    latestCaption?.latencyMs ? '' : 'invisible'
+                  } ${
+                    isDarkCaption
+                      ? 'bg-white/5 text-slate-400 border-slate-700'
+                      : 'bg-slate-100 text-slate-500 border-slate-200'
+                  }`}
+                >
+                  <Zap className="w-3 h-3 text-amber-500" />
+                  <span>{latestCaption?.latencyMs ?? 0}ms</span>
+                </span>
               )}
 
-              {!latestCaption && !hasPartial ? (
-                <div className={isDarkCaption ? 'text-slate-500' : 'text-slate-400'}>
+              {!latestCaption && !hasPartial && (
+                <div
+                  className={`absolute inset-0 rounded-2xl flex flex-col items-center justify-center text-center px-6 ${
+                    isDarkCaption ? 'bg-black text-slate-500' : 'bg-white text-slate-400'
+                  }`}
+                >
                   <div className={`font-bold text-sm ${isDarkCaption ? 'text-slate-300' : 'text-slate-700'}`}>
                     พร้อมรับเสียงจากไมโครโฟน
                   </div>
@@ -1134,79 +1320,8 @@ export default function Admin() {
                     กดปุ่มไมโครโฟนวงกลมกลางจอ จากนั้นพูดใส่ไมโครโฟนเพื่อทำการแปลภาษาแบบเรียลไทม์
                   </p>
                 </div>
-              ) : isEditingBox ? (
-                <div className="space-y-3 text-left max-w-2xl mx-auto">
-                  <label className="text-xs font-bold text-slate-600 block">คำแปล:</label>
-                  <input
-                    type="text"
-                    autoFocus
-                    value={editDraft}
-                    onChange={(e) => setEditDraft(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && saveEdit()}
-                    className="w-full p-3 text-lg font-bold text-black text-center border border-slate-300 rounded-lg outline-none focus:border-[#DE5C8E]"
-                  />
-                  <div className="flex items-center justify-center gap-2 pt-1">
-                    <button
-                      type="button"
-                      onClick={() => setEditingSeq(null)}
-                      className="px-3.5 py-1.5 text-xs text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium transition-all"
-                    >
-                      ยกเลิก
-                    </button>
-                    <button
-                      type="button"
-                      onClick={saveEdit}
-                      className="px-3.5 py-1.5 text-xs text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg font-semibold flex items-center gap-1.5 shadow-xs transition-all"
-                    >
-                      <Check className="w-3.5 h-3.5" />
-                      <span>บันทึก</span>
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <>
-                  {config.showOriginal && boxSourceText && (
-                    <SubtitleText
-                      text={boxSourceText}
-                      maxLines={1}
-                      className={`text-base sm:text-lg mb-2 ${
-                        isDarkCaption
-                          ? hasPartial ? 'text-slate-600' : 'text-slate-400'
-                          : hasPartial ? 'text-slate-300' : 'text-slate-400'
-                      }`}
-                    />
-                  )}
-                  {boxTargetText ? (
-                    <SubtitleText
-                      text={boxTargetText}
-                      maxLines={2}
-                      className={`${boxTextSizeClass(config.fontSize)} font-bold leading-snug tracking-tight ${
-                        isDarkCaption ? 'text-white' : 'text-black'
-                      }`}
-                    />
-                  ) : (
-                    <p
-                      className={`${boxTextSizeClass(config.fontSize)} font-normal ${
-                        isDarkCaption ? 'text-slate-600' : 'text-slate-300'
-                      }`}
-                    >
-                      กำลังแปล…
-                    </p>
-                  )}
-                  {config.showLatency && !hasPartial && latestCaption?.latencyMs ? (
-                    <span
-                      className={`mt-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-mono text-[10px] border ${
-                        isDarkCaption
-                          ? 'bg-white/5 text-slate-400 border-slate-700'
-                          : 'bg-slate-100 text-slate-500 border-slate-200'
-                      }`}
-                    >
-                      <Zap className="w-3 h-3 text-amber-500" />
-                      <span>{latestCaption.latencyMs}ms</span>
-                    </span>
-                  ) : null}
-                </>
               )}
+
             </div>
           </div>
 
@@ -1299,22 +1414,23 @@ export default function Admin() {
                 </button>
               )}
               <button
-                onClick={() => exportTranscript('txt')}
+                type="button"
+                onClick={handleSwapLanguages}
+                className="px-2.5 py-1.5 text-xs text-[#DE5C8E] bg-white hover:bg-pink-50 border border-pink-200 rounded-lg font-semibold transition-all flex items-center gap-1.5 shadow-2xs"
+                title="สลับภาษาผู้พูดและภาษาแปล"
+              >
+                <span className="uppercase">{sourceLang}</span>
+                <ArrowLeftRight className="w-3.5 h-3.5" />
+                <span className="uppercase">{targetLang}</span>
+              </button>
+              <button
+                onClick={exportTranscript}
                 disabled={captions.length === 0}
                 className="px-2.5 py-1.5 text-xs text-slate-700 hover:text-slate-900 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg font-semibold transition-all disabled:opacity-40 flex items-center gap-1.5 shadow-2xs"
                 title="ส่งออกข้อความ TXT"
               >
                 <Download className="w-3.5 h-3.5 text-slate-500" />
                 <span>TXT</span>
-              </button>
-              <button
-                onClick={() => exportTranscript('srt')}
-                disabled={captions.length === 0}
-                className="px-2.5 py-1.5 text-xs text-slate-700 hover:text-slate-900 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg font-semibold transition-all disabled:opacity-40 flex items-center gap-1.5 shadow-2xs"
-                title="ส่งออกคำบรรยาย SRT"
-              >
-                <FileText className="w-3.5 h-3.5 text-slate-500" />
-                <span>SRT</span>
               </button>
               <button
                 onClick={clearTranscripts}
@@ -1330,9 +1446,9 @@ export default function Admin() {
           {/* ─────────────────────────────────────────────────────────────
               HISTORY — collapsed by default so the subtitle box above stays
               the primary view. Captions run together as paragraphs of
-              continuous speech rather than one card per utterance; the full
-              edit/hide/copy tooling still reaches every caption, through the
-              toolbar that follows the cursor.
+              continuous speech rather than one card per utterance; hiding
+              still reaches every caption, through the toolbar that follows
+              the cursor.
           ────────────────────────────────────────────────────────────── */}
           {captions.length > 0 && (
             <div className="border-t border-slate-200 bg-white shrink-0">
@@ -1353,7 +1469,7 @@ export default function Admin() {
                       prose at the top of the scroller. Inline controls would
                       reflow the paragraph every time the cursor moved. */}
                   <div className="sticky top-0 z-10 h-0 flex justify-end pointer-events-none">
-                    {hoveredItem && editingSeq === null && (
+                    {hoveredItem && (
                       <div className="pointer-events-auto flex items-center gap-1 bg-white/95 backdrop-blur-sm border border-slate-200 rounded-lg shadow-sm px-1.5 py-1">
                         <span className="font-mono text-[10px] text-slate-400 px-0.5">
                           {new Date(hoveredItem.ts * 1000).toLocaleTimeString()}
@@ -1364,24 +1480,6 @@ export default function Admin() {
                             <span>{hoveredItem.latencyMs}ms</span>
                           </span>
                         ) : null}
-                        <button
-                          onClick={() => handleCopyItem(hoveredItem)}
-                          className="p-1 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
-                          title="คัดลอกข้อความ"
-                        >
-                          {copiedSeq === hoveredItem.seq ? (
-                            <Check className="w-3.5 h-3.5 text-emerald-600" />
-                          ) : (
-                            <Copy className="w-3.5 h-3.5" />
-                          )}
-                        </button>
-                        <button
-                          onClick={() => startEditing(hoveredItem)}
-                          className="p-1 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 transition-all"
-                          title="แก้ไขคำแปล"
-                        >
-                          <Edit2 className="w-3.5 h-3.5" />
-                        </button>
                         <button
                           onClick={() => hideItem(hoveredItem.seq)}
                           className="p-1 text-slate-400 hover:text-rose-600 rounded-md hover:bg-rose-50 transition-all"
@@ -1409,62 +1507,10 @@ export default function Admin() {
                           </p>
                         )}
 
-                        {/* A div rather than a p: an open editor is a block
-                            element and cannot legally nest inside a paragraph. */}
                         <div
                           className={`${textSizeClass(config.fontSize)} font-bold text-black leading-relaxed tracking-tight`}
                         >
                           {paragraph.items.map((item) => {
-                            // Editing the latest caption happens in the box
-                            // above, not duplicated here.
-                            const isEditing = editingSeq === item.seq && item.seq !== latestCaption?.seq;
-                            if (isEditing) {
-                              return (
-                                <div
-                                  key={item.seq}
-                                  className="my-2 p-3.5 bg-amber-50/90 border border-amber-300 ring-2 ring-amber-200 rounded-xl space-y-2.5"
-                                >
-                                  {/* Original text has no re-transcription command in
-                                      this pipeline — it's corrected by re-speaking, not typed. */}
-                                  <div>
-                                    <label className="text-xs font-bold text-slate-600 block mb-1">
-                                      ประโยคต้นฉบับ (แก้ไขไม่ได้):
-                                    </label>
-                                    <p className="w-full p-2.5 text-xs font-normal bg-slate-100 border border-slate-200 rounded-lg text-slate-500">
-                                      {item.sourceText}
-                                    </p>
-                                  </div>
-                                  <div>
-                                    <label className="text-xs font-bold text-slate-600 block mb-1">คำแปล:</label>
-                                    <input
-                                      type="text"
-                                      autoFocus
-                                      value={editDraft}
-                                      onChange={(e) => setEditDraft(e.target.value)}
-                                      onKeyDown={(e) => e.key === 'Enter' && saveEdit()}
-                                      className="w-full p-2.5 text-xs bg-white border border-slate-300 rounded-lg font-bold text-black outline-none focus:border-[#DE5C8E]"
-                                    />
-                                  </div>
-                                  <div className="flex items-center justify-end gap-2 pt-1">
-                                    <button
-                                      type="button"
-                                      onClick={() => setEditingSeq(null)}
-                                      className="px-3.5 py-1.5 text-xs text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium transition-all"
-                                    >
-                                      ยกเลิก
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={saveEdit}
-                                      className="px-3.5 py-1.5 text-xs text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg font-semibold flex items-center gap-1.5 shadow-xs transition-all"
-                                    >
-                                      <Check className="w-3.5 h-3.5" />
-                                      <span>บันทึก</span>
-                                    </button>
-                                  </div>
-                                </div>
-                              );
-                            }
                             return (
                               <span
                                 key={item.seq}

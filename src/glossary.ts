@@ -97,8 +97,35 @@ export function applyEnThCorrections(text: string, sections: GlossarySections): 
   // enough on its own to stop "Kawin" matching inside "Kawinsky".
   // One global pass means a replacement's own text is never rescanned.
   const pattern = new RegExp(`(^|[^A-Za-z0-9_])(${alternation})(?![A-Za-z0-9_])`, 'gi');
-  return text.replace(pattern, (match, prefix: string, term: string) => {
+  const corrected = text.replace(pattern, (match, prefix: string, term: string) => {
     const replacement = byTerm.get(term.toLowerCase());
     return replacement === undefined ? match : prefix + replacement;
+  });
+
+  return spaceAdjacentThaiValues(corrected, entries.map(([, replacement]) => replacement));
+}
+
+// Thai is written without spaces between words, so a model that renders two
+// glossary names itself joins them ("ปพนธนัยอุ่นโสภา") and nothing above has
+// English left to replace. Only boundaries between two glossary values get a
+// space — a name next to ordinary Thai stays joined, as Thai writes it.
+function spaceAdjacentThaiValues(text: string, values: string[]): string {
+  const thai = [...new Set(values)].filter((value) => /[\u0E00-\u0E7F]/.test(value));
+  if (thai.length === 0) return text;
+
+  // Longest first, so a scan at each position takes the whole "สมชาย" rather
+  // than splitting it into glossary entries "สม" and "ชาย".
+  const pattern = new RegExp(
+    thai
+      .sort((a, b) => b.length - a.length)
+      .map(escapeRegExp)
+      .join('|'),
+    'g'
+  );
+  let previousEnd = -1;
+  return text.replace(pattern, (match: string, offset: number) => {
+    const joined = offset === previousEnd;
+    previousEnd = offset + match.length;
+    return joined ? ` ${match}` : match;
   });
 }

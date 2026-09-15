@@ -8,8 +8,24 @@ interface SubtitleTextProps {
   maxLines?: number;
   /** Typography for the caption, applied to both the visible and measured copy. */
   className?: string;
-  /** Keeps the block from collapsing between captions. */
+  /**
+   * Locks the block to exactly `maxLines` tall — one line of text and a full
+   * block occupy the same space, so the caption box never resizes while
+   * someone is speaking.
+   */
   reserveLines?: boolean;
+  /**
+   * How text that does not fit is handled.
+   *
+   * 'page' (the default) is subtitle behaviour: the block shows the LAST page
+   * that fits, so a caption still being spoken always shows its newest words.
+   *
+   * 'clip' shows the text from its start and cuts the overflow with an
+   * ellipsis. A finished sentence needs this — paging it would show only the
+   * remainder after the last page break, which for the wrong sentence length
+   * is a two-character stub that reads as a line gone missing.
+   */
+  overflow?: 'page' | 'clip';
 }
 
 /**
@@ -21,7 +37,13 @@ interface SubtitleTextProps {
  * an invisible twin of the visible paragraph (identical classes, identical
  * width) and the paging decision itself is made by `fitSubtitlePage`.
  */
-export default function SubtitleText({ text, maxLines = 2, className = '', reserveLines = true }: SubtitleTextProps) {
+export default function SubtitleText({
+  text,
+  maxLines = 2,
+  className = '',
+  reserveLines = true,
+  overflow = 'page'
+}: SubtitleTextProps) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const measureRef = useRef<HTMLParagraphElement>(null);
   const startRef = useRef(0);
@@ -49,10 +71,22 @@ export default function SubtitleText({ text, maxLines = 2, className = '', reser
       return;
     }
 
-    // One line of THIS paragraph, at THIS width and font size.
+    // One line of THIS paragraph, at THIS width and font size. The reserved
+    // height comes from the fractional rect — `scrollHeight` rounds down, and
+    // three roundings of a 41.25px line would clip the last line.
     el.textContent = 'A';
     const oneLine = el.scrollHeight || 0;
-    setLineHeight(oneLine);
+    setLineHeight(el.getBoundingClientRect().height || oneLine);
+
+    // Clipped text is never paged — CSS does the cutting, and the reserved
+    // height above is all this measurement was needed for.
+    if (overflow === 'clip') {
+      el.textContent = '';
+      prevTextRef.current = text;
+      startRef.current = 0;
+      setVisible(text);
+      return;
+    }
 
     const measure = (value: string) => {
       if (!value) return 0;
@@ -69,15 +103,19 @@ export default function SubtitleText({ text, maxLines = 2, className = '', reser
     prevTextRef.current = text;
     startRef.current = start;
     setVisible(text.slice(start));
-  }, [text, maxLines, width]);
+  }, [text, maxLines, width, overflow]);
 
   return (
     <div
       ref={wrapRef}
       className="relative w-full"
-      style={reserveLines && lineHeight ? { minHeight: lineHeight * maxLines } : undefined}
+      style={
+        reserveLines && lineHeight
+          ? { height: lineHeight * maxLines, overflow: 'hidden' }
+          : undefined
+      }
     >
-      <p className={`${className} break-words`}>{visible}</p>
+      <p className={`${className} ${overflow === 'clip' ? 'truncate' : 'break-words'}`}>{visible}</p>
       <p ref={measureRef} aria-hidden className={`${className} break-words absolute inset-x-0 top-0 invisible pointer-events-none`} />
     </div>
   );

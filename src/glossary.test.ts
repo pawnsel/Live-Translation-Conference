@@ -102,4 +102,33 @@ describe('applyEnThCorrections', () => {
   it('returns the text unchanged when nothing is mapped', () => {
     expect(applyEnThCorrections('Kawin is presenting now', emptyGlossary())).toBe('Kawin is presenting now');
   });
+
+  describe('spacing between adjacent Thai names', () => {
+    const names = withEnTh({ Kawin: 'กวิน', Paponthanai: 'ปพนธนัย', Ounsopa: 'อุ่นโสภา' });
+
+    it('separates two names the model wrote joined together', () => {
+      expect(applyEnThCorrections('ขอบคุณ ปพนธนัยอุ่นโสภา ครับ', names)).toBe('ขอบคุณ ปพนธนัย อุ่นโสภา ครับ');
+    });
+
+    it('separates a replaced English name from the Thai name it was glued to', () => {
+      expect(applyEnThCorrections('Paponthanaiอุ่นโสภา', names)).toBe('ปพนธนัย อุ่นโสภา');
+    });
+
+    it('separates every name in a longer run', () => {
+      expect(applyEnThCorrections('กวินปพนธนัยอุ่นโสภา', names)).toBe('กวิน ปพนธนัย อุ่นโสภา');
+    });
+
+    it('does not add a second space where one is already present', () => {
+      expect(applyEnThCorrections('ปพนธนัย อุ่นโสภา', names)).toBe('ปพนธนัย อุ่นโสภา');
+    });
+
+    it('leaves a name joined to ordinary Thai text, which Thai writes without spaces', () => {
+      expect(applyEnThCorrections('ปพนธนัยพูดว่า', names)).toBe('ปพนธนัยพูดว่า');
+    });
+
+    it('does not split a name that is itself made of two shorter glossary names', () => {
+      const g = withEnTh({ Som: 'สม', Chai: 'ชาย', Somchai: 'สมชาย' });
+      expect(applyEnThCorrections('สมชายมาแล้ว', g)).toBe('สมชายมาแล้ว');
+    });
+  });
 });

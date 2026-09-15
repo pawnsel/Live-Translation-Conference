@@ -17,6 +17,10 @@ export interface DisplayConfig {
   fontSize?: 'small' | 'medium' | 'large' | 'xlarge';
   fontFamily?: string;
   showOriginal?: boolean;
+  /** Turns the caption box into a rolling stack of the last three sentences —
+   *  the live one on the bottom line, older ones climbing a row and fading as
+   *  they go, like song lyrics — instead of a single two-line caption. */
+  showPrevious?: boolean;
   showLatency?: boolean;
   /** Color scheme of the live caption box. 'light' (black text on white) is
    *  the default; 'dark' is white text on black, for a darker room/stage. */
