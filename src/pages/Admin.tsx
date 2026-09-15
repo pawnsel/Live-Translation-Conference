@@ -196,6 +196,8 @@ export default function Admin() {
   const [config, setConfig] = useState<DisplayConfig>({
     fontSize: 'medium',
     showOriginal: false,
+    // The rolling caption stack is disabled: its settings toggle was removed,
+    // so this is the only place that decides it and it stays off.
     showPrevious: false,
     showLatency: false,
     captionTheme: 'light'
@@ -1104,15 +1106,6 @@ export default function Admin() {
                         className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
                       />
                       <span>แสดงประโยคต้นฉบับคู่กับคำแปล</span>
-                    </label>
-                    <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
-                      <input
-                        type="checkbox"
-                        checked={config.showPrevious === true}
-                        onChange={(e) => setConfig((c) => ({ ...c, showPrevious: e.target.checked }))}
-                        className="rounded text-[#DE5C8E] focus:ring-[#DE5C8E] w-4 h-4"
-                      />
-                      <span>แสดงคำแปลย้อนหลัง</span>
                     </label>
                     <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
                       <input
