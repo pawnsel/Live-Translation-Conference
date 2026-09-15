@@ -74,3 +74,16 @@ export function fitSubtitlePage(text: string, start: number, maxLines: number, m
 export function isContinuation(previous: string, next: string): boolean {
   return next.length >= previous.length && next.startsWith(previous);
 }
+
+/**
+ * An element's layout height from its bounding rect, with any ancestor CSS
+ * scale undone. `getBoundingClientRect` reports what is on screen — inside the
+ * Output stage that is the 1920×1080 box after `scale()` — while the reserved
+ * height is applied in layout pixels. Widths of the same element give the
+ * scale; the rect is kept (rather than `offsetHeight`) for its fractional
+ * precision.
+ */
+export function unscaledHeight(rectHeight: number, rectWidth: number, layoutWidth: number): number {
+  if (!rectWidth || !layoutWidth) return rectHeight;
+  return rectHeight * (layoutWidth / rectWidth);
+}

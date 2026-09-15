@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fitSubtitlePage, isContinuation, longestFittingLength } from './subtitleLines';
+import { fitSubtitlePage, isContinuation, longestFittingLength, unscaledHeight } from './subtitleLines';
 
 // A stand-in for the browser's layout: a fixed number of characters per
 // line, wrapping on spaces, and hard-wrapping a run that is longer than a
@@ -98,5 +98,21 @@ describe('isContinuation', () => {
   it('treats a fresh caption as a new block', () => {
     expect(isContinuation('สวัสดีครับ', 'ขอบคุณ')).toBe(false);
     expect(isContinuation('hello world', 'hello')).toBe(false);
+  });
+});
+
+describe('unscaledHeight', () => {
+  it('returns the rect height when nothing is scaled', () => {
+    expect(unscaledHeight(41.25, 800, 800)).toBe(41.25);
+  });
+
+  it('undoes an ancestor scale, keeping fractional pixels', () => {
+    // A 1920-wide stage drawn at half size: 30.5 on screen is 61 in layout.
+    expect(unscaledHeight(30.5, 960, 1920)).toBe(61);
+  });
+
+  it('falls back to the rect height when widths are unknown', () => {
+    expect(unscaledHeight(20, 0, 1920)).toBe(20);
+    expect(unscaledHeight(20, 960, 0)).toBe(20);
   });
 });
