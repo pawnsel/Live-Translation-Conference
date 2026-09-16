@@ -66,8 +66,11 @@ function OutputStage({ stream, config, caption, prefs, onMove }: OutputStageProp
   // (never the console's global — same rule as SubtitleText.tsx) catches
   // size changes that do not correspond to a prop change. jsdom has no
   // ResizeObserver, so the effect still measures once via `update()` above
-  // and simply skips observing further.
+  // and simply skips observing further. Only letterbox reads the height, and
+  // `offsetHeight` forces a reflow — on a six-hour stream the overlay layout
+  // would pay that on every caption, for a value nothing uses.
   useLayoutEffect(() => {
+    if (prefs.layout !== 'letterbox') return;
     const bar = barRef.current;
     if (!bar) return;
     const update = () => setBarHeightPct((bar.offsetHeight / STAGE_HEIGHT) * 100);
