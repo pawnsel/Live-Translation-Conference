@@ -68,7 +68,7 @@ describe('StreamPanel', () => {
 
   it('locks and resets the position', () => {
     const onPrefsChange = vi.fn();
-    const prefs = { x: 20, y: 50, widthPct: 40, locked: false };
+    const prefs = { ...DEFAULT_OUTPUT_PREFS, x: 20, y: 50, widthPct: 40, locked: false };
     render(<StreamPanel share={share()} output={output()} prefs={prefs} onPrefsChange={onPrefsChange} />);
     fireEvent.click(screen.getByLabelText(/ล็อกตำแหน่ง/));
     expect(onPrefsChange).toHaveBeenLastCalledWith({ ...prefs, locked: true });

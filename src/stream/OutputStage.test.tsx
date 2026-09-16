@@ -3,6 +3,8 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import OutputStage from './OutputStage';
 import type { CaptionView } from '../components/LiveCaptionBox';
+import { DEFAULT_OUTPUT_PREFS } from '../storage/outputStore';
+import { letterboxBarBottomPct, letterboxSlideHeightPct } from './outputLayout';
 
 // jsdom has no PointerEvent; a MouseEvent carrying a pointerId is enough here.
 beforeAll(() => {
@@ -32,14 +34,14 @@ const caption: CaptionView = {
   isIdle: false
 };
 
-function renderStage(prefs = { x: 50, y: 96, widthPct: 80, locked: false }, onMove = vi.fn()) {
+function renderStage(prefs = DEFAULT_OUTPUT_PREFS, onMove = vi.fn()) {
   render(<OutputStage stream={null} config={{ fontSize: 'large', captionTheme: 'translucent', showLatency: true }} caption={caption} prefs={prefs} onMove={onMove} />);
   return { bar: screen.getByTestId('output-caption-bar'), stage: screen.getByTestId('output-stage'), onMove };
 }
 
 describe('OutputStage', () => {
   it('places the bar by its bottom-centre at the saved position and width', () => {
-    const { bar } = renderStage({ x: 40, y: 90, widthPct: 70, locked: false });
+    const { bar } = renderStage({ ...DEFAULT_OUTPUT_PREFS, x: 40, y: 90, widthPct: 70, locked: false });
     expect(bar.style.left).toBe('40%');
     expect(bar.style.top).toBe('90%');
     expect(bar.style.width).toBe('70%');
@@ -56,7 +58,7 @@ describe('OutputStage', () => {
         // assertion passed whether or not the stage variant suppresses the
         // hint at all.
         caption={{ ...caption, isIdle: true }}
-        prefs={{ x: 50, y: 96, widthPct: 80, locked: false }}
+        prefs={DEFAULT_OUTPUT_PREFS}
         onMove={vi.fn()}
       />
     );
@@ -77,7 +79,7 @@ describe('OutputStage', () => {
   });
 
   it('ignores drags while locked', () => {
-    const { bar, stage, onMove } = renderStage({ x: 50, y: 96, widthPct: 80, locked: true });
+    const { bar, stage, onMove } = renderStage({ ...DEFAULT_OUTPUT_PREFS, locked: true });
     vi.spyOn(stage, 'getBoundingClientRect').mockReturnValue({ width: 960, height: 540, left: 0, top: 0, right: 960, bottom: 540, x: 0, y: 0, toJSON: () => ({}) });
 
     fireEvent.pointerDown(bar, { pointerId: 1, button: 0, clientX: 480, clientY: 500 });
@@ -92,5 +94,59 @@ describe('OutputStage', () => {
     fireEvent.pointerDown(bar, { pointerId: 1, button: 0, clientX: 480, clientY: 500 });
     fireEvent.pointerUp(bar, { pointerId: 1, clientX: 480, clientY: 500 });
     expect(onMove).not.toHaveBeenCalled();
+  });
+
+  describe('letterbox layout', () => {
+    it('positions the video and the bar from the pure geometry helpers', () => {
+      // Stand in for jsdom's real (always-zero) layout: 162px of a 1080px
+      // stage is 15%.
+      vi.spyOn(window.HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(162);
+      const prefs = { ...DEFAULT_OUTPUT_PREFS, layout: 'letterbox' as const, slidePct: 80 };
+      render(
+        <OutputStage
+          stream={null}
+          config={{ fontSize: 'large', captionTheme: 'translucent', showLatency: true }}
+          caption={caption}
+          prefs={prefs}
+          onMove={vi.fn()}
+        />
+      );
+      const video = document.querySelector('video') as HTMLVideoElement;
+      const bar = screen.getByTestId('output-caption-bar');
+
+      const slideH = letterboxSlideHeightPct(prefs.slidePct, 15);
+      expect(video.style.left).toBe('0px');
+      expect(video.style.top).toBe('0px');
+      expect(video.style.width).toBe('100%');
+      expect(video.style.height).toBe(`${slideH}%`);
+
+      expect(bar.style.left).toBe('50%');
+      expect(bar.style.top).toBe(`${letterboxBarBottomPct(slideH, 15)}%`);
+      expect(bar.style.width).toBe(`${prefs.widthPct}%`);
+      expect(bar.style.transform).toBe('translate(-50%, -100%)');
+    });
+
+    it('never drags: no pointer handlers fire onMove and no drag styling is applied', () => {
+      const onMove = vi.fn();
+      const prefs = { ...DEFAULT_OUTPUT_PREFS, layout: 'letterbox' as const };
+      render(
+        <OutputStage
+          stream={null}
+          config={{ fontSize: 'large', captionTheme: 'translucent', showLatency: true }}
+          caption={caption}
+          prefs={prefs}
+          onMove={onMove}
+        />
+      );
+      const bar = screen.getByTestId('output-caption-bar');
+
+      fireEvent.pointerDown(bar, { pointerId: 1, button: 0, clientX: 480, clientY: 500 });
+      fireEvent.pointerMove(bar, { pointerId: 1, clientX: 100, clientY: 100 });
+      fireEvent.pointerUp(bar, { pointerId: 1, clientX: 100, clientY: 100 });
+
+      expect(onMove).not.toHaveBeenCalled();
+      expect(bar.className).not.toContain('cursor-move');
+      expect(bar.className).not.toContain('outline');
+    });
   });
 });
