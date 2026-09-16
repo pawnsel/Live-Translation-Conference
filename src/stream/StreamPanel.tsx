@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { AlertTriangle, AppWindow, EyeOff, Lock, MonitorUp, RotateCcw, Square } from 'lucide-react';
+import { AlertTriangle, AppWindow, EyeOff, Lock, Maximize, MonitorUp, RotateCcw, Square } from 'lucide-react';
 import type { ScreenShare } from './useScreenShare';
 import type { OutputWindow } from './useOutputWindow';
 import { clampBar } from './outputLayout';
@@ -47,8 +47,9 @@ const layoutButtonSelected =
 const layoutButtonUnselected =
   'flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all border-slate-200 bg-slate-50 text-slate-500 hover:bg-white';
 
-/** The สตรีม tab: share the projector display, open the window OBS captures,
- *  and place the caption bar. Independent of the translation session. */
+/** The สตรีม tab: share the slide window, open the window that goes on the
+ *  second display, and place the caption bar. Independent of the translation
+ *  session. */
 export default function StreamPanel({
   share,
   output,
@@ -68,7 +69,7 @@ export default function StreamPanel({
   return (
     <div className="space-y-4">
       <div className={section}>
-        <div className="text-xs font-bold text-slate-800">1. แชร์หน้าจอสไลด์</div>
+        <div className="text-xs font-bold text-slate-800">1. แชร์สไลด์</div>
         {sharing ? (
           <>
             <Thumbnail stream={share.stream} />
@@ -84,7 +85,7 @@ export default function StreamPanel({
             </div>
             <button type="button" onClick={() => void share.start()} className={`${secondaryButton} w-full`}>
               <MonitorUp className="w-3.5 h-3.5" />
-              <span>เปลี่ยนจอที่แชร์</span>
+              <span>เปลี่ยนสิ่งที่แชร์</span>
             </button>
           </>
         ) : (
@@ -92,15 +93,16 @@ export default function StreamPanel({
             {share.status === 'ended' && (
               <div className={warning}>
                 <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-                <span>แชร์จอหยุดแล้ว — หน้าต่าง Output ยังเปิดอยู่และแสดงพื้นดำกับคำแปล กดแชร์ใหม่เพื่อให้สไลด์กลับมา</span>
+                <span>แชร์สไลด์หยุดแล้ว — หน้าต่าง Output ยังเปิดอยู่และแสดงพื้นดำกับคำแปล กดแชร์ใหม่เพื่อให้สไลด์กลับมา</span>
               </div>
             )}
             <button type="button" onClick={() => void share.start()} className={primaryButton}>
               <MonitorUp className="w-4 h-4" />
-              <span>{share.status === 'ended' ? 'แชร์ใหม่ (เลือกจอที่จะแชร์)' : 'เลือกจอที่จะแชร์'}</span>
+              <span>{share.status === 'ended' ? 'แชร์ใหม่ (เลือกหน้าต่างสไลด์)' : 'เลือกหน้าต่างสไลด์'}</span>
             </button>
             <p className="text-[11px] text-slate-500 leading-relaxed">
-              เลือก <b>ทั้งหน้าจอ</b> ของจอ projector ที่เปิดสไลด์ — อย่าเลือกจอที่มีหน้านี้อยู่ ภาพจะซ้อนกันไม่รู้จบ
+              เลือกแท็บ <b>หน้าต่าง</b> แล้วเลือก <b>หน้าต่าง PowerPoint</b> บนจอโน้ตบุ๊ค — อย่าเลือก "ทั้งหน้าจอ"
+              ของจอที่สอง เพราะจอนั้นกำลังฉายหน้าต่าง Output อยู่ ภาพจะซ้อนกันไม่รู้จบ
             </p>
           </>
         )}
@@ -128,12 +130,21 @@ export default function StreamPanel({
       </div>
 
       <div className={section}>
-        <div className="text-xs font-bold text-slate-800">2. หน้าต่าง Output (ให้ OBS จับ)</div>
+        <div className="text-xs font-bold text-slate-800">2. หน้าต่าง Output (ฉายขึ้นจอที่สอง)</div>
         {output.isOpen ? (
-          <button type="button" onClick={output.close} className={`${secondaryButton} w-full`}>
-            <AppWindow className="w-3.5 h-3.5" />
-            <span>ปิดหน้าต่าง Output</span>
-          </button>
+          <>
+            <button type="button" onClick={output.close} className={`${secondaryButton} w-full`}>
+              <AppWindow className="w-3.5 h-3.5" />
+              <span>ปิดหน้าต่าง Output</span>
+            </button>
+            {/* The fullscreen button itself is inside the Output window —
+                Chrome only grants fullscreen to a click in the window being
+                expanded — so the console can only say where to find it. */}
+            <p className="text-[11px] text-slate-500 leading-relaxed">
+              <b>ลากไปจอที่สอง</b> แล้วกดปุ่ม <Maximize className="w-3 h-3 inline -mt-0.5" /> <b>เต็มจอ</b> ที่มุมขวาบนของหน้าต่างนั้น —
+              ปุ่มจะซ่อนเองเมื่อเมาส์นิ่ง กด Esc เพื่อออกจากเต็มจอ
+            </p>
+          </>
         ) : (
           <button type="button" onClick={() => void output.open()} className={primaryButton}>
             <AppWindow className="w-4 h-4" />
@@ -269,13 +280,12 @@ export default function StreamPanel({
       </div>
 
       <details className="bg-white rounded-xl border border-slate-200 p-3.5 text-[11px] text-slate-600 leading-relaxed">
-        <summary className="text-xs font-bold text-slate-800 cursor-pointer">วิธีตั้งค่า OBS</summary>
+        <summary className="text-xs font-bold text-slate-800 cursor-pointer">วิธีตั้งค่าจอที่สอง</summary>
         <ol className="list-decimal pl-4 mt-2 space-y-1.5">
-          <li>เพิ่ม Source แบบ <b>Window Capture</b> แล้วเลือกหน้าต่าง "Live Translation — Output" (บน Windows เลือก Capture Method เป็น "Windows 10 (1903 and up)")</li>
-          <li>ปิดตัวเลือก <b>Capture Cursor</b> เพื่อไม่ให้เมาส์ขึ้นบน stream</li>
-          <li>ถ้าเป็นหน้าต่าง popup ที่มีแถบ address bar ให้ crop ด้านบนออก (คลิกขวา Source → Transform → Edit Transform)</li>
-          <li><b>ห้าม minimise หน้าต่าง Output</b> — Chrome จะหยุดวาดภาพ และ OBS จะได้ภาพค้าง ย้ายไปไว้มุมจอหรือให้หน้าต่างอื่นอยู่ข้างๆ แทน</li>
-          <li>macOS: ครั้งแรกต้องให้สิทธิ์บันทึกหน้าจอทั้งกับ Chrome/Edge และ OBS ใน System Settings (Privacy &amp; Security) — ทำก่อนวันงาน</li>
+          <li>ตั้งจอที่สองเป็นแบบ <b>extend</b> ไม่ใช่ mirror — ถ้า mirror จอโน้ตบุ๊คจะแสดงหน้าต่าง Output ตามไปด้วย</li>
+          <li>เปิด PowerPoint <b>แบบหน้าต่าง</b> บนจอโน้ตบุ๊ค (ไม่ใช่ slideshow เต็มจอ) เพื่อให้แชร์เป็นหน้าต่างได้และยังเห็นหน้านี้อยู่</li>
+          <li><b>ห้าม minimise หน้าต่าง Output</b> — Chrome จะหยุดวาดภาพ และจอที่สองจะค้าง</li>
+          <li>macOS: ครั้งแรกต้องให้สิทธิ์บันทึกหน้าจอกับ Chrome/Edge ใน System Settings (Privacy &amp; Security) — ทำก่อนวันงาน</li>
           <li>ถ้าเสียงคลิป YouTube ดังผ่านลำโพงห้อง ไมโครโฟนจะได้ยินและแปลด้วย — กด "พัก" session ระหว่างเปิดคลิปถ้าไม่ต้องการ</li>
         </ol>
       </details>
@@ -301,13 +311,13 @@ export function StreamStatusChip({
       {share.status === 'sharing' && (
         <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-          <span>แชร์จอ</span>
+          <span>แชร์สไลด์</span>
         </span>
       )}
       {ended && (
         <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200">
           <AlertTriangle className="w-3 h-3" />
-          <span>แชร์จอหยุด</span>
+          <span>แชร์สไลด์หยุด</span>
         </span>
       )}
       {output.isOpen && (

@@ -1,6 +1,6 @@
 /** Where the caption bar sits on the Output stage, how wide it is, and
  *  whether it is locked — per device, same spirit as micStore: the layout is
- *  tuned to one room's projector and one OBS scene. */
+ *  tuned to one room's projector. */
 
 import { readSetting, writeSetting } from './safeStorage';
 

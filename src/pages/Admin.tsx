@@ -193,7 +193,7 @@ export default function Admin() {
   });
 
   // ── Stream output ─────────────────────────────────────────────────────────
-  // The projector display and the window OBS captures. Both live as long as
+  // The shared slide window and the window that goes on the projector. Both live as long as
   // this console does and are independent of the translation session: set up
   // before the meeting, untouched when a session ends. Signing out unmounts
   // the console, and the hooks' cleanups stop the share and close the window.
@@ -216,7 +216,7 @@ export default function Admin() {
   const [captionHidden, setCaptionHidden] = useState(false);
 
   // Reloading or closing the console takes the Output window with it, and
-  // OBS with it goes to black mid-broadcast. Ask first.
+  // the projector goes to black mid-event. Ask first.
   useEffect(() => {
     if (!output.isOpen) return;
     const warn = (e: BeforeUnloadEvent) => {
@@ -646,8 +646,8 @@ export default function Admin() {
   const micPermissionError = capture.status === 'error';
 
   // The live subtitle box always shows ONE caption at a time — the latest —
-  // like a YouTube subtitle, so an operator can crop just this box in OBS
-  // for streaming.
+  // like a YouTube subtitle: the same single box the audience reads on the
+  // projector.
   const latestCaption = captions.length > 0 ? captions[captions.length - 1] : null;
   // While a sentence is still being spoken the model is already streaming
   // its translation, so the box shows that in-progress text (faded) and
@@ -712,6 +712,8 @@ export default function Admin() {
           prefs={outputPrefs}
           onMove={moveOutputBar}
           captionHidden={captionHidden}
+          isFullscreen={output.isFullscreen}
+          onToggleFullscreen={output.toggleFullscreen}
         />,
         output.container
       )

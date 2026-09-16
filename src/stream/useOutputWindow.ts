@@ -1,53 +1,45 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 /**
- * The window OBS captures.
+ * The window the audience sees, dragged onto the second display and put
+ * full screen there.
  *
  * Opened by the console and rendered into with a React portal, so it shares
- * the console's state instead of syncing a copy of it. Document
- * Picture-in-Picture is preferred because it stays on top and cannot be
- * minimised — and a minimised Chrome window stops painting, which OBS
- * captures as a frozen frame. A popup is the fallback.
+ * the console's state instead of syncing a copy of it. A plain popup, not
+ * Document Picture-in-Picture: Chrome blocks the Fullscreen API inside a PiP
+ * window, and filling the projector is the whole point of this window.
  */
 
-// Whether OBS Window Capture reliably captures a Document PiP window on
-// macOS and Windows — see docs/stream-output-checklist.md for the answer and
-// how it was verified.
-export const PREFER_DOCUMENT_PIP = true;
-export const OUTPUT_WINDOW_SIZE = { width: 960, height: 540 };
+/** Big enough to read while it is still on the console's display. */
+export const OUTPUT_WINDOW_SIZE = { width: 1280, height: 720 };
 
-export type OutputWindowKind = 'pip' | 'popup';
 export type OutputWindowError = 'blocked' | 'failed';
 
 export interface OutputWindow {
   /** Where to portal the stage; null while no window is open. */
   container: HTMLElement | null;
-  kind: OutputWindowKind | null;
   isOpen: boolean;
   error: OutputWindowError | null;
-  /** Must be called from a click handler — both window kinds need a user gesture. */
+  /** Must be called from a click handler — opening a window needs a user gesture. */
   open: () => Promise<void>;
   close: () => void;
+  /** The Output window fills the display it sits on. */
+  isFullscreen: boolean;
+  /**
+   * Must be called from a click handler INSIDE the Output window: the
+   * Fullscreen API wants a user gesture in that window, and a click in the
+   * console does not count.
+   */
+  toggleFullscreen: () => void;
 }
 
-interface DocumentPictureInPictureApi {
-  requestWindow(options?: { width?: number; height?: number }): Promise<Window>;
-}
-
-export async function requestOutputWindow(
-  host: Window,
-  preferPip: boolean
-): Promise<{ win: Window; kind: OutputWindowKind } | null> {
-  const pip = (host as Window & { documentPictureInPicture?: DocumentPictureInPictureApi }).documentPictureInPicture;
-  if (preferPip && pip) {
-    return { win: await pip.requestWindow(OUTPUT_WINDOW_SIZE), kind: 'pip' };
-  }
-  const win = host.open(
+/** null when the browser blocked the popup. */
+export function requestOutputWindow(host: Window): Window | null {
+  return host.open(
     '',
     'live-translation-output',
     `popup,width=${OUTPUT_WINDOW_SIZE.width},height=${OUTPUT_WINDOW_SIZE.height}`
   );
-  return win ? { win, kind: 'popup' } : null;
 }
 
 /**
@@ -72,22 +64,28 @@ export function prepareOutputDocument(source: Document, target: Document): HTMLE
   return root;
 }
 
-export function useOutputWindow(preferPip: boolean = PREFER_DOCUMENT_PIP): OutputWindow {
+export function useOutputWindow(): OutputWindow {
   const [container, setContainer] = useState<HTMLElement | null>(null);
-  const [kind, setKind] = useState<OutputWindowKind | null>(null);
   const [error, setError] = useState<OutputWindowError | null>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const winRef = useRef<Window | null>(null);
-  // Guards the gap between a click and the first await below. Without it, two
-  // clicks before `requestOutputWindow` resolves both go through: on the
-  // popup path they return the same named window, and the second
-  // `prepareOutputDocument` call detaches the node React is portalled into
-  // out from under it.
-  const openingRef = useRef(false);
 
   const forget = useCallback(() => {
     winRef.current = null;
     setContainer(null);
-    setKind(null);
+    setIsFullscreen(false);
+  }, []);
+
+  const toggleFullscreen = useCallback(() => {
+    const win = winRef.current;
+    if (!win || win.closed) return;
+    const doc = win.document;
+    // Fullscreen can be refused (no user gesture left, a permissions policy)
+    // and the rejection is nothing to act on: `isFullscreen` follows the
+    // document's own fullscreenchange event, so a refusal simply leaves the
+    // window as it was and the button still reads "full screen".
+    const done = doc.fullscreenElement ? doc.exitFullscreen?.() : doc.documentElement.requestFullscreen?.();
+    done?.catch(() => undefined);
   }, []);
 
   const close = useCallback(() => {
@@ -102,50 +100,34 @@ export function useOutputWindow(preferPip: boolean = PREFER_DOCUMENT_PIP): Outpu
       existing.focus();
       return;
     }
-    // A second click before the first `await` below resolves must not start
-    // a second request — see the comment on openingRef above.
-    if (openingRef.current) return;
-    openingRef.current = true;
 
+    let opened: Window | null;
     try {
-      let result: Awaited<ReturnType<typeof requestOutputWindow>>;
-      try {
-        result = await requestOutputWindow(window, preferPip);
-      } catch {
-        // Document PiP can reject for reasons a redeploy can't fix on event
-        // day — permissions policy, an enterprise policy, a consumed user
-        // gesture, InvalidStateError. Retrying once as a plain popup turns
-        // most of those into the actionable 'blocked' ("allow popups")
-        // message instead of a dead end.
-        if (!preferPip) {
-          setError('failed');
-          return;
-        }
-        try {
-          result = await requestOutputWindow(window, false);
-        } catch {
-          setError('failed');
-          return;
-        }
-      }
-      if (!result) {
-        setError('blocked');
-        return;
-      }
-
-      const { win } = result;
-      const root = prepareOutputDocument(document, win.document);
-      winRef.current = win;
-      win.addEventListener('pagehide', () => {
-        if (winRef.current === win) forget();
-      });
-      setError(null);
-      setKind(result.kind);
-      setContainer(root);
-    } finally {
-      openingRef.current = false;
+      opened = requestOutputWindow(window);
+    } catch {
+      setError('failed');
+      return;
     }
-  }, [preferPip, forget]);
+    if (!opened) {
+      setError('blocked');
+      return;
+    }
+    const win = opened;
+
+    const root = prepareOutputDocument(document, win.document);
+    winRef.current = win;
+    win.addEventListener('pagehide', () => {
+      if (winRef.current === win) forget();
+    });
+    // Listened for rather than assumed from toggleFullscreen: the viewer can
+    // also leave fullscreen with Esc, and the button must not go on claiming
+    // the window is still filling the display.
+    win.document.addEventListener('fullscreenchange', () => {
+      if (winRef.current === win) setIsFullscreen(Boolean(win.document.fullscreenElement));
+    });
+    setError(null);
+    setContainer(root);
+  }, [forget]);
 
   useEffect(
     () => () => {
@@ -156,5 +138,5 @@ export function useOutputWindow(preferPip: boolean = PREFER_DOCUMENT_PIP): Outpu
     []
   );
 
-  return { container, kind, isOpen: container !== null, error, open, close };
+  return { container, isOpen: container !== null, error, open, close, isFullscreen, toggleFullscreen };
 }

@@ -13,14 +13,15 @@ const share = (over: Partial<ScreenShare> = {}): ScreenShare => ({
   stream: null, status: 'idle', error: null, label: '', start: vi.fn(), stop: vi.fn(), ...over
 });
 const output = (over: Partial<OutputWindow> = {}): OutputWindow => ({
-  container: null, kind: null, isOpen: false, error: null, open: vi.fn(), close: vi.fn(), ...over
+  container: null, isOpen: false, error: null, open: vi.fn(), close: vi.fn(),
+  isFullscreen: false, toggleFullscreen: vi.fn(), ...over
 });
 
 describe('StreamPanel', () => {
   it('starts a share from the picker button', () => {
     const s = share();
     render(<StreamPanel share={s} output={output()} prefs={DEFAULT_OUTPUT_PREFS} onPrefsChange={vi.fn()} />);
-    fireEvent.click(screen.getByRole('button', { name: /เลือกจอที่จะแชร์/ }));
+    fireEvent.click(screen.getByRole('button', { name: /เลือกหน้าต่างสไลด์/ }));
     expect(s.start).toHaveBeenCalled();
   });
 
@@ -34,7 +35,7 @@ describe('StreamPanel', () => {
 
   it('says the share stopped and offers to share again', () => {
     render(<StreamPanel share={share({ status: 'ended' })} output={output()} prefs={DEFAULT_OUTPUT_PREFS} onPrefsChange={vi.fn()} />);
-    expect(screen.getByText(/แชร์จอหยุดแล้ว/)).toBeTruthy();
+    expect(screen.getByText(/แชร์สไลด์หยุดแล้ว/)).toBeTruthy();
     expect(screen.getByRole('button', { name: /แชร์ใหม่/ })).toBeTruthy();
   });
 
@@ -49,10 +50,28 @@ describe('StreamPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: /เปิดหน้าต่าง Output/ }));
     expect(closed.open).toHaveBeenCalled();
 
-    const open = output({ isOpen: true, kind: 'pip' });
+    const open = output({ isOpen: true });
     rerender(<StreamPanel share={share()} output={open} prefs={DEFAULT_OUTPUT_PREFS} onPrefsChange={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: /ปิดหน้าต่าง Output/ }));
     expect(open.close).toHaveBeenCalled();
+  });
+
+  it('asks for the PowerPoint window, not the display the Output window is on', () => {
+    // Sharing the whole second display now means sharing the Output window
+    // that sits on it — the slide inside the slide, forever.
+    render(<StreamPanel share={share()} output={output()} prefs={DEFAULT_OUTPUT_PREFS} onPrefsChange={vi.fn()} />);
+    expect(screen.getByText(/หน้าต่าง PowerPoint/)).toBeTruthy();
+  });
+
+  it('says how to get the Output window onto the second display full screen', () => {
+    render(<StreamPanel share={share()} output={output({ isOpen: true })} prefs={DEFAULT_OUTPUT_PREFS} onPrefsChange={vi.fn()} />);
+    const hint = screen.getByText(/ลากไปจอที่สอง/).closest('p');
+    expect(hint?.textContent).toMatch(/เต็มจอ/);
+  });
+
+  it('carries no OBS instructions: the Output window is the broadcast now', () => {
+    render(<StreamPanel share={share()} output={output()} prefs={DEFAULT_OUTPUT_PREFS} onPrefsChange={vi.fn()} />);
+    expect(screen.queryByText(/OBS/)).toBeNull();
   });
 
   it('tells the operator to allow popups when blocked', () => {
@@ -161,13 +180,13 @@ describe('StreamStatusChip', () => {
 
   it('shows sharing and Output state', () => {
     render(<StreamStatusChip share={share({ status: 'sharing' })} output={output({ isOpen: true })} />);
-    expect(screen.getByText('แชร์จอ')).toBeTruthy();
+    expect(screen.getByText('แชร์สไลด์')).toBeTruthy();
     expect(screen.getByText('Output')).toBeTruthy();
   });
 
   it('flags a share that stopped while Output is still open', () => {
     render(<StreamStatusChip share={share({ status: 'ended' })} output={output({ isOpen: true })} />);
-    expect(screen.getByText('แชร์จอหยุด')).toBeTruthy();
+    expect(screen.getByText('แชร์สไลด์หยุด')).toBeTruthy();
   });
 
   it('warns from every tab while the caption is hidden', () => {

@@ -1,4 +1,5 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState, type PointerEvent } from 'react';
+import { Maximize, Minimize } from 'lucide-react';
 import LiveCaptionBox, { type CaptionView } from '../components/LiveCaptionBox';
 import type { OutputPrefs } from '../storage/outputStore';
 import type { DisplayConfig } from '../types';
@@ -29,7 +30,18 @@ interface OutputStageProps {
    * storage at the start of the next event is a silent failure.
    */
   captionHidden?: boolean;
+  /** The window this stage is in fills its display. */
+  isFullscreen?: boolean;
+  /**
+   * Given only where the window can actually go full screen. The button has
+   * to live HERE rather than in the console because the Fullscreen API wants
+   * the click to happen inside the window being expanded.
+   */
+  onToggleFullscreen?: () => void;
 }
+
+/** How long the mouse rests before the full-screen button leaves the image. */
+const CONTROLS_IDLE_MS = 2000;
 
 interface Drag {
   pointerId: number;
@@ -42,13 +54,23 @@ interface Drag {
 /**
  * The broadcast image: the shared display with the caption bar on top, in a
  * fixed 1920×1080 stage scaled to whatever window holds it. What is drawn
- * here is exactly what OBS captures, so nothing operator-only appears.
+ * here is exactly what the audience sees, so nothing operator-only stays on
+ * screen.
  *
  * Wrapped in React.memo below: it is rebuilt by Admin on every one of its
  * renders, most of which (opening the profile menu, ticking the elapsed
  * clock, and so on) touch none of this component's props.
  */
-function OutputStage({ stream, config, caption, prefs, onMove, captionHidden = false }: OutputStageProps) {
+function OutputStage({
+  stream,
+  config,
+  caption,
+  prefs,
+  onMove,
+  captionHidden = false,
+  isFullscreen = false,
+  onToggleFullscreen
+}: OutputStageProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
@@ -56,6 +78,33 @@ function OutputStage({ stream, config, caption, prefs, onMove, captionHidden = f
   const [scale, setScale] = useState(0);
   const [drag, setDrag] = useState<Drag | null>(null);
   const [barHeightPct, setBarHeightPct] = useState(0);
+  const [controlsVisible, setControlsVisible] = useState(true);
+
+  // Full screen means the window is on the projector, so the button and the
+  // mouse cursor have to get out of the image once the operator stops
+  // moving the mouse. Windowed, the button stays put: it is the only way to
+  // reach full screen, and nobody is looking at the window yet.
+  useEffect(() => {
+    if (!isFullscreen) {
+      setControlsVisible(true);
+      return;
+    }
+    const doc = rootRef.current?.ownerDocument;
+    const view = doc?.defaultView;
+    if (!doc || !view) return;
+    setControlsVisible(true);
+    let timer = view.setTimeout(() => setControlsVisible(false), CONTROLS_IDLE_MS);
+    const wake = () => {
+      setControlsVisible(true);
+      view.clearTimeout(timer);
+      timer = view.setTimeout(() => setControlsVisible(false), CONTROLS_IDLE_MS);
+    };
+    doc.addEventListener('pointermove', wake);
+    return () => {
+      view.clearTimeout(timer);
+      doc.removeEventListener('pointermove', wake);
+    };
+  }, [isFullscreen]);
 
   // Sized by the window the stage is IN — the Output window, not the console.
   useLayoutEffect(() => {
@@ -147,7 +196,25 @@ function OutputStage({ stream, config, caption, prefs, onMove, captionHidden = f
   const barTop = isLetterbox ? letterboxBarBottomPct(slideHeightPct, barHeightPct) : position.y;
 
   return (
-    <div ref={rootRef} className="fixed inset-0 flex items-center justify-center overflow-hidden bg-black">
+    <div
+      ref={rootRef}
+      data-testid="output-root"
+      className="fixed inset-0 flex items-center justify-center overflow-hidden bg-black"
+      style={controlsVisible ? undefined : { cursor: 'none' }}
+    >
+      {/* Unmounted rather than faded out, for the same reason as the caption
+          bar above: nothing operator-only may survive into the image. */}
+      {onToggleFullscreen && controlsVisible && (
+        <button
+          type="button"
+          onClick={onToggleFullscreen}
+          aria-label={isFullscreen ? 'ออกจากเต็มจอ' : 'เต็มจอ'}
+          title={isFullscreen ? 'ออกจากเต็มจอ (Esc)' : 'เต็มจอ'}
+          className="absolute right-4 top-4 z-10 rounded-lg bg-black/60 p-2 text-white/80 backdrop-blur transition-colors hover:bg-black/80 hover:text-white"
+        >
+          {isFullscreen ? <Minimize className="h-5 w-5" /> : <Maximize className="h-5 w-5" />}
+        </button>
+      )}
       <div
         ref={stageRef}
         data-testid="output-stage"

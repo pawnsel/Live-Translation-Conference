@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import OutputStage from './OutputStage';
 import type { CaptionView } from '../components/LiveCaptionBox';
@@ -193,6 +193,93 @@ describe('OutputStage', () => {
       const bar = screen.getByTestId('output-caption-bar');
       expect(bar.style.left).toBe('40%');
       expect(bar.style.top).toBe('90%');
+    });
+  });
+
+  describe('full-screen control', () => {
+    const renderWithControl = (over: { isFullscreen?: boolean; onToggleFullscreen?: () => void } = {}) => {
+      const onToggleFullscreen = over.onToggleFullscreen ?? vi.fn();
+      render(
+        <OutputStage
+          stream={null}
+          config={{ fontSize: 'large', captionTheme: 'translucent', showLatency: true }}
+          caption={caption}
+          prefs={DEFAULT_OUTPUT_PREFS}
+          onMove={vi.fn()}
+          isFullscreen={over.isFullscreen ?? false}
+          onToggleFullscreen={onToggleFullscreen}
+        />
+      );
+      return { onToggleFullscreen };
+    };
+
+    it('asks the window it lives in to go full screen', () => {
+      const { onToggleFullscreen } = renderWithControl();
+      fireEvent.click(screen.getByRole('button', { name: 'เต็มจอ' }));
+      expect(onToggleFullscreen).toHaveBeenCalledTimes(1);
+    });
+
+    it('offers the way back out once the window fills the display', () => {
+      renderWithControl({ isFullscreen: true });
+      expect(screen.getByRole('button', { name: 'ออกจากเต็มจอ' })).toBeTruthy();
+    });
+
+    it('stays put while the window is not full screen, so the operator can find it', () => {
+      vi.useFakeTimers();
+      try {
+        renderWithControl();
+        act(() => vi.advanceTimersByTime(10_000));
+        expect(screen.queryByRole('button', { name: 'เต็มจอ' })).toBeTruthy();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // Full screen means the window is on the projector: an operator-only
+    // button parked in the corner is a button the audience is looking at.
+    it('takes itself and the mouse cursor off the projector once the mouse settles', () => {
+      vi.useFakeTimers();
+      try {
+        renderWithControl({ isFullscreen: true });
+        expect(screen.queryByRole('button', { name: 'ออกจากเต็มจอ' })).toBeTruthy();
+
+        act(() => vi.advanceTimersByTime(2000));
+
+        expect(screen.queryByRole('button', { name: 'ออกจากเต็มจอ' })).toBeNull();
+        expect(screen.getByTestId('output-root').style.cursor).toBe('none');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('comes back when the mouse moves over the window again', () => {
+      vi.useFakeTimers();
+      try {
+        renderWithControl({ isFullscreen: true });
+        act(() => vi.advanceTimersByTime(2000));
+
+        act(() => {
+          fireEvent.pointerMove(document, { clientX: 10, clientY: 10 });
+        });
+
+        expect(screen.queryByRole('button', { name: 'ออกจากเต็มจอ' })).toBeTruthy();
+        expect(screen.getByTestId('output-root').style.cursor).not.toBe('none');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('draws no control at all where the window cannot go full screen', () => {
+      render(
+        <OutputStage
+          stream={null}
+          config={{ fontSize: 'large', captionTheme: 'translucent', showLatency: true }}
+          caption={caption}
+          prefs={DEFAULT_OUTPUT_PREFS}
+          onMove={vi.fn()}
+        />
+      );
+      expect(screen.queryByRole('button')).toBeNull();
     });
   });
 });

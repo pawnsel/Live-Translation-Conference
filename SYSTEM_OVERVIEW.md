@@ -88,11 +88,11 @@
 | `supabase/schema.sql` | ตาราง `access_requests` + RLS (อนุมัติได้จาก dashboard เท่านั้น) |
 | `supabase/schema-projects.sql` | ตาราง projects/project_sessions/transcript_items + glossary lists/terms + RLS ที่ผูกกับ `owner_id = auth.uid()` |
 | `src/components/LiveCaptionBox.tsx` | กล่องคำแปลสด ใช้ร่วมกันระหว่าง console และหน้าต่าง Output (`captionStyle.ts` = สี/ขนาด, `useCaptionStackAnimation.ts` = animation) |
-| `src/stream/useScreenShare.ts` | แชร์หน้าจอ projector + สถานะ + แยกกรณี macOS ไม่ให้สิทธิ์ |
-| `src/stream/useOutputWindow.ts` | เปิด/ปิดหน้าต่าง Output (Document PiP หรือ popup) และคัดลอก stylesheet |
+| `src/stream/useScreenShare.ts` | แชร์หน้าต่างสไลด์ + สถานะ + แยกกรณี macOS ไม่ให้สิทธิ์ |
+| `src/stream/useOutputWindow.ts` | เปิด/ปิดหน้าต่าง Output (popup) สั่งเต็มจอ และคัดลอก stylesheet |
 | `src/stream/OutputStage.tsx` | ภาพที่ถ่ายทอด 1920×1080: สไลด์ + แถบคำแปลที่ลากได้ |
 | `src/stream/outputLayout.ts` | คณิตศาสตร์ของ stage (scale, clamp, drag, snap) — pure ทั้งไฟล์ |
-| `src/stream/StreamPanel.tsx` | แท็บสตรีม, ป้ายสถานะบน header, คู่มือตั้งค่า OBS |
+| `src/stream/StreamPanel.tsx` | แท็บสตรีม, ป้ายสถานะบน header, คู่มือตั้งค่าจอที่สอง |
 | `src/storage/outputStore.ts` | ตำแหน่ง/ความกว้าง/ล็อกของแถบคำแปล ต่อเครื่อง |
 
 รายละเอียดการติดตั้งฝั่ง Supabase อยู่ใน `docs/supabase-auth-setup.md`
@@ -117,22 +117,28 @@
 
 ## 2. ฟังก์ชันหลักของระบบ (Core System Features)
 
-### 2.1 กล่อง Subtitle เดียว และหน้าต่าง Output สำหรับ OBS
+### 2.1 กล่อง Subtitle เดียว และหน้าต่าง Output สำหรับจอที่สอง
 พื้นที่แสดงคำแปลหลักเป็น **กล่องเดียว** แสดงทีละข้อความ (เหมือน subtitle บน
 YouTube) วาดโดย `src/components/LiveCaptionBox.tsx` ประวัติทั้งหมดอยู่ใน panel
 พับเก็บด้านล่าง
 
-แท็บ **สตรีม** ในแถบข้างใช้ถ่ายทอดสด โดย OBS จับหน้าต่างเดียว:
+แท็บ **สตรีม** ในแถบข้างใช้ถ่ายทอดสด: หน้าต่าง Output หน้าเดียวไปเต็มจออยู่บน
+จอที่สอง (projector) ส่วน console กับสไลด์อยู่บนจอโน้ตบุ๊ค
 
-1. **แชร์หน้าจอ** (`src/stream/useScreenShare.ts`) — เลือกจอ projector ที่เปิดสไลด์
-   หรือคลิป YouTube ภาพเปลี่ยนตามจอจริง สลับสไลด์หรือเปิดคลิปได้โดยไม่ต้องแชร์ใหม่
-2. **หน้าต่าง Output** (`src/stream/useOutputWindow.ts`) — Document
-   Picture-in-Picture (อยู่บนสุดเสมอ ย่อไม่ได้) หรือ popup ถ้าเบราว์เซอร์ไม่รองรับ
-   console วาดลงหน้าต่างนี้ด้วย React portal จึงใช้ state ชุดเดียวกัน ไม่มีการ sync
-   และไม่แตะเซิร์ฟเวอร์
+1. **แชร์สไลด์** (`src/stream/useScreenShare.ts`) — เลือก **หน้าต่าง** PowerPoint
+   (หรือคลิป YouTube) บนจอโน้ตบุ๊ค สลับสไลด์หรือเปิดคลิปได้โดยไม่ต้องแชร์ใหม่
+   ห้ามเลือก "ทั้งหน้าจอ" ของจอที่สอง เพราะจอนั้นกำลังฉายหน้าต่าง Output อยู่
+   ภาพจะซ้อนกันไม่รู้จบ
+2. **หน้าต่าง Output** (`src/stream/useOutputWindow.ts`) — popup ที่ operator
+   ลากไปจอที่สองแล้วกดปุ่มเต็มจอที่มุมขวาบนของหน้าต่างนั้นเอง (Chrome ให้สิทธิ์
+   fullscreen เฉพาะคลิกที่เกิดในหน้าต่างที่จะขยาย จึงสั่งจาก console ไม่ได้ และ
+   ด้วยเหตุผลเดียวกันจึงใช้ popup ไม่ใช่ Document Picture-in-Picture ที่ Chrome
+   บล็อก Fullscreen API ไว้) console วาดลงหน้าต่างนี้ด้วย React portal จึงใช้
+   state ชุดเดียวกัน ไม่มีการ sync และไม่แตะเซิร์ฟเวอร์
 3. **Stage 1920×1080** (`src/stream/OutputStage.tsx`) — สไลด์ + แถบคำแปล
    ที่หน้าตาตรงกับกล่องใน console ทุกอย่าง (ขนาดตัวอักษร ธีม แสดงต้นฉบับ) แต่ไม่มี
-   ป้าย latency และข้อความ "กำลังแปล…" ปรับความกว้างแถบได้จากแท็บสตรีม
+   ป้าย latency และข้อความ "กำลังแปล…" ปุ่มเต็มจอกับเมาส์เคอร์เซอร์ซ่อนตัวเองเมื่อ
+   เมาส์นิ่ง 2 วินาทีในโหมดเต็มจอ ผู้ชมจึงไม่เห็น ปรับความกว้างแถบได้จากแท็บสตรีม
    ค่าเก็บต่อเครื่อง (`src/storage/outputStore.ts`) มีสองรูปแบบการวาง:
    - **ทับบนสไลด์** (ค่าเริ่มต้น) — สไลด์เต็มพื้นที่ คำแปลซ้อนอยู่ด้านบน ลากย้าย
      ตำแหน่งได้ในหน้าต่าง Output และล็อกตำแหน่งได้จากแท็บสตรีม (ปุ่มล็อกมีเฉพาะ
