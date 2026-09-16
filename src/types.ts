@@ -23,8 +23,10 @@ export interface DisplayConfig {
   showPrevious?: boolean;
   showLatency?: boolean;
   /** Color scheme of the live caption box. 'light' (black text on white) is
-   *  the default; 'dark' is white text on black, for a darker room/stage. */
-  captionTheme?: 'light' | 'dark';
+   *  the default; 'dark' is white text on black, for a darker room/stage;
+   *  'translucent' is white text on 70% black, so a slide shows through the
+   *  caption bar on a stream. */
+  captionTheme?: 'light' | 'dark' | 'translucent';
 }
 
 export interface ProjectSession {

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import {
   Mic,
   MicOff,
@@ -6,7 +6,6 @@ import {
   BookOpen,
   Download,
   Trash2,
-  Sparkles,
   Zap,
   Menu,
   ShieldAlert,
@@ -20,8 +19,10 @@ import {
   ChevronLeft,
   ChevronRight,
   User,
-  LogOut
+  LogOut,
+  MonitorUp
 } from 'lucide-react';
+import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth/AuthProvider';
 import { getAccessToken } from '../lib/supabase';
@@ -36,6 +37,7 @@ import {
   SessionSummaryModal
 } from '../components/ProjectPanel';
 import DictionaryManager from '../components/DictionaryManager';
+import AppLogo from '../components/AppLogo';
 import { captionsReducer, initialCaptionState, selectCaptions, type Caption } from '../asr/captions';
 import { groupCaptionsIntoParagraphs } from '../asr/historyParagraphs';
 import { activeUtteranceSeq, buildCaptionRows } from '../asr/captionStack';
@@ -47,12 +49,18 @@ import { loadSidebarCollapsed, saveSidebarCollapsed } from '../storage/sidebarSt
 import { autoStopReason, IDLE_STOP_MS, type AutoStopReason } from '../asr/audio/sessionLimits';
 import { SESSION_HEARTBEAT_MS } from '../data/staleSessions';
 import { forgetTabSession, loadTabSession, rememberTabSession } from '../storage/tabSession';
-import SubtitleText from '../components/SubtitleText';
+import LiveCaptionBox, { type CaptionView } from '../components/LiveCaptionBox';
 import { useProjects } from '../hooks/useProjects';
 import { useLiveProjectCost } from '../hooks/useLiveProjectCost';
 import { emptyGlossary, type GlossarySection, type GlossarySections } from '../glossary';
 import { useGlossary } from '../hooks/useGlossary';
 import type { DisplayConfig, Project, ProjectSession, TranscriptItem } from '../types';
+import OutputStage from '../stream/OutputStage';
+import StreamPanel, { StreamStatusChip } from '../stream/StreamPanel';
+import { useScreenShare } from '../stream/useScreenShare';
+import { useOutputWindow } from '../stream/useOutputWindow';
+import type { BarPosition } from '../stream/outputLayout';
+import { loadOutputPrefs, saveOutputPrefs, type OutputPrefs } from '../storage/outputStore';
 
 // Bounded wait for a summary before giving up and showing the "AI summary
 // failed" state. A two-hour transcript is summarised chunk by chunk on the
@@ -95,22 +103,6 @@ function textSizeClass(size: DisplayConfig['fontSize']): string {
     case 'large':
     default:
       return 'text-lg sm:text-xl';
-  }
-}
-
-// The live subtitle box is the thing an operator will OBS-crop for
-// streaming, so it reads a size tier larger than the history list.
-function boxTextSizeClass(size: DisplayConfig['fontSize']): string {
-  switch (size) {
-    case 'small':
-      return 'text-xl sm:text-2xl';
-    case 'medium':
-      return 'text-2xl sm:text-3xl';
-    case 'xlarge':
-      return 'text-4xl sm:text-5xl';
-    case 'large':
-    default:
-      return 'text-3xl sm:text-4xl';
   }
 }
 
@@ -199,7 +191,43 @@ export default function Admin() {
     showLatency: false,
     captionTheme: 'light'
   });
-  const [activeTab, setActiveTab] = useState<'languages' | 'dictionary'>('languages');
+
+  // ── Stream output ─────────────────────────────────────────────────────────
+  // The projector display and the window OBS captures. Both live as long as
+  // this console does and are independent of the translation session: set up
+  // before the meeting, untouched when a session ends. Signing out unmounts
+  // the console, and the hooks' cleanups stop the share and close the window.
+  const share = useScreenShare();
+  const output = useOutputWindow();
+  const [outputPrefs, setOutputPrefs] = useState<OutputPrefs>(() => loadOutputPrefs());
+  const updateOutputPrefs = useCallback((next: OutputPrefs) => {
+    setOutputPrefs(next);
+    saveOutputPrefs(next);
+  }, []);
+  const moveOutputBar = useCallback(
+    (position: BarPosition) => updateOutputPrefs({ ...outputPrefs, ...position }),
+    [outputPrefs, updateOutputPrefs]
+  );
+  // Takes the caption bar off the broadcast image for the minute somebody is
+  // photographing the stage. Kept out of outputPrefs on purpose: it is not a
+  // setting for the room, it is a state for the next thirty seconds, and one
+  // restored from storage at the start of the next event would mean a session
+  // that silently shows no subtitles.
+  const [captionHidden, setCaptionHidden] = useState(false);
+
+  // Reloading or closing the console takes the Output window with it, and
+  // OBS with it goes to black mid-broadcast. Ask first.
+  useEffect(() => {
+    if (!output.isOpen) return;
+    const warn = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [output.isOpen]);
+
+  const [activeTab, setActiveTab] = useState<'languages' | 'dictionary' | 'stream'>('languages');
   const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => loadSidebarCollapsed());
   const toggleSidebarCollapsed = () => {
@@ -231,9 +259,15 @@ export default function Admin() {
 
   const handleSignOut = useCallback(async () => {
     setProfileOpen(false);
+    // Explicit half of stream teardown on sign-out — the hooks' own unmount
+    // cleanups are the leak safety net, but a deliberate sign-out should stop
+    // the share and close the Output window right away rather than only when
+    // the unmount effects happen to run.
+    share.stop();
+    output.close();
     await signOut();
     navigate('/login', { replace: true });
-  }, [signOut, navigate]);
+  }, [signOut, navigate, share.stop, output.close]);
 
   // Captions have no "delete" concept anymore (there is no server to delete
   // them from) — "delete" stays a local-only hide so an operator can tidy
@@ -387,6 +421,13 @@ export default function Admin() {
     // finishing a project prices what the database holds.
     await projects.flushCaptions();
     await projects.detachAsrSession();
+    // Wipe the live buffer only once it is safely on the record, so the
+    // screen the operator is left with matches the session state: no stale
+    // last sentence frozen on the subtitle line or in the Output window, and
+    // no transcript of a meeting that has already ended. The session's words
+    // are not lost — they are read back from the session history on demand.
+    dispatchCaption({ kind: 'reset' });
+    setHiddenSeqs(new Set());
     return sessionCaptions;
   };
 
@@ -511,8 +552,7 @@ export default function Admin() {
     const lastAsrSessionId = sessionId;
     const captionsForProject = await stopSessionAndMic();
     const finished = await projects.finishProject(captionsForProject, lastAsrSessionId);
-    dispatchCaption({ kind: 'reset' });
-    setHiddenSeqs(new Set());
+    // No reset needed here — stopSessionAndMic already cleared the buffer.
     if (finished) setFinishedProject(finished);
   };
 
@@ -615,7 +655,6 @@ export default function Admin() {
   const hasPartial = !!(capture.partialSource || capture.partialTarget);
   const boxSourceText = capture.partialSource || latestCaption?.sourceText || '';
   const boxTargetText = capture.partialTarget || latestCaption?.targetText || '';
-  const isDarkCaption = config.captionTheme === 'dark';
 
   // ── Rolling caption stack ────────────────────────────────────────────────
   // Song-lyric behaviour: one row per utterance with the sentence being
@@ -647,96 +686,36 @@ export default function Admin() {
     [captions, activeSeq, hasPartial, capture.partialTarget]
   );
 
-  // The slide is measured, not predicted. Each row is keyed by its utterance,
-  // so React MOVES the same node up the stack, and the animation is simply
-  // "you were there, you are here now, cover the difference". Nothing about
-  // the caption pipeline can talk it into a shift that did not happen, or out
-  // of one that did — which is what every earlier attempt at this got wrong.
-  const rowNodesRef = useRef(new Map<string, HTMLDivElement>());
-  const rowTopsRef = useRef(new Map<string, number>());
-  // The animation currently playing for each row, if any — so a shift that
-  // lands before the previous one finishes can be handled deliberately
-  // instead of by accident.
-  const rowAnimsRef = useRef(new Map<string, Animation>());
-  const [captionDebug] = useState(() => {
-    try {
-      return window.localStorage.getItem('captionStackDebug') === '1';
-    } catch {
-      return false;
-    }
-  });
+  // One description of the live box, handed to every copy of it — the
+  // console's and the Output window's — so they can never disagree.
+  const captionView = useMemo<CaptionView>(
+    () => ({
+      sourceText: boxSourceText,
+      targetText: boxTargetText,
+      hasPartial,
+      rows: captionRows,
+      latencyMs: latestCaption?.latencyMs ?? null,
+      isIdle: !latestCaption && !hasPartial
+    }),
+    [boxSourceText, boxTargetText, hasPartial, captionRows, latestCaption]
+  );
 
-  // The translateY a row is rendering RIGHT NOW, mid-animation or not.
-  // getComputedStyle reports the live interpolated value regardless of how
-  // many keyframes are involved, so this is the one place both 2D and 3D
-  // transform matrices need reading (a translate3d keyframe on some engines
-  // computes to matrix3d instead of matrix).
-  const currentTranslateY = (node: HTMLElement): number => {
-    try {
-      const transform = getComputedStyle(node).transform;
-      if (!transform || transform === 'none' || typeof DOMMatrixReadOnly === 'undefined') return 0;
-      return new DOMMatrixReadOnly(transform).m42;
-    } catch {
-      return 0;
-    }
-  };
-
-  useLayoutEffect(() => {
-    const previousTops = rowTopsRef.current;
-    const nextTops = new Map<string, number>();
-    rowNodesRef.current.forEach((node, key) => nextTops.set(key, node.offsetTop));
-    rowTopsRef.current = nextTops;
-    if (previousTops.size === 0) return; // first paint: the stack arrived, it did not move
-
-    const moves: string[] = [];
-    nextTops.forEach((top, key) => {
-      const node = rowNodesRef.current.get(key);
-      if (!node || typeof node.animate !== 'function') return;
-      // A row that was already on screen slides from where it was; a row that
-      // is new to the stack rides in from just under the bottom edge.
-      const from = previousTops.get(key) ?? top + node.offsetHeight;
-      let delta = from - top;
-
-      // Rapid, back-to-back sentences close faster than one 220ms slide can
-      // finish, so the next shift for this row lands while its animation from
-      // the PREVIOUS shift is still running. `node.animate()` again here
-      // would start a second animation on the same property — WAAPI has the
-      // newer one replace the older wholesale, so the row would cut straight
-      // from wherever it visually was to this shift's theoretical start point,
-      // an instant jump that reads as a skip. Reading the live transform
-      // before cancelling makes the new animation continue from exactly where
-      // the eye last saw the row, no matter how many shifts have piled up.
-      const running = rowAnimsRef.current.get(key);
-      if (running?.playState === 'running') {
-        delta = currentTranslateY(node);
-        running.cancel();
-      }
-      if (delta === 0) return;
-
-      moves.push(`${key}: ${from}→${top}`);
-      const anim = node.animate(
-        [{ transform: `translateY(${delta}px)` }, { transform: 'translateY(0)' }],
-        { duration: 220, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' }
-      );
-      rowAnimsRef.current.set(key, anim);
-      anim.addEventListener('finish', () => {
-        if (rowAnimsRef.current.get(key) === anim) rowAnimsRef.current.delete(key);
-      });
-    });
-
-    // Switched on with `localStorage.captionStackDebug = '1'` (then reload).
-    // The stack has now been rebuilt several times off reports of it "not
-    // sliding sometimes", and guessing has cost more than measuring would
-    // have: this prints what the rows actually were, and what actually moved.
-    if (captionDebug) {
-      // eslint-disable-next-line no-console
-      console.debug(
-        '[caption-stack]',
-        captionRows.map((row) => `${row.key}:${JSON.stringify(row.text.slice(0, 24))}`).join(' | '),
-        moves.length > 0 ? `moved ${moves.join(', ')}` : 'no movement'
-      );
-    }
-  }, [captionRows, captionDebug]);
+  // The broadcast image, drawn into the Output window. Rendered from every
+  // screen below — including the project picker — so switching projects
+  // mid-event does not blank the stream.
+  const outputPortal = output.container
+    ? createPortal(
+        <OutputStage
+          stream={share.stream}
+          config={config}
+          caption={captionView}
+          prefs={outputPrefs}
+          onMove={moveOutputBar}
+          captionHidden={captionHidden}
+        />,
+        output.container
+      )
+    : null;
 
   // Read live off the project record so the popup fills itself in the moment
   // the summary lands, rather than holding a stale copy of the session.
@@ -744,9 +723,12 @@ export default function Admin() {
 
   if (projects.loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-500 text-sm">
-        กำลังโหลดโปรเจกต์…
-      </div>
+      <>
+        {outputPortal}
+        <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-500 text-sm">
+          กำลังโหลดโปรเจกต์…
+        </div>
+      </>
     );
   }
 
@@ -754,6 +736,7 @@ export default function Admin() {
   if (!projects.currentProject) {
     return (
       <>
+        {outputPortal}
         <ProjectPicker
           activeProjects={projects.activeProjects}
           canCreateProject={projects.canCreateProject}
@@ -768,7 +751,9 @@ export default function Admin() {
   }
 
   return (
-    <div className="flex flex-col h-screen w-full bg-slate-100 text-slate-800 font-sans overflow-hidden">
+    <>
+      {outputPortal}
+      <div className="flex flex-col h-screen w-full bg-slate-100 text-slate-800 font-sans overflow-hidden">
       {showHistory && <HistoryPanel projects={projects.endedProjects} onClose={() => setShowHistory(false)} />}
       {finishedProject && <BillModal project={finishedProject} onClose={() => setFinishedProject(null)} />}
       {showSessionHistory && (
@@ -806,9 +791,7 @@ export default function Admin() {
           </button>
 
           <div className="flex items-center gap-2.5">
-            <div className="w-8.5 h-8.5 rounded-lg bg-[#DE5C8E] flex items-center justify-center text-white shadow-xs">
-              <Sparkles className="w-4.5 h-4.5" />
-            </div>
+            <AppLogo className="w-8 h-8 shrink-0" />
             <div className="flex flex-col">
               <span className="font-bold text-sm text-slate-900 tracking-tight leading-none">Live Translation</span>
             </div>
@@ -831,6 +814,7 @@ export default function Admin() {
               <ClipboardList className="w-4 h-4" />
             </button>
             <LiveCostBadge cost={liveCost} isRecording={isSessionActive} />
+            <StreamStatusChip share={share} output={output} captionHidden={captionHidden} />
           </div>
         </div>
 
@@ -926,7 +910,7 @@ export default function Admin() {
               lg:w-0, so the panel is clipped away rather than reflowing its
               controls into an ever-narrower column on the way out. */}
           <div className="flex-1 flex flex-col min-h-0 lg:w-96">
-            <div className="grid grid-cols-2 p-1.5 bg-slate-50 border-b border-slate-200 text-xs gap-1 shrink-0">
+            <div className="grid grid-cols-3 p-1.5 bg-slate-50 border-b border-slate-200 text-xs gap-1 shrink-0">
               <button
                 onClick={() => setActiveTab('languages')}
                 className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all ${
@@ -944,6 +928,15 @@ export default function Admin() {
               >
                 <BookOpen className="w-4 h-4" />
                 <span className="whitespace-nowrap">พจนานุกรม</span>
+              </button>
+              <button
+                onClick={() => setActiveTab('stream')}
+                className={`py-2 px-1 rounded-lg font-semibold flex items-center justify-center gap-1.5 transition-all ${
+                  activeTab === 'stream' ? 'bg-white text-[#DE5C8E] shadow-xs' : 'text-slate-500 hover:text-slate-800'
+                }`}
+              >
+                <MonitorUp className="w-4 h-4" />
+                <span className="whitespace-nowrap">สตรีม</span>
               </button>
             </div>
 
@@ -968,7 +961,7 @@ export default function Admin() {
                     </div>
 
                     <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">ภาษาที่แปลเป็น (Target — อัตโนมัติ)</label>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">ภาษาที่แปลเป็น (Target Language)</label>
                       <select
                         value={targetLang}
                         onChange={(e) => setLanguage(other(e.target.value) as 'th' | 'en')}
@@ -996,7 +989,7 @@ export default function Admin() {
 
                   <div>
                     <label className="block text-xs font-bold text-slate-700 mb-1.5">ธีมคำบรรยาย (Caption Theme)</label>
-                    <div className="grid grid-cols-2 gap-1.5">
+                    <div className="grid grid-cols-3 gap-1.5">
                       <button
                         type="button"
                         onClick={() => setConfig((c) => ({ ...c, captionTheme: 'light' }))}
@@ -1020,6 +1013,18 @@ export default function Admin() {
                       >
                         <span className="w-3.5 h-3.5 rounded-full bg-black text-white flex items-center justify-center text-[8px] font-black">A</span>
                         <span>ตัวขาวพื้นดำ</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfig((c) => ({ ...c, captionTheme: 'translucent' }))}
+                        className={`flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all ${
+                          config.captionTheme === 'translucent'
+                            ? 'border-[#DE5C8E] ring-2 ring-pink-100 bg-white text-slate-800'
+                            : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-white'
+                        }`}
+                      >
+                        <span className="w-3.5 h-3.5 rounded-full bg-black/70 text-white flex items-center justify-center text-[8px] font-black">A</span>
+                        <span>โปร่งแสง</span>
                       </button>
                     </div>
                   </div>
@@ -1105,6 +1110,17 @@ export default function Admin() {
                   isOwnTerm={glossaryState.isOwnTerm}
                 />
               )}
+
+              {activeTab === 'stream' && (
+                <StreamPanel
+                  share={share}
+                  output={output}
+                  prefs={outputPrefs}
+                  onPrefsChange={updateOutputPrefs}
+                  captionHidden={captionHidden}
+                  onCaptionHiddenChange={setCaptionHidden}
+                />
+              )}
             </div>
 
             <div className="p-3 border-t border-slate-200 lg:hidden">
@@ -1187,142 +1203,10 @@ export default function Admin() {
           )}
 
           {/* ─────────────────────────────────────────────────────────────
-              LIVE SUBTITLE — pinned to the top edge. Two-line mode pages the
-              way broadcast subtitles do: a caption that outgrows the block
-              restarts from the word that no longer fitted. Rolling mode
-              instead keeps one line per sentence, newest on the bottom line
-              and older ones fading upwards out of the block. Either way
-              the box holds ONE fixed height for a given display setting:
-              nothing that happens while someone speaks may resize it.
+              LIVE SUBTITLE — pinned to the top edge (components/LiveCaptionBox).
           ────────────────────────────────────────────────────────────── */}
           <div className="shrink-0 px-3 pt-3 sm:px-6 sm:pt-4">
-            <div
-              className={`relative w-full rounded-2xl border shadow-sm px-6 py-6 sm:px-10 sm:py-[28.8px] text-left overflow-hidden transition-colors ${
-                isDarkCaption ? 'bg-black border-slate-700' : 'bg-white border-slate-200'
-              }`}
-            >
-              {/* Every slot below is ALWAYS mounted and every one of them is
-                  locked to its own line count, so the box is exactly as tall
-                  as the display settings demand and not one pixel more. The
-                  idle hint, which used to replace the content, now sits on
-                  top of it instead, because a box that resized under a
-                  speaker would shove the whole page around mid-sentence. */}
-              {config.showOriginal && (
-                <SubtitleText
-                  text={boxSourceText}
-                  maxLines={1}
-                  className={`text-base sm:text-lg mb-2 ${
-                    isDarkCaption
-                      ? hasPartial ? 'text-slate-600' : 'text-slate-400'
-                      : hasPartial ? 'text-slate-300' : 'text-slate-400'
-                  }`}
-                />
-              )}
-              {config.showPrevious ? (
-                <div className="relative overflow-hidden">
-                  {/* Keyed by utterance, so a line that climbs is the SAME
-                      node in a new place — which is what lets the animation
-                      measure the move instead of guessing it. The fade belongs
-                      to the slot, not to the sentence: a line dims by
-                      climbing, the way a lyric does, and the transition makes
-                      that dimming travel with the slide. */}
-                  {captionRows.map((row, index) => {
-                    const isLive = index === CAPTION_ROWS - 1;
-                    return (
-                      <div
-                        key={row.key}
-                        ref={(node) => {
-                          const nodes = rowNodesRef.current;
-                          if (node) {
-                            nodes.set(row.key, node);
-                          } else {
-                            nodes.delete(row.key);
-                            // The row is gone for good once it falls off the
-                            // top of the stack — nothing will ever animate it
-                            // again, so its Animation handle would otherwise
-                            // just sit in the map for the rest of the session.
-                            rowAnimsRef.current.get(row.key)?.cancel();
-                            rowAnimsRef.current.delete(row.key);
-                          }
-                        }}
-                        // One line tall, in CSS, from the very first paint:
-                        // leading-snug is a 1.375 line-height, so 1.375em of
-                        // this element's own font size IS one line. Letting
-                        // the row measure its own height instead (the way the
-                        // paged caption does) leaves it briefly the wrong size
-                        // while that measurement lands — and a stack whose
-                        // geometry moves under the animation is a slide that
-                        // sometimes plays and sometimes does not.
-                        className={`${boxTextSizeClass(config.fontSize)} leading-snug overflow-hidden`}
-                        style={{
-                          height: '1.375em',
-                          opacity: 1 - (CAPTION_ROWS - 1 - index) * 0.35,
-                          transition: 'opacity 220ms ease-out'
-                        }}
-                      >
-                        <SubtitleText
-                          text={isLive ? row.text || 'กำลังแปล…' : row.text}
-                          maxLines={1}
-                          reserveLines={false}
-                          // The live line follows the speaker (newest words
-                          // win); a finished one is read from its start.
-                          overflow={isLive ? 'page' : 'clip'}
-                          className={`${boxTextSizeClass(config.fontSize)} leading-snug tracking-tight ${
-                            isLive && !row.text
-                              ? `font-normal ${isDarkCaption ? 'text-slate-600' : 'text-slate-300'}`
-                              : `font-bold ${isDarkCaption ? 'text-white' : 'text-black'}`
-                          }`}
-                        />
-                      </div>
-                    );
-                  })}
-                </div>
-              ) : (
-                <SubtitleText
-                  text={boxTargetText || 'กำลังแปล…'}
-                  maxLines={2}
-                  className={`${boxTextSizeClass(config.fontSize)} leading-snug tracking-tight ${
-                    boxTargetText
-                      ? `font-bold ${isDarkCaption ? 'text-white' : 'text-black'}`
-                      : `font-normal ${isDarkCaption ? 'text-slate-600' : 'text-slate-300'}`
-                  }`}
-                />
-              )}
-              {/* The last MEASURED latency, kept on screen. Blanking it for
-                  the whole of the next sentence (the old `!hasPartial` rule)
-                  left it visible only in the gap between utterances — which
-                  in continuous speech is never, so it read as broken. */}
-              {config.showLatency && (
-                <span
-                  className={`mt-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-mono text-[10px] border ${
-                    latestCaption?.latencyMs ? '' : 'invisible'
-                  } ${
-                    isDarkCaption
-                      ? 'bg-white/5 text-slate-400 border-slate-700'
-                      : 'bg-slate-100 text-slate-500 border-slate-200'
-                  }`}
-                >
-                  <Zap className="w-3 h-3 text-amber-500" />
-                  <span>{latestCaption?.latencyMs ?? 0}ms</span>
-                </span>
-              )}
-
-              {!latestCaption && !hasPartial && (
-                <div
-                  className={`absolute inset-0 rounded-2xl flex flex-col items-center justify-center text-center px-6 ${
-                    isDarkCaption ? 'bg-black text-slate-500' : 'bg-white text-slate-400'
-                  }`}
-                >
-                  <div className={`font-bold text-sm ${isDarkCaption ? 'text-slate-300' : 'text-slate-700'}`}>
-                    พร้อมรับเสียงจากไมโครโฟน
-                  </div>
-                  <p className="text-xs leading-relaxed mt-1">
-                    กดปุ่มไมโครโฟนวงกลมกลางจอ จากนั้นพูดใส่ไมโครโฟนเพื่อทำการแปลภาษาแบบเรียลไทม์
-                  </p>
-                </div>
-              )}
-
-            </div>
+            <LiveCaptionBox config={config} view={captionView} variant="console" />
           </div>
 
           {/* ─────────────────────────────────────────────────────────────
@@ -1538,5 +1422,6 @@ export default function Admin() {
         </main>
       </div>
     </div>
+    </>
   );
 }

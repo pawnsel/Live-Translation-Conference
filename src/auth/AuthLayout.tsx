@@ -2,7 +2,8 @@
  *  brand panel on the left (hidden on small screens), form card on the right. */
 
 import type { ReactNode } from 'react';
-import { Sparkles, Languages, ShieldCheck, Mic } from 'lucide-react';
+import { Languages, ShieldCheck, Mic } from 'lucide-react';
+import AppLogo, { AppLogoBadge } from '../components/AppLogo';
 
 const HIGHLIGHTS = [
   { icon: Mic, text: 'ถอดเสียงการประชุมแบบเรียลไทม์' },
@@ -16,9 +17,7 @@ export default function AuthLayout({ children }: { children: ReactNode }) {
       {/* Brand panel */}
       <aside className="hidden lg:flex w-[44%] max-w-2xl flex-col justify-between p-12 bg-linear-to-br from-[#DE5C8E] to-[#8B3A67] text-white">
         <div className="flex items-center gap-2.5">
-          <div className="w-9 h-9 rounded-xl bg-white/15 flex items-center justify-center backdrop-blur-xs">
-            <Sparkles className="w-5 h-5" />
-          </div>
+          <AppLogoBadge className="w-10 h-10" />
           <span className="font-bold tracking-tight">Live Translation</span>
         </div>
 
@@ -51,9 +50,7 @@ export default function AuthLayout({ children }: { children: ReactNode }) {
       <main className="flex-1 flex flex-col items-center justify-center px-5 py-10 sm:px-8">
         <div className="w-full max-w-md">
           <div className="lg:hidden flex items-center gap-2.5 mb-8">
-            <div className="w-9 h-9 rounded-xl bg-[#DE5C8E] flex items-center justify-center text-white">
-              <Sparkles className="w-5 h-5" />
-            </div>
+            <AppLogo className="w-10 h-10 shrink-0" />
             <span className="font-bold tracking-tight text-slate-900">Live Translation</span>
           </div>
           {children}

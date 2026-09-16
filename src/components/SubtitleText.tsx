@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState } from 'react';
-import { fitSubtitlePage, isContinuation } from '../asr/subtitleLines';
+import { fitSubtitlePage, isContinuation, unscaledHeight } from '../asr/subtitleLines';
 
 interface SubtitleTextProps {
   /** The whole caption accumulated so far — paging is handled here. */
@@ -54,12 +54,17 @@ export default function SubtitleText({
 
   // A narrower box fits fewer words per line, so the block has to be paged
   // again on resize — otherwise a rotated phone shows three or four lines.
+  //
+  // The observer comes from the window the caption is IN. Rendered into the
+  // Output window, the console's own ResizeObserver would only deliver during
+  // the console's rendering — which stops while the console is minimised.
   useLayoutEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
     setWidth(el.clientWidth);
-    if (typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver(() => setWidth(el.clientWidth));
+    const Observer = el.ownerDocument.defaultView?.ResizeObserver;
+    if (!Observer) return;
+    const observer = new Observer(() => setWidth(el.clientWidth));
     observer.observe(el);
     return () => observer.disconnect();
   }, []);
@@ -76,7 +81,8 @@ export default function SubtitleText({
     // three roundings of a 41.25px line would clip the last line.
     el.textContent = 'A';
     const oneLine = el.scrollHeight || 0;
-    setLineHeight(el.getBoundingClientRect().height || oneLine);
+    const rect = el.getBoundingClientRect();
+    setLineHeight(unscaledHeight(rect.height, rect.width, el.offsetWidth) || oneLine);
 
     // Clipped text is never paged — CSS does the cutting, and the reserved
     // height above is all this measurement was needed for.
