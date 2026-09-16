@@ -6,7 +6,6 @@ import {
   BookOpen,
   Download,
   Trash2,
-  Sparkles,
   Zap,
   Menu,
   ShieldAlert,
@@ -38,6 +37,7 @@ import {
   SessionSummaryModal
 } from '../components/ProjectPanel';
 import DictionaryManager from '../components/DictionaryManager';
+import AppLogo from '../components/AppLogo';
 import { captionsReducer, initialCaptionState, selectCaptions, type Caption } from '../asr/captions';
 import { groupCaptionsIntoParagraphs } from '../asr/historyParagraphs';
 import { activeUtteranceSeq, buildCaptionRows } from '../asr/captionStack';
@@ -778,9 +778,7 @@ export default function Admin() {
           </button>
 
           <div className="flex items-center gap-2.5">
-            <div className="w-8.5 h-8.5 rounded-lg bg-[#DE5C8E] flex items-center justify-center text-white shadow-xs">
-              <Sparkles className="w-4.5 h-4.5" />
-            </div>
+            <AppLogo className="w-8 h-8 shrink-0" />
             <div className="flex flex-col">
               <span className="font-bold text-sm text-slate-900 tracking-tight leading-none">Live Translation</span>
             </div>
