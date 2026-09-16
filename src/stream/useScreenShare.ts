@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 /**
- * The projector display, shared into the console.
+ * The slide window, shared into the console.
  *
  * Deliberately independent of the translation session: an operator sets the
  * share up before the meeting starts, and ending a session leaves it running.
@@ -21,14 +21,22 @@ export interface ScreenShare {
 }
 
 // Chrome-only hints are passed through as-is; other browsers ignore them.
-// `selfBrowserSurface: 'exclude'` keeps the console's own tab out of the
-// picker — sharing it would put the console inside its own broadcast.
+// Every surface this setup must not share is kept out of the picker, so the
+// wrong choice is not one click away during an event:
+//   selfBrowserSurface — the console's own tab, inside its own broadcast.
+//   monitorTypeSurfaces — a whole display. The second one is showing the
+//     Output window (the slide inside the slide, forever) and the first is
+//     showing the console. Only a window or a tab is ever the answer.
+//   surfaceSwitching — this one is not about the picker: it is the "Share
+//     this tab instead" button Chrome puts in its sharing bar, which sits on
+//     screen for the whole event and leads somewhere the operator must not
+//     go. Excluding it also makes that bar shorter.
 const DISPLAY_MEDIA_OPTIONS = {
   video: { frameRate: { ideal: 30 }, width: { ideal: 1920 }, height: { ideal: 1080 } },
   audio: false,
   selfBrowserSurface: 'exclude',
-  surfaceSwitching: 'include',
-  monitorTypeSurfaces: 'include'
+  surfaceSwitching: 'exclude',
+  monitorTypeSurfaces: 'exclude'
 } as DisplayMediaStreamOptions;
 
 /**

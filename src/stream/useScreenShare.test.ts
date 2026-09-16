@@ -53,6 +53,23 @@ describe('useScreenShare', () => {
     expect(result.current.error).toBeNull();
   });
 
+  it('offers the picker only the surfaces this setup can use', async () => {
+    // A whole display is always the wrong answer now: the second display is
+    // showing the Output window, and the console's own display is showing
+    // the console. And "Share this tab instead" only adds a button to
+    // Chrome's sharing bar that leads somewhere the operator must not go.
+    const { stream } = fakeStream('PowerPoint');
+    getDisplayMedia.mockResolvedValue(stream);
+    const { result } = renderHook(() => useScreenShare());
+
+    await act(() => result.current.start());
+
+    const options = getDisplayMedia.mock.calls[0][0] as Record<string, unknown>;
+    expect(options.monitorTypeSurfaces).toBe('exclude');
+    expect(options.surfaceSwitching).toBe('exclude');
+    expect(options.selfBrowserSurface).toBe('exclude');
+  });
+
   it('does nothing when the operator cancels the picker', async () => {
     getDisplayMedia.mockRejectedValue(domError('NotAllowedError', 'Permission denied'));
     const { result } = renderHook(() => useScreenShare());
