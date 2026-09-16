@@ -12,6 +12,8 @@ export const STAGE_WIDTH = 1920;
 export const STAGE_HEIGHT = 1080;
 /** How close (in % of stage width) to the centre a drag snaps onto it. */
 export const CENTRE_SNAP_PCT = 2;
+/** Gap kept between the slide and the caption bar, and below the bar, in % of stage height. */
+export const LETTERBOX_GAP_PCT = 2;
 
 export interface BarPosition {
   /** Bar centre, % of stage width. */
@@ -59,4 +61,27 @@ export function dragBar(
   };
   if (Math.abs(moved.x - 50) <= CENTRE_SNAP_PCT) moved.x = 50;
   return clampBar(moved, bar);
+}
+
+/**
+ * Height of the slide region in letterbox, as % of stage height. `slidePct`
+ * is what the operator asked for; when the caption bar plus its gaps needs
+ * more room than the band below would have, the SLIDE shrinks — the caption
+ * must never cover the slide in this layout.
+ */
+export function letterboxSlideHeightPct(slidePct: number, barHeightPct: number, gapPct: number = LETTERBOX_GAP_PCT): number {
+  const requested = clamp(slidePct, 0, 100);
+  const needed = barHeightPct + 2 * gapPct;
+  return clamp(Math.min(requested, 100 - needed), 0, 100);
+}
+
+/**
+ * Where the caption bar's bottom edge sits (same anchor as BarPosition.y: %
+ * of stage height, bar anchored bottom-centre) when it is centred in the
+ * band under a slide of `slideHeightPct`.
+ */
+export function letterboxBarBottomPct(slideHeightPct: number, barHeightPct: number): number {
+  const bandHeightPct = 100 - slideHeightPct;
+  const bottom = slideHeightPct + (bandHeightPct + barHeightPct) / 2;
+  return clamp(bottom, barHeightPct, 100);
 }

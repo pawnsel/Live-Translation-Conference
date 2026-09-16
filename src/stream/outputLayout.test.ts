@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { clampBar, dragBar, fitScale } from './outputLayout';
+import { clampBar, dragBar, fitScale, letterboxBarBottomPct, letterboxSlideHeightPct } from './outputLayout';
 
 describe('fitScale', () => {
   it('fits the 1920×1080 stage into the window', () => {
@@ -60,5 +60,50 @@ describe('dragBar', () => {
 
   it('does not move on a stage with no on-screen size', () => {
     expect(dragBar({ x: 50, y: 80 }, { dx: 100, dy: 100 }, { width: 0, height: 0 }, bar)).toEqual({ x: 50, y: 80 });
+  });
+});
+
+describe('letterboxSlideHeightPct', () => {
+  it('gives the operator their requested slide height when the bar comfortably fits below', () => {
+    expect(letterboxSlideHeightPct(80, 15)).toBe(80);
+  });
+
+  it('shrinks the slide when the bar plus its gaps would not fit in the remaining band', () => {
+    // needed = 15 + 2*2 = 19, so the band can only spare 100 - 19 = 81.
+    expect(letterboxSlideHeightPct(95, 15)).toBe(81);
+  });
+
+  it('collapses the slide to nothing when the bar alone is bigger than the stage', () => {
+    expect(letterboxSlideHeightPct(80, 100)).toBe(0);
+  });
+
+  it('clamps an out-of-range requested slide percentage first', () => {
+    expect(letterboxSlideHeightPct(150, 15)).toBe(81);
+    expect(letterboxSlideHeightPct(-10, 15)).toBe(0);
+  });
+
+  it('accepts a custom gap', () => {
+    // needed = 15 + 2*5 = 25, band spares 75.
+    expect(letterboxSlideHeightPct(95, 15, 5)).toBe(75);
+  });
+});
+
+describe('letterboxBarBottomPct', () => {
+  it('centres the bar in the band below the slide', () => {
+    expect(letterboxBarBottomPct(80, 10)).toBe(95);
+  });
+
+  it('puts the bar flush with the stage bottom when it fills the whole band', () => {
+    expect(letterboxBarBottomPct(80, 20)).toBe(100);
+  });
+
+  it('clamps to the stage bottom when the band would push the bar past it', () => {
+    expect(letterboxBarBottomPct(90, 30)).toBe(100);
+  });
+
+  it('clamps to the bar height at the low end', () => {
+    // An artificial slideHeightPct far below the normal 0..100 range pushes
+    // the unclamped centring result below barHeightPct.
+    expect(letterboxBarBottomPct(-300, 10)).toBe(10);
   });
 });
