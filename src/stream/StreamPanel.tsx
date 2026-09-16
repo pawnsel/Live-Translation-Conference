@@ -3,7 +3,14 @@ import { AlertTriangle, AppWindow, Lock, MonitorUp, RotateCcw, Square } from 'lu
 import type { ScreenShare } from './useScreenShare';
 import type { OutputWindow } from './useOutputWindow';
 import { clampBar } from './outputLayout';
-import { DEFAULT_OUTPUT_PREFS, MAX_BAR_WIDTH_PCT, MIN_BAR_WIDTH_PCT, type OutputPrefs } from '../storage/outputStore';
+import {
+  DEFAULT_OUTPUT_PREFS,
+  MAX_BAR_WIDTH_PCT,
+  MAX_SLIDE_PCT,
+  MIN_BAR_WIDTH_PCT,
+  MIN_SLIDE_PCT,
+  type OutputPrefs
+} from '../storage/outputStore';
 
 interface StreamPanelProps {
   share: ScreenShare;
@@ -31,6 +38,10 @@ const primaryButton =
 const secondaryButton =
   'flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg text-xs font-semibold border border-slate-200 bg-white text-slate-600 hover:text-slate-900 transition-all shrink-0 whitespace-nowrap';
 const warning = 'flex gap-2 text-[11px] leading-relaxed text-amber-800 bg-amber-50 border border-amber-200 rounded-lg p-2.5';
+const layoutButtonSelected =
+  'flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all border-[#DE5C8E] ring-2 ring-pink-100 bg-white text-slate-800';
+const layoutButtonUnselected =
+  'flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-[11px] font-bold border transition-all border-slate-200 bg-slate-50 text-slate-500 hover:bg-white';
 
 /** The สตรีม tab: share the projector display, open the window OBS captures,
  *  and place the caption bar. Independent of the translation session. */
@@ -41,6 +52,7 @@ export default function StreamPanel({ share, output, prefs, onPrefsChange }: Str
     const { x, y } = clampBar({ x: prefs.x, y: prefs.y }, { widthPct, heightPct: 0 });
     onPrefsChange({ ...prefs, widthPct, x, y });
   };
+  const isLetterbox = prefs.layout === 'letterbox';
 
   return (
     <div className="space-y-4">
@@ -131,6 +143,45 @@ export default function StreamPanel({ share, output, prefs, onPrefsChange }: Str
         )}
 
         <div>
+          <div className="text-[11px] font-bold text-slate-700 mb-1">รูปแบบการวางคำแปล</div>
+          <div className="grid grid-cols-2 gap-1.5">
+            <button
+              type="button"
+              onClick={() => onPrefsChange({ ...prefs, layout: 'overlay' })}
+              className={isLetterbox ? layoutButtonUnselected : layoutButtonSelected}
+            >
+              <span>ทับบนสไลด์</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onPrefsChange({ ...prefs, layout: 'letterbox' })}
+              className={isLetterbox ? layoutButtonSelected : layoutButtonUnselected}
+            >
+              <span>แบ่งพื้นที่</span>
+            </button>
+          </div>
+        </div>
+
+        {isLetterbox && (
+          <div>
+            <label htmlFor="output-slide-size" className="flex justify-between text-[11px] font-bold text-slate-700 mb-1">
+              <span>ขนาดสไลด์</span>
+              <span className="font-mono text-slate-500">{prefs.slidePct}%</span>
+            </label>
+            <input
+              id="output-slide-size"
+              type="range"
+              min={MIN_SLIDE_PCT}
+              max={MAX_SLIDE_PCT}
+              step={5}
+              value={prefs.slidePct}
+              onChange={(e) => onPrefsChange({ ...prefs, slidePct: Number(e.target.value) })}
+              className="w-full accent-[#DE5C8E]"
+            />
+          </div>
+        )}
+
+        <div>
           <label htmlFor="output-bar-width" className="flex justify-between text-[11px] font-bold text-slate-700 mb-1">
             <span>ความกว้างแถบคำแปล</span>
             <span className="font-mono text-slate-500">{prefs.widthPct}%</span>
@@ -147,29 +198,37 @@ export default function StreamPanel({ share, output, prefs, onPrefsChange }: Str
           />
         </div>
 
-        <div className="flex items-center justify-between gap-2">
-          <label className="flex items-center gap-2 text-[11px] font-semibold text-slate-700 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={prefs.locked}
-              onChange={(e) => onPrefsChange({ ...prefs, locked: e.target.checked })}
-              className="accent-[#DE5C8E]"
-            />
-            <Lock className="w-3 h-3" />
-            <span>ล็อกตำแหน่ง</span>
-          </label>
-          <button
-            type="button"
-            onClick={() => onPrefsChange({ ...prefs, x: DEFAULT_OUTPUT_PREFS.x, y: DEFAULT_OUTPUT_PREFS.y })}
-            className={secondaryButton}
-          >
-            <RotateCcw className="w-3 h-3" />
-            <span>รีเซ็ตตำแหน่ง</span>
-          </button>
-        </div>
-        <p className="text-[11px] text-slate-500 leading-relaxed">
-          ลากแถบคำแปลในหน้าต่าง Output เพื่อย้ายตำแหน่ง — ผู้ชมจะเห็นแถบขยับด้วย จัดให้เสร็จก่อนเริ่มถ่ายทอด แล้วกดล็อก
-        </p>
+        {isLetterbox ? (
+          <p className="text-[11px] text-slate-500 leading-relaxed">
+            แถบคำแปลจะจัดกึ่งกลางแถบดำด้านล่างให้เอง ลากไม่ได้ในโหมดนี้ — ถ้าแถบต้องการพื้นที่มากกว่าที่เหลือ สไลด์จะหดลงให้เอง
+          </p>
+        ) : (
+          <>
+            <div className="flex items-center justify-between gap-2">
+              <label className="flex items-center gap-2 text-[11px] font-semibold text-slate-700 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={prefs.locked}
+                  onChange={(e) => onPrefsChange({ ...prefs, locked: e.target.checked })}
+                  className="accent-[#DE5C8E]"
+                />
+                <Lock className="w-3 h-3" />
+                <span>ล็อกตำแหน่ง</span>
+              </label>
+              <button
+                type="button"
+                onClick={() => onPrefsChange({ ...prefs, x: DEFAULT_OUTPUT_PREFS.x, y: DEFAULT_OUTPUT_PREFS.y })}
+                className={secondaryButton}
+              >
+                <RotateCcw className="w-3 h-3" />
+                <span>รีเซ็ตตำแหน่ง</span>
+              </button>
+            </div>
+            <p className="text-[11px] text-slate-500 leading-relaxed">
+              ลากแถบคำแปลในหน้าต่าง Output เพื่อย้ายตำแหน่ง — ผู้ชมจะเห็นแถบขยับด้วย จัดให้เสร็จก่อนเริ่มถ่ายทอด แล้วกดล็อก
+            </p>
+          </>
+        )}
       </div>
 
       <details className="bg-white rounded-xl border border-slate-200 p-3.5 text-[11px] text-slate-600 leading-relaxed">

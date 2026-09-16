@@ -950,7 +950,7 @@ export default function Admin() {
                     </div>
 
                     <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">ภาษาที่แปลเป็น (Target — อัตโนมัติ)</label>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">ภาษาที่แปลเป็น (Target Language)</label>
                       <select
                         value={targetLang}
                         onChange={(e) => setLanguage(other(e.target.value) as 'th' | 'en')}

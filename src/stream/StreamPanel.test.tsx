@@ -5,6 +5,7 @@ import StreamPanel, { StreamStatusChip } from './StreamPanel';
 import type { ScreenShare } from './useScreenShare';
 import type { OutputWindow } from './useOutputWindow';
 import { DEFAULT_OUTPUT_PREFS } from '../storage/outputStore';
+import type { OutputPrefs } from '../storage/outputStore';
 
 afterEach(cleanup);
 
@@ -74,6 +75,47 @@ describe('StreamPanel', () => {
     expect(onPrefsChange).toHaveBeenLastCalledWith({ ...prefs, locked: true });
     fireEvent.click(screen.getByRole('button', { name: /รีเซ็ตตำแหน่ง/ }));
     expect(onPrefsChange).toHaveBeenLastCalledWith({ ...prefs, x: DEFAULT_OUTPUT_PREFS.x, y: DEFAULT_OUTPUT_PREFS.y });
+  });
+
+  it('switches to letterbox layout from the layout picker', () => {
+    const onPrefsChange = vi.fn();
+    render(<StreamPanel share={share()} output={output()} prefs={DEFAULT_OUTPUT_PREFS} onPrefsChange={onPrefsChange} />);
+    fireEvent.click(screen.getByRole('button', { name: 'แบ่งพื้นที่' }));
+    expect(onPrefsChange).toHaveBeenCalledWith({ ...DEFAULT_OUTPUT_PREFS, layout: 'letterbox' });
+  });
+
+  it('switches back to overlay layout from the layout picker', () => {
+    const onPrefsChange = vi.fn();
+    const prefs: OutputPrefs = { ...DEFAULT_OUTPUT_PREFS, layout: 'letterbox' };
+    render(<StreamPanel share={share()} output={output()} prefs={prefs} onPrefsChange={onPrefsChange} />);
+    fireEvent.click(screen.getByRole('button', { name: 'ทับบนสไลด์' }));
+    expect(onPrefsChange).toHaveBeenCalledWith({ ...prefs, layout: 'overlay' });
+  });
+
+  it('changes the slide size in letterbox layout', () => {
+    const onPrefsChange = vi.fn();
+    const prefs: OutputPrefs = { ...DEFAULT_OUTPUT_PREFS, layout: 'letterbox', slidePct: 80 };
+    render(<StreamPanel share={share()} output={output()} prefs={prefs} onPrefsChange={onPrefsChange} />);
+    fireEvent.change(screen.getByLabelText(/ขนาดสไลด์/), { target: { value: '90' } });
+    expect(onPrefsChange).toHaveBeenCalledWith({ ...prefs, slidePct: 90 });
+  });
+
+  it('hides lock/reset/drag hint and shows the slide slider in letterbox', () => {
+    const prefs: OutputPrefs = { ...DEFAULT_OUTPUT_PREFS, layout: 'letterbox' };
+    render(<StreamPanel share={share()} output={output()} prefs={prefs} onPrefsChange={vi.fn()} />);
+    expect(screen.queryByLabelText(/ล็อกตำแหน่ง/)).toBeNull();
+    expect(screen.queryByRole('button', { name: /รีเซ็ตตำแหน่ง/ })).toBeNull();
+    expect(screen.queryByText(/ลากแถบคำแปล/)).toBeNull();
+    expect(screen.getByLabelText(/ขนาดสไลด์/)).toBeTruthy();
+    expect(screen.getByText(/จัดกึ่งกลาง/)).toBeTruthy();
+  });
+
+  it('shows lock/reset/drag hint and no slide slider in overlay', () => {
+    render(<StreamPanel share={share()} output={output()} prefs={DEFAULT_OUTPUT_PREFS} onPrefsChange={vi.fn()} />);
+    expect(screen.getByLabelText(/ล็อกตำแหน่ง/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: /รีเซ็ตตำแหน่ง/ })).toBeTruthy();
+    expect(screen.getByText(/ลากแถบคำแปล/)).toBeTruthy();
+    expect(screen.queryByLabelText(/ขนาดสไลด์/)).toBeNull();
   });
 });
 
