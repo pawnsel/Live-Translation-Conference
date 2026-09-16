@@ -434,7 +434,6 @@ export function ProjectHeaderBar({
       <span className="text-[11px] text-slate-400 font-mono shrink-0">
         {project.sessions.length} session{project.sessions.length === 1 ? '' : 's'}
       </span>
-      <DeadlineBadge project={project} />
       <button
         type="button"
         onClick={onSwitchProject}

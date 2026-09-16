@@ -149,4 +149,50 @@ describe('OutputStage', () => {
       expect(bar.className).not.toContain('outline');
     });
   });
+
+  describe('captionHidden', () => {
+    const renderHidden = (prefs = DEFAULT_OUTPUT_PREFS) =>
+      render(
+        <OutputStage
+          stream={null}
+          config={{ fontSize: 'large', captionTheme: 'translucent', showLatency: true }}
+          caption={caption}
+          prefs={prefs}
+          onMove={vi.fn()}
+          captionHidden
+        />
+      );
+
+    it('takes the bar off the stage entirely', () => {
+      renderHidden();
+      expect(screen.queryByTestId('output-caption-bar')).toBeNull();
+      expect(screen.queryByText(/Welcome to the conference/)).toBeNull();
+    });
+
+    it('gives the whole stage back to the slide in letterbox', () => {
+      vi.spyOn(window.HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(162);
+      renderHidden({ ...DEFAULT_OUTPUT_PREFS, layout: 'letterbox', slidePct: 80 });
+      const video = document.querySelector('video') as HTMLVideoElement;
+      expect(video.style.height).toBe('100%');
+    });
+
+    it('brings the bar back where it was when unhidden', () => {
+      const prefs = { ...DEFAULT_OUTPUT_PREFS, x: 40, y: 90, widthPct: 70 };
+      const { rerender } = renderHidden(prefs);
+      expect(screen.queryByTestId('output-caption-bar')).toBeNull();
+      rerender(
+        <OutputStage
+          stream={null}
+          config={{ fontSize: 'large', captionTheme: 'translucent', showLatency: true }}
+          caption={caption}
+          prefs={prefs}
+          onMove={vi.fn()}
+          captionHidden={false}
+        />
+      );
+      const bar = screen.getByTestId('output-caption-bar');
+      expect(bar.style.left).toBe('40%');
+      expect(bar.style.top).toBe('90%');
+    });
+  });
 });

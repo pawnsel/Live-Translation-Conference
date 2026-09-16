@@ -21,6 +21,14 @@ interface OutputStageProps {
   prefs: OutputPrefs;
   /** Called once per finished drag with the bar's new position. */
   onMove: (position: BarPosition) => void;
+  /**
+   * Takes the caption bar off the broadcast image entirely — for the minute
+   * somebody photographs the stage, where a half-finished sentence across
+   * the slide is what ends up in the photo. Deliberately NOT part of
+   * OutputPrefs: it is a momentary state, and a hidden bar restored from
+   * storage at the start of the next event is a silent failure.
+   */
+  captionHidden?: boolean;
 }
 
 interface Drag {
@@ -40,7 +48,7 @@ interface Drag {
  * renders, most of which (opening the profile menu, ticking the elapsed
  * clock, and so on) touch none of this component's props.
  */
-function OutputStage({ stream, config, caption, prefs, onMove }: OutputStageProps) {
+function OutputStage({ stream, config, caption, prefs, onMove, captionHidden = false }: OutputStageProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
@@ -70,7 +78,7 @@ function OutputStage({ stream, config, caption, prefs, onMove }: OutputStageProp
   // `offsetHeight` forces a reflow — on a six-hour stream the overlay layout
   // would pay that on every caption, for a value nothing uses.
   useLayoutEffect(() => {
-    if (prefs.layout !== 'letterbox') return;
+    if (prefs.layout !== 'letterbox' || captionHidden) return;
     const bar = barRef.current;
     if (!bar) return;
     const update = () => setBarHeightPct((bar.offsetHeight / STAGE_HEIGHT) * 100);
@@ -80,7 +88,7 @@ function OutputStage({ stream, config, caption, prefs, onMove }: OutputStageProp
     const observer = new Observer(update);
     observer.observe(bar);
     return () => observer.disconnect();
-  }, [prefs, caption, config]);
+  }, [prefs, caption, config, captionHidden]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -131,7 +139,10 @@ function OutputStage({ stream, config, caption, prefs, onMove }: OutputStageProp
 
   const position = drag?.current ?? { x: prefs.x, y: prefs.y };
   const isLetterbox = prefs.layout === 'letterbox';
-  const slideHeightPct = isLetterbox ? letterboxSlideHeightPct(prefs.slidePct, barHeightPct) : 100;
+  // With the bar gone there is nothing for the band under the slide to hold,
+  // so letterbox gives the whole stage back to the slide — otherwise the
+  // photo everyone is posing for has a black stripe across the bottom.
+  const slideHeightPct = isLetterbox && !captionHidden ? letterboxSlideHeightPct(prefs.slidePct, barHeightPct) : 100;
   const barLeft = isLetterbox ? 50 : position.x;
   const barTop = isLetterbox ? letterboxBarBottomPct(slideHeightPct, barHeightPct) : position.y;
 
@@ -155,6 +166,9 @@ function OutputStage({ stream, config, caption, prefs, onMove }: OutputStageProp
             className={isLetterbox ? 'absolute left-0 top-0 w-full object-contain' : 'absolute inset-0 w-full h-full object-contain'}
             style={isLetterbox ? { left: 0, top: 0, width: '100%', height: `${slideHeightPct}%` } : undefined}
           />
+          {/* Unmounted rather than hidden with CSS: nothing of the bar — not
+              an outline, not a drag ring — may survive into the photo. */}
+          {!captionHidden && (
           <div
             ref={barRef}
             data-testid="output-caption-bar"
@@ -184,6 +198,7 @@ function OutputStage({ stream, config, caption, prefs, onMove }: OutputStageProp
           >
             <LiveCaptionBox config={config} view={caption} variant="stage" />
           </div>
+          )}
         </div>
       </div>
     </div>

@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { AlertTriangle, AppWindow, Lock, MonitorUp, RotateCcw, Square } from 'lucide-react';
+import { AlertTriangle, AppWindow, EyeOff, Lock, MonitorUp, RotateCcw, Square } from 'lucide-react';
 import type { ScreenShare } from './useScreenShare';
 import type { OutputWindow } from './useOutputWindow';
 import { clampBar } from './outputLayout';
@@ -17,6 +17,10 @@ interface StreamPanelProps {
   output: OutputWindow;
   prefs: OutputPrefs;
   onPrefsChange: (prefs: OutputPrefs) => void;
+  /** Caption bar currently taken off the Output window — a momentary state,
+   *  not saved with the prefs. */
+  captionHidden?: boolean;
+  onCaptionHiddenChange?: (hidden: boolean) => void;
 }
 
 function Thumbnail({ stream }: { stream: MediaStream | null }) {
@@ -45,7 +49,14 @@ const layoutButtonUnselected =
 
 /** The สตรีม tab: share the projector display, open the window OBS captures,
  *  and place the caption bar. Independent of the translation session. */
-export default function StreamPanel({ share, output, prefs, onPrefsChange }: StreamPanelProps) {
+export default function StreamPanel({
+  share,
+  output,
+  prefs,
+  onPrefsChange,
+  captionHidden = false,
+  onCaptionHiddenChange
+}: StreamPanelProps) {
   const sharing = share.status === 'sharing';
 
   const setWidth = (widthPct: number) => {
@@ -140,6 +151,32 @@ export default function StreamPanel({ share, output, prefs, onPrefsChange }: Str
             <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
             <span>เปิดหน้าต่าง Output ไม่สำเร็จ ลองกดอีกครั้ง</span>
           </div>
+        )}
+
+        {/* The in-event escape hatch: somebody is about to photograph the
+            stage, and a half-finished sentence across the slide is what ends
+            up in the picture. Placed above the placement controls because it
+            is used DURING an event, not while setting one up. */}
+        <label
+          className={`flex items-center gap-2 p-2 rounded-lg border cursor-pointer text-[11px] font-semibold transition-all ${
+            captionHidden
+              ? 'border-amber-300 bg-amber-50 text-amber-800'
+              : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+          }`}
+        >
+          <input
+            type="checkbox"
+            checked={captionHidden}
+            onChange={(e) => onCaptionHiddenChange?.(e.target.checked)}
+            className="accent-[#DE5C8E]"
+          />
+          <EyeOff className="w-3.5 h-3.5 shrink-0" />
+          <span>ซ่อนคำแปลชั่วคราว</span>
+        </label>
+        {captionHidden && (
+          <p className="text-[11px] text-amber-700 leading-relaxed">
+            คำแปลถูกซ่อนจากหน้าต่าง Output แล้ว — การถอดความยังทำงานและยังบันทึกอยู่ อย่าลืมเอาเครื่องหมายถูกออก
+          </p>
         )}
 
         <div>
@@ -248,7 +285,15 @@ export default function StreamPanel({ share, output, prefs, onPrefsChange }: Str
 
 /** Header status: visible from every tab, so the operator always knows the
  *  broadcast window is live — or that the slides dropped out of it. */
-export function StreamStatusChip({ share, output }: { share: ScreenShare; output: OutputWindow }) {
+export function StreamStatusChip({
+  share,
+  output,
+  captionHidden = false
+}: {
+  share: ScreenShare;
+  output: OutputWindow;
+  captionHidden?: boolean;
+}) {
   const ended = share.status === 'ended' && output.isOpen;
   if (share.status !== 'sharing' && !output.isOpen) return null;
   return (
@@ -269,6 +314,15 @@ export function StreamStatusChip({ share, output }: { share: ScreenShare; output
         <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-pink-50 text-[#DE5C8E] border border-pink-200">
           <AppWindow className="w-3 h-3" />
           <span>Output</span>
+        </span>
+      )}
+      {/* A bar hidden for a photo and never switched back on is a whole
+          session with no subtitles, so the reminder follows the operator to
+          every tab. */}
+      {captionHidden && (
+        <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200">
+          <EyeOff className="w-3 h-3" />
+          <span>ซ่อนคำแปล</span>
         </span>
       )}
     </div>

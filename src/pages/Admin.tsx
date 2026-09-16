@@ -208,6 +208,12 @@ export default function Admin() {
     (position: BarPosition) => updateOutputPrefs({ ...outputPrefs, ...position }),
     [outputPrefs, updateOutputPrefs]
   );
+  // Takes the caption bar off the broadcast image for the minute somebody is
+  // photographing the stage. Kept out of outputPrefs on purpose: it is not a
+  // setting for the room, it is a state for the next thirty seconds, and one
+  // restored from storage at the start of the next event would mean a session
+  // that silently shows no subtitles.
+  const [captionHidden, setCaptionHidden] = useState(false);
 
   // Reloading or closing the console takes the Output window with it, and
   // OBS with it goes to black mid-broadcast. Ask first.
@@ -415,6 +421,13 @@ export default function Admin() {
     // finishing a project prices what the database holds.
     await projects.flushCaptions();
     await projects.detachAsrSession();
+    // Wipe the live buffer only once it is safely on the record, so the
+    // screen the operator is left with matches the session state: no stale
+    // last sentence frozen on the subtitle line or in the Output window, and
+    // no transcript of a meeting that has already ended. The session's words
+    // are not lost — they are read back from the session history on demand.
+    dispatchCaption({ kind: 'reset' });
+    setHiddenSeqs(new Set());
     return sessionCaptions;
   };
 
@@ -539,8 +552,7 @@ export default function Admin() {
     const lastAsrSessionId = sessionId;
     const captionsForProject = await stopSessionAndMic();
     const finished = await projects.finishProject(captionsForProject, lastAsrSessionId);
-    dispatchCaption({ kind: 'reset' });
-    setHiddenSeqs(new Set());
+    // No reset needed here — stopSessionAndMic already cleared the buffer.
     if (finished) setFinishedProject(finished);
   };
 
@@ -699,6 +711,7 @@ export default function Admin() {
           caption={captionView}
           prefs={outputPrefs}
           onMove={moveOutputBar}
+          captionHidden={captionHidden}
         />,
         output.container
       )
@@ -801,7 +814,7 @@ export default function Admin() {
               <ClipboardList className="w-4 h-4" />
             </button>
             <LiveCostBadge cost={liveCost} isRecording={isSessionActive} />
-            <StreamStatusChip share={share} output={output} />
+            <StreamStatusChip share={share} output={output} captionHidden={captionHidden} />
           </div>
         </div>
 
@@ -1099,7 +1112,14 @@ export default function Admin() {
               )}
 
               {activeTab === 'stream' && (
-                <StreamPanel share={share} output={output} prefs={outputPrefs} onPrefsChange={updateOutputPrefs} />
+                <StreamPanel
+                  share={share}
+                  output={output}
+                  prefs={outputPrefs}
+                  onPrefsChange={updateOutputPrefs}
+                  captionHidden={captionHidden}
+                  onCaptionHiddenChange={setCaptionHidden}
+                />
               )}
             </div>
 

@@ -117,6 +117,40 @@ describe('StreamPanel', () => {
     expect(screen.getByText(/ลากแถบคำแปล/)).toBeTruthy();
     expect(screen.queryByLabelText(/ขนาดสไลด์/)).toBeNull();
   });
+
+  it('toggles the temporary caption hide without touching the saved prefs', () => {
+    const onCaptionHiddenChange = vi.fn();
+    const onPrefsChange = vi.fn();
+    render(
+      <StreamPanel
+        share={share()}
+        output={output()}
+        prefs={DEFAULT_OUTPUT_PREFS}
+        onPrefsChange={onPrefsChange}
+        captionHidden={false}
+        onCaptionHiddenChange={onCaptionHiddenChange}
+      />
+    );
+    fireEvent.click(screen.getByLabelText(/ซ่อนคำแปลชั่วคราว/));
+    expect(onCaptionHiddenChange).toHaveBeenCalledWith(true);
+    expect(onPrefsChange).not.toHaveBeenCalled();
+  });
+
+  it('offers the hide toggle in letterbox too, and reminds the operator while it is on', () => {
+    const prefs: OutputPrefs = { ...DEFAULT_OUTPUT_PREFS, layout: 'letterbox' };
+    render(
+      <StreamPanel
+        share={share()}
+        output={output()}
+        prefs={prefs}
+        onPrefsChange={vi.fn()}
+        captionHidden
+        onCaptionHiddenChange={vi.fn()}
+      />
+    );
+    expect(screen.getByLabelText(/ซ่อนคำแปลชั่วคราว/)).toBeTruthy();
+    expect(screen.getByText(/อย่าลืมเอาเครื่องหมายถูกออก/)).toBeTruthy();
+  });
 });
 
 describe('StreamStatusChip', () => {
@@ -134,5 +168,15 @@ describe('StreamStatusChip', () => {
   it('flags a share that stopped while Output is still open', () => {
     render(<StreamStatusChip share={share({ status: 'ended' })} output={output({ isOpen: true })} />);
     expect(screen.getByText('แชร์จอหยุด')).toBeTruthy();
+  });
+
+  it('warns from every tab while the caption is hidden', () => {
+    render(<StreamStatusChip share={share()} output={output({ isOpen: true })} captionHidden />);
+    expect(screen.getByText('ซ่อนคำแปล')).toBeTruthy();
+  });
+
+  it('says nothing about hiding when the caption is showing', () => {
+    render(<StreamStatusChip share={share()} output={output({ isOpen: true })} />);
+    expect(screen.queryByText('ซ่อนคำแปล')).toBeNull();
   });
 });
