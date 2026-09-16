@@ -47,7 +47,19 @@ describe('OutputStage', () => {
   });
 
   it('shows the caption but none of the operator-only extras', () => {
-    renderStage();
+    render(
+      <OutputStage
+        stream={null}
+        config={{ fontSize: 'large', captionTheme: 'translucent', showLatency: true }}
+        // isIdle: true is what actually exercises the idle-hint assertion
+        // below — with isIdle: false (as this fixture read before), that
+        // assertion passed whether or not the stage variant suppresses the
+        // hint at all.
+        caption={{ ...caption, isIdle: true }}
+        prefs={{ x: 50, y: 96, widthPct: 80, locked: false }}
+        onMove={vi.fn()}
+      />
+    );
     expect(screen.getByText('Welcome to the conference.')).toBeTruthy();
     expect(screen.queryByText(/ms$/)).toBeNull();
     expect(screen.queryByText('พร้อมรับเสียงจากไมโครโฟน')).toBeNull();

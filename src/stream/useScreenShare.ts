@@ -63,6 +63,11 @@ export function useScreenShare(): ScreenShare {
     streamRef.current = null;
     setStream(null);
     setStatus(next);
+    // A banner from a previous failure (e.g. macOS system-denied) must not
+    // survive a stop — StreamPanel renders error banners outside the sharing
+    // ternary, so a stale error/label here would show forever.
+    setError(null);
+    setLabel('');
   }, []);
 
   const start = useCallback(async () => {

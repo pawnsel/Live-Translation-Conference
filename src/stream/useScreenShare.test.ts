@@ -137,6 +137,30 @@ describe('useScreenShare', () => {
     expect(result.current.error).toBe('failed');
   });
 
+  it('clears a stale error and label when the operator stops sharing', async () => {
+    // A denied attempt first (sets error, no stream yet)...
+    getDisplayMedia.mockRejectedValueOnce(domError('NotAllowedError', 'Permission denied by system'));
+    const { result } = renderHook(() => useScreenShare());
+    await act(() => result.current.start());
+    expect(result.current.error).toBe('system-denied');
+
+    // ...then a successful share and a stop. Neither the earlier error nor
+    // the label from this share may survive the stop — StreamPanel renders
+    // error banners outside the "sharing" ternary, so a stale one would show
+    // as a permanent, misleading banner.
+    const { stream } = fakeStream('Screen 2');
+    getDisplayMedia.mockResolvedValueOnce(stream);
+    await act(() => result.current.start());
+    expect(result.current.error).toBeNull();
+    expect(result.current.label).toBe('Screen 2');
+
+    act(() => result.current.stop());
+
+    expect(result.current.status).toBe('idle');
+    expect(result.current.error).toBeNull();
+    expect(result.current.label).toBe('');
+  });
+
   it('stops the tracks when the console unmounts', async () => {
     const { stream, track } = fakeStream();
     getDisplayMedia.mockResolvedValue(stream);

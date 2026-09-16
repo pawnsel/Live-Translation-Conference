@@ -149,4 +149,59 @@ describe('useOutputWindow', () => {
     expect(open).toHaveBeenCalledTimes(1);
     expect(popup.focus).toHaveBeenCalled();
   });
+
+  it('ignores a second open() fired before the first settles', async () => {
+    // Two clicks before the first `await` inside open() resolves must not
+    // both go through: on the popup path they would return the same named
+    // window, and a second prepareOutputDocument call would detach the node
+    // React is portalled into out from under it.
+    const popup = fakeWindow();
+    const open = vi.spyOn(window, 'open').mockReturnValue(popup as unknown as Window);
+    const { result } = renderHook(() => useOutputWindow(false));
+
+    await act(async () => {
+      const first = result.current.open();
+      const second = result.current.open();
+      await Promise.all([first, second]);
+    });
+
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(result.current.isOpen).toBe(true);
+  });
+
+  it('retries as a popup when the Document PiP request rejects', async () => {
+    const requestWindow = vi.fn().mockRejectedValue(new Error('InvalidStateError'));
+    Object.defineProperty(window, 'documentPictureInPicture', { value: { requestWindow }, configurable: true });
+    const popup = fakeWindow();
+    const open = vi.spyOn(window, 'open').mockReturnValue(popup as unknown as Window);
+    const { result } = renderHook(() => useOutputWindow(true));
+
+    try {
+      await act(() => result.current.open());
+
+      expect(requestWindow).toHaveBeenCalledTimes(1);
+      expect(open).toHaveBeenCalledTimes(1);
+      expect(result.current.isOpen).toBe(true);
+      expect(result.current.kind).toBe('popup');
+      expect(result.current.error).toBeNull();
+    } finally {
+      delete (window as unknown as { documentPictureInPicture?: unknown }).documentPictureInPicture;
+    }
+  });
+
+  it('reports a blocked popup — not an unrecoverable failure — when the PiP retry is also blocked', async () => {
+    const requestWindow = vi.fn().mockRejectedValue(new Error('permissions policy'));
+    Object.defineProperty(window, 'documentPictureInPicture', { value: { requestWindow }, configurable: true });
+    vi.spyOn(window, 'open').mockReturnValue(null);
+    const { result } = renderHook(() => useOutputWindow(true));
+
+    try {
+      await act(() => result.current.open());
+
+      expect(result.current.error).toBe('blocked');
+      expect(result.current.isOpen).toBe(false);
+    } finally {
+      delete (window as unknown as { documentPictureInPicture?: unknown }).documentPictureInPicture;
+    }
+  });
 });

@@ -10,8 +10,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
  * captures as a frozen frame. A popup is the fallback.
  */
 
-// Decided by the spike (spikes/stream-output-spike.html): whether OBS Window
-// Capture reliably captures a Document PiP window on macOS and Windows.
+// Whether OBS Window Capture reliably captures a Document PiP window on
+// macOS and Windows — see docs/stream-output-checklist.md for the answer and
+// how it was verified.
 export const PREFER_DOCUMENT_PIP = true;
 export const OUTPUT_WINDOW_SIZE = { width: 960, height: 540 };
 
@@ -76,6 +77,12 @@ export function useOutputWindow(preferPip: boolean = PREFER_DOCUMENT_PIP): Outpu
   const [kind, setKind] = useState<OutputWindowKind | null>(null);
   const [error, setError] = useState<OutputWindowError | null>(null);
   const winRef = useRef<Window | null>(null);
+  // Guards the gap between a click and the first await below. Without it, two
+  // clicks before `requestOutputWindow` resolves both go through: on the
+  // popup path they return the same named window, and the second
+  // `prepareOutputDocument` call detaches the node React is portalled into
+  // out from under it.
+  const openingRef = useRef(false);
 
   const forget = useCallback(() => {
     winRef.current = null;
@@ -95,28 +102,49 @@ export function useOutputWindow(preferPip: boolean = PREFER_DOCUMENT_PIP): Outpu
       existing.focus();
       return;
     }
+    // A second click before the first `await` below resolves must not start
+    // a second request — see the comment on openingRef above.
+    if (openingRef.current) return;
+    openingRef.current = true;
 
-    let result: Awaited<ReturnType<typeof requestOutputWindow>>;
     try {
-      result = await requestOutputWindow(window, preferPip);
-    } catch {
-      setError('failed');
-      return;
-    }
-    if (!result) {
-      setError('blocked');
-      return;
-    }
+      let result: Awaited<ReturnType<typeof requestOutputWindow>>;
+      try {
+        result = await requestOutputWindow(window, preferPip);
+      } catch {
+        // Document PiP can reject for reasons a redeploy can't fix on event
+        // day — permissions policy, an enterprise policy, a consumed user
+        // gesture, InvalidStateError. Retrying once as a plain popup turns
+        // most of those into the actionable 'blocked' ("allow popups")
+        // message instead of a dead end.
+        if (!preferPip) {
+          setError('failed');
+          return;
+        }
+        try {
+          result = await requestOutputWindow(window, false);
+        } catch {
+          setError('failed');
+          return;
+        }
+      }
+      if (!result) {
+        setError('blocked');
+        return;
+      }
 
-    const { win } = result;
-    const root = prepareOutputDocument(document, win.document);
-    winRef.current = win;
-    win.addEventListener('pagehide', () => {
-      if (winRef.current === win) forget();
-    });
-    setError(null);
-    setKind(result.kind);
-    setContainer(root);
+      const { win } = result;
+      const root = prepareOutputDocument(document, win.document);
+      winRef.current = win;
+      win.addEventListener('pagehide', () => {
+        if (winRef.current === win) forget();
+      });
+      setError(null);
+      setKind(result.kind);
+      setContainer(root);
+    } finally {
+      openingRef.current = false;
+    }
   }, [preferPip, forget]);
 
   useEffect(

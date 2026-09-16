@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type PointerEvent } from 'react';
+import { memo, useEffect, useLayoutEffect, useRef, useState, type PointerEvent } from 'react';
 import LiveCaptionBox, { type CaptionView } from '../components/LiveCaptionBox';
 import type { OutputPrefs } from '../storage/outputStore';
 import type { DisplayConfig } from '../types';
@@ -27,8 +27,12 @@ interface Drag {
  * The broadcast image: the shared display with the caption bar on top, in a
  * fixed 1920×1080 stage scaled to whatever window holds it. What is drawn
  * here is exactly what OBS captures, so nothing operator-only appears.
+ *
+ * Wrapped in React.memo below: it is rebuilt by Admin on every one of its
+ * renders, most of which (opening the profile menu, ticking the elapsed
+ * clock, and so on) touch none of this component's props.
  */
-export default function OutputStage({ stream, config, caption, prefs, onMove }: OutputStageProps) {
+function OutputStage({ stream, config, caption, prefs, onMove }: OutputStageProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
@@ -54,6 +58,12 @@ export default function OutputStage({ stream, config, caption, prefs, onMove }: 
     // Muted, so autoplay is allowed; jsdom returns undefined here.
     const playing = video.play() as Promise<void> | undefined;
     playing?.catch(() => undefined);
+    // Releases the element's hold on the MediaStream when the stage unmounts
+    // (Output window closed) or the stream changes out from under it, rather
+    // than leaving a detached <video> pinned to a track that should be free.
+    return () => {
+      video.srcObject = null;
+    };
   }, [stream]);
 
   const barSize = () => ({
@@ -109,8 +119,13 @@ export default function OutputStage({ stream, config, caption, prefs, onMove }: 
             onPointerMove={onPointerMove}
             onPointerUp={endDrag}
             onPointerCancel={endDrag}
+            onLostPointerCapture={endDrag}
             className={`absolute select-none touch-none ${prefs.locked ? '' : 'cursor-move'} ${
-              drag ? 'outline-2 outline-offset-8 outline-white/70 rounded-[24px]' : ''
+              // Two-tone so the drag grab is visible over any slide: the pink
+              // outline reads against dark slides, the dark ring against
+              // light ones (a single white outline over a white slide was
+              // the only feedback that the drag had grabbed anything).
+              drag ? 'outline-2 outline-offset-8 outline-[#DE5C8E] ring-2 ring-black/70 rounded-[24px]' : ''
             }`}
             style={{
               left: `${position.x}%`,
@@ -126,3 +141,5 @@ export default function OutputStage({ stream, config, caption, prefs, onMove }: 
     </div>
   );
 }
+
+export default memo(OutputStage);

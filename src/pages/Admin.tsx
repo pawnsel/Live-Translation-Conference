@@ -253,9 +253,15 @@ export default function Admin() {
 
   const handleSignOut = useCallback(async () => {
     setProfileOpen(false);
+    // Explicit half of stream teardown on sign-out — the hooks' own unmount
+    // cleanups are the leak safety net, but a deliberate sign-out should stop
+    // the share and close the Output window right away rather than only when
+    // the unmount effects happen to run.
+    share.stop();
+    output.close();
     await signOut();
     navigate('/login', { replace: true });
-  }, [signOut, navigate]);
+  }, [signOut, navigate, share.stop, output.close]);
 
   // Captions have no "delete" concept anymore (there is no server to delete
   // them from) — "delete" stays a local-only hide so an operator can tidy
@@ -732,8 +738,9 @@ export default function Admin() {
   }
 
   return (
-    <div className="flex flex-col h-screen w-full bg-slate-100 text-slate-800 font-sans overflow-hidden">
+    <>
       {outputPortal}
+      <div className="flex flex-col h-screen w-full bg-slate-100 text-slate-800 font-sans overflow-hidden">
       {showHistory && <HistoryPanel projects={projects.endedProjects} onClose={() => setShowHistory(false)} />}
       {finishedProject && <BillModal project={finishedProject} onClose={() => setFinishedProject(null)} />}
       {showSessionHistory && (
@@ -1005,7 +1012,7 @@ export default function Admin() {
                             : 'border-slate-200 bg-slate-50 text-slate-500 hover:bg-white'
                         }`}
                       >
-                        <span className="w-3.5 h-3.5 rounded-full bg-black/60 text-white flex items-center justify-center text-[8px] font-black">A</span>
+                        <span className="w-3.5 h-3.5 rounded-full bg-black/70 text-white flex items-center justify-center text-[8px] font-black">A</span>
                         <span>โปร่งแสง</span>
                       </button>
                     </div>
@@ -1397,5 +1404,6 @@ export default function Admin() {
         </main>
       </div>
     </div>
+    </>
   );
 }
