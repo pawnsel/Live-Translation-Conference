@@ -23,6 +23,21 @@
 > `drop function ... get_account_status` อยู่ในไฟล์แล้ว ฟังก์ชันนั้นไม่ใช้แล้ว
 > เพราะเปิดให้ใครก็ตามที่มี anon key ตรวจสอบได้ว่าอีเมลไหนมีบัญชีอยู่
 
+3. จากนั้นวางเนื้อหาทั้งไฟล์ `supabase/schema-projects.sql` → Run (ต้องรัน**หลัง**
+   `schema.sql` เพราะ policy ในไฟล์นี้อ่านตาราง `access_requests`)
+
+จะได้:
+
+| สิ่งที่สร้าง | หน้าที่ |
+|---|---|
+| `public.projects`, `public.project_sessions`, `public.transcript_items` | project → session → บรรทัด transcript ของแต่ละคน |
+| `public.glossary_lists`, `public.glossary_terms`, `public.project_glossary_lists` | glossary แบบ shared (ขององค์กร) และแบบผูกกับ project + การเลือกใช้ list ต่อ project |
+| `public.is_approved()` | ใช้ใน policy — เขียนได้เฉพาะบัญชีที่ `approved` |
+| RLS policies | ทุกแถวเป็นของเจ้าของ (`owner_id = auth.uid()`) อ่านได้แม้ถูกถอนสิทธิ์ แต่เขียนได้เฉพาะเมื่อ `approved` shared list อ่านได้ แต่แก้จากในแอปไม่ได้ |
+
+ถ้าข้ามไฟล์นี้ ล็อกอินและอนุมัติจะใช้ได้ปกติ แต่ทุกอย่างที่เกี่ยวกับ project,
+transcript และ glossary จะ error ไฟล์นี้รันซ้ำได้อย่างปลอดภัยเช่นกัน
+
 ## 2. เปิด Google provider
 
 1. **Authentication → Providers → Google** → Enable
@@ -112,8 +127,9 @@ PostgREST ตรวจลายเซ็น JWT ให้ และ RLS กร�
 - **ไม่ใช้ service-role key** — เซิร์ฟเวอร์นี้ไม่เคยถือกุญแจที่อ่านแถวคนอื่นได้
 - ถ้าติดต่อ Supabase ไม่ได้ จะ **ปฏิเสธ** (fail closed) ไม่ใช่ปล่อยผ่าน
 - ผลการตรวจถูก cache ไว้ 60 วินาที → ถอนสิทธิ์แล้วจะมีผลกับงานใหม่ภายใน 1 นาที
-- ถ้าไม่ได้ตั้ง `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` เซิร์ฟเวอร์จะ
-  ปฏิเสธทุก request พร้อมขึ้น error ใน log ตอนเริ่มทำงาน
+- เซิร์ฟเวอร์อ่าน `SUPABASE_URL` / `SUPABASE_ANON_KEY` ก่อน ถ้าไม่มีจึงใช้
+  `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` แทน ถ้าไม่ได้ตั้งทั้งสองชุด
+  จะปฏิเสธทุก request ด้วย 503 พร้อมขึ้น error ใน log ตอนเริ่มทำงาน
 
 ทดสอบได้ด้วย:
 
