@@ -1,7 +1,7 @@
 # การ Deploy ขึ้น server ขององค์กร
 
 เอกสารนี้ครอบคลุมการนำแอปขึ้น server ที่เข้าถึงผ่าน VPN + SSH
-สำหรับการตั้งค่า Supabase ครั้งแรก (schema, Google provider) ดู
+สำหรับการตั้งค่า Supabase ครั้งแรก (Google provider ฯลฯ) ดู
 [docs/supabase-auth-setup.md](docs/supabase-auth-setup.md) ประกอบ — ที่นี่จะพูดถึง
 เฉพาะส่วนที่ต่างไปเมื่อขึ้น production
 
@@ -13,7 +13,8 @@
 
 แอปขอไมโครโฟนผ่าน `getUserMedia()` ซึ่งเบราว์เซอร์จะ**ปฏิเสธทันที**บน origin ที่เป็น
 HTTP ธรรมดา (ยกเว้น `localhost`) อาการคือหน้าเว็บโหลดได้ ล็อกอินได้ แต่พอกดอัดเสียง
-จะขึ้น error สิทธิ์ไมโครโฟน ซึ่งดูเหมือนบั๊กของแอปทั้งที่ไม่ใช่
+จะขึ้น error สิทธิ์ไมโครโฟน ซึ่งดูเหมือนบั๊กของแอปทั้งที่ไม่ใช่ การแชร์สไลด์ในแท็บสตรีม
+(`getDisplayMedia()`) ก็ติดเงื่อนไขเดียวกัน
 
 ถ้ายังไม่มีใบรับรอง TLS สำหรับ host นี้ ให้ใช้ทางเลี่ยงในหัวข้อ
 [ยังไม่มี TLS](#ยังไม่มี-tls-ใช้-ssh-tunnel-ไปก่อน) ซึ่งใช้ได้เพราะมันทำให้ origin
@@ -141,6 +142,19 @@ update public.access_requests
  where lower(email) = lower('someone@chula.ac.th');
 ```
 
+### 2.6 Schema ของ database
+
+`deploy.sh` **ไม่แตะ database เลย** และยังไม่มีระบบ migration ต้องรัน SQL เองที่
+Supabase → SQL Editor ตามลำดับนี้:
+
+1. [supabase/schema.sql](supabase/schema.sql) — ตารางอนุมัติบัญชี `access_requests`
+2. [supabase/schema-projects.sql](supabase/schema-projects.sql) — project, session,
+   transcript และ glossary (ต้องรัน**หลัง** `schema.sql`)
+
+ถ้าลืมไฟล์ที่สอง ล็อกอินและอนุมัติได้ปกติ แต่ทุกอย่างที่เกี่ยวกับ project/transcript/glossary
+จะ error ทั้งสองไฟล์รันซ้ำได้อย่างปลอดภัย ดังนั้นเมื่อ deploy โค้ดที่แก้ไฟล์ใน `supabase/`
+ให้รันไฟล์นั้นใหม่ทับได้เลย — ทำ**ก่อน** `./deploy.sh` เพื่อไม่ให้โค้ดใหม่วิ่งบน schema เก่า
+
 ---
 
 ## 3. Deploy ครั้งแรก
@@ -235,9 +249,25 @@ git checkout <commit-ก่อนหน้า>
 ./deploy.sh
 ```
 
-image เก่าถูก prune ทิ้งทุกครั้ง จึงไม่มี tag ให้ย้อนกลับ — rollback คือ deploy ซอร์ส
-เวอร์ชันเก่าใหม่อีกครั้ง ถ้าต้องการ rollback แบบเร็วกว่านั้น ให้เปลี่ยน `IMAGE_NAME`
-ใน `deploy.conf` เป็น tag ตาม git sha แทน `latest`
+ทุก deploy build ทับ `live-translation:latest` แล้ว `docker image prune` ลบ image เก่าที่
+หลุด tag ไปทิ้ง จึงไม่มี image เก่าให้ย้อนกลับ — rollback คือ deploy ซอร์สเวอร์ชันเก่าใหม่
+อีกครั้ง
+
+ถ้าต้องการ rollback ได้ทันทีโดยไม่ต้อง build ใหม่ ให้ tag image ปัจจุบันเก็บไว้บน server
+**ก่อน** deploy (prune ลบเฉพาะ image ที่ไม่มี tag จึงไม่แตะตัวนี้):
+
+```bash
+ssh <user>@<server> "docker tag live-translation:latest live-translation:previous"
+./deploy.sh
+
+# ถ้าเวอร์ชันใหม่มีปัญหา:
+ssh <user>@<server> "docker tag live-translation:previous live-translation:latest \
+  && cd /opt/live-translation && docker compose up -d --no-build --wait"
+```
+
+> อย่าใช้วิธีเปลี่ยน `IMAGE_NAME` ใน `deploy.conf` — `docker-compose.yml` fix ชื่อ image
+> ไว้ที่ `live-translation:latest` ค่านั้นจึงมีผลแค่กับ `--mode image` และทำให้ compose
+> รัน image เก่าต่อไปแทนตัวที่เพิ่งส่งขึ้นไป
 
 ---
 
@@ -270,9 +300,11 @@ curl -s https://translate.example.ac.th/api/health
 | หน้าเว็บบอก "ยังไม่ได้ตั้งค่า VITE_SUPABASE_..." | build โดยไม่ได้ส่ง build args | ตรวจ `.env` บน server แล้ว `docker compose up -d --build` |
 | ล็อกอินแล้วเด้งไป `localhost:3000` | ไม่ได้ใส่ URL production ใน Supabase | หัวข้อ 2.1 |
 | ล็อกอินแล้วขึ้น "redirect_uri is not allowed" | URL ไม่ตรงกับที่ลงทะเบียน (เช่นมี/ไม่มี `www`) | หัวข้อ 2.1 ให้ตรงเป๊ะ |
-| กดอัดแล้ว error สิทธิ์ไมโครโฟน | เปิดผ่าน HTTP ไม่ใช่ HTTPS | หัวข้อ 0 |
+| กดอัดแล้ว error สิทธิ์ไมโครโฟน / แชร์สไลด์ไม่ได้ | เปิดผ่าน HTTP ไม่ใช่ HTTPS | หัวข้อ 0 |
+| ล็อกอินได้ แต่เปิด/สร้าง project หรือ glossary แล้ว error | ยังไม่ได้รัน `schema-projects.sql` | หัวข้อ 2.6 |
 | caption หลุดทุกๆ ~1 นาทีตอนเงียบ | `proxy_read_timeout` ของ nginx | หัวข้อ 3.4 |
-| WebSocket ปิดทันทีด้วย 401 | บัญชียัง `pending` หรือ token หมดอายุ | หัวข้อ 2.5 / ล็อกอินใหม่ |
+| WebSocket ถูกปฏิเสธด้วย 401 | token หาย/หมดอายุ | ล็อกอินใหม่ |
+| WebSocket หรือ `/api/gemini/*` ถูกปฏิเสธด้วย 403 | บัญชียังไม่ได้ลงทะเบียน หรือสถานะไม่ใช่ `approved` | หัวข้อ 2.5 |
 | ทุก request ตอบ 503 "authentication is not configured" | `SUPABASE_URL`/`SUPABASE_ANON_KEY` ไม่ถึงคอนเทนเนอร์ | ตรวจ `.env` แล้ว `docker compose up -d` |
 | สรุปประชุมได้ 413 | `client_max_body_size` | หัวข้อ 3.4 |
 | container restart วนไม่หยุด | `docker compose logs app` จะบอกเหตุผลตรงๆ | ดู log |
@@ -308,6 +340,6 @@ ssh -L 3000:127.0.0.1:3000 <user>@<server>
 - **image ขนาด ~435MB** ส่วนใหญ่คือ dependency ของ front end ที่ vite bundle ลง
   `dist/assets` ไปแล้วแต่ยังติดมากับ `npm ci --omit=dev` ตัดออกได้อีกแต่จะเปราะ
   จึงเลือกความถูกต้องไว้ก่อน
-- **`APP_URL` ใน `.env.example` เดิมเป็นค่าที่ไม่มีโค้ดไหนอ่าน** — ไม่ต้องตั้ง
+- **`APP_URL` ใน `.env.example` ไม่มีโค้ดไหนอ่าน** — ไม่ต้องตั้ง
 - คอนเทนเนอร์เปิดพอร์ตไว้ที่ `127.0.0.1` เท่านั้น เข้าถึงได้ผ่าน nginx ทางเดียว
   ถ้าเปลี่ยนเป็น `0.0.0.0` docker จะเจาะ firewall ของ host ให้เองโดยไม่ถามด้วย
